@@ -18,7 +18,7 @@ from io import BytesIO
 #  whatever wasn't exported yet, exactly like before.
 #
 #   50   FONT SETUP
-#   90   CONFIG (BOT_TOKEN, ADMIN_ID, PDF_ALLOWED_USER_IDS)
+#   90   CONFIG (BOT_TOKEN)
 #  110   QUIZZY — flavor text
 #  140   MESSAGES
 #  160   STATE
@@ -57,20 +57,21 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Image as RLImage
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Image as RLImage, KeepTogether, PageBreak
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas as _canvas
 
 try:
     from docx import Document as DocxDocument
     from docx.shared import Pt, RGBColor, Inches, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
+    from docx.oxml import OxmlElement, parse_xml
     DOCX_AVAILABLE = True
 except ImportError:
     # python-docx (and its lxml dependency) not installed — DOCX export is
@@ -141,17 +142,6 @@ BUNDLED_FONTS = {
     },
 }
 
-# ── Replace with YOUR Telegram numeric user ID ──────────────────
-ADMIN_ID = 940770584
-
-# ── Access whitelist ──────────────────────────────────────────
-# Empty set = nobody but you has been added yet; add numeric Telegram user
-# IDs (same way as ADMIN_ID above) as you approve people.
-PDF_ALLOWED_USER_IDS: set[int] = set()
-
-def _pdf_access_allowed(update: Update) -> bool:
-    uid = update.effective_user.id if update.effective_user else None
-    return uid is not None and (uid == ADMIN_ID or uid in PDF_ALLOWED_USER_IDS)
 
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — flavor text (kept purely cosmetic, no dependency on anything else)
@@ -193,7 +183,6 @@ def quizzy_block(art: str, line: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 # MESSAGES
 # ═══════════════════════════════════════════════════════════════
-MSG_PDF_ACCESS_DENIED = "🚫 مميزة PDF/DOCX مش متاحة لحسابك دلوقتي."
 MSG_PDF_ASK_NAME = (
     "✏️ <b>اكتب اسم التوحفة الفنية (الملف) اللي عايزه:</b>\n"
     "<i>Lecture 1 Anatomy Questions</i>"
@@ -202,8 +191,10 @@ MSG_PDF_EMPTY = "❌ لا يوجد أسئلة محفوظة"
 MSG_EXPORT_EMPTY = "❌ لا يوجد أسئلة محفوظة بعد"
 MSG_EXPORT_GENERATING = "⏳ جاري توليد {kind} لـ {count} عنصر..."
 MSG_PDF_GENERATING = "⏳ جاري توليد PDF لـ {count} عنصر..."
-MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ❤️\n\n <i>{quizzy_line}</i>"
-MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ❤️\n\n <i>{quizzy_line}</i>"
+MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ({label}) ❤️\n\n <i>{quizzy_line}</i>"
+MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ({label}) ❤️\n\n <i>{quizzy_line}</i>"
+LABEL_ANSWERED = "بالإجابات"
+LABEL_BLANK = "بدون إجابات"
 MSG_DOCX_UNAVAILABLE = (
     "❌ DOCX export مش متاح دلوقتي (python-docx مش متثبت). "
     "استخدم PDF Export بدل كده، أو ثبّت python-docx وأعد التشغيل."
@@ -514,10 +505,76 @@ HOW_TO_USE_TEXT = (
 )
 
 # ═══════════════════════════════════════════════════════════════
+# ANSWER KEY OVERLAY — a small bordered box stamped onto the bottom-right
+# corner of the LAST page only. Reportlab's Platypus flow can't know where
+# the last page ends until the whole document has been laid out, so this
+# uses the standard two-pass Canvas trick: buffer every page via showPage(),
+# then on save() replay them, drawing the box on top of the final one only.
+# ═══════════════════════════════════════════════════════════════
+class _AnswerKeyCanvas(_canvas.Canvas):
+    def __init__(self, *args, answer_pairs=None, font_name=FONT_NAME,
+                 font_name_bold=FONT_NAME_BOLD, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ak_pages      = []
+        self._answer_pairs  = answer_pairs or []
+        self._ak_font       = font_name
+        self._ak_font_bold  = font_name_bold
+
+    def showPage(self):
+        self._ak_pages.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        total = len(self._ak_pages)
+        for i, state in enumerate(self._ak_pages):
+            self.__dict__.update(state)
+            if i == total - 1 and self._answer_pairs:
+                self._draw_answer_key()
+            super().showPage()
+        super().save()
+
+    def _draw_answer_key(self):
+        pairs   = self._answer_pairs
+        per_row = 5
+        lines   = [
+            "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
+            for i in range(0, len(pairs), per_row)
+        ]
+
+        pad     = 0.35 * cm
+        line_h  = 0.42 * cm
+        title_h = 0.5 * cm
+        box_w   = 6.6 * cm
+        box_h   = pad * 2 + title_h + line_h * len(lines)
+
+        x_right  = A4[0] - 2 * cm
+        x_left   = x_right - box_w
+        y_bottom = 1.3 * cm
+
+        self.saveState()
+        self.setFillColor(colors.HexColor("#F5F7F8"))
+        self.setStrokeColor(colors.HexColor("#90A4AE"))
+        self.setLineWidth(0.75)
+        self.roundRect(x_left, y_bottom, box_w, box_h, 4, stroke=1, fill=1)
+
+        self.setFillColor(colors.HexColor("#1A1A2E"))
+        self.setFont(self._ak_font_bold, 10)
+        y = y_bottom + box_h - pad - 0.3 * cm
+        self.drawString(x_left + pad, y, "Answer Key")
+
+        self.setFont(self._ak_font, 9)
+        for line in lines:
+            y -= line_h
+            self.drawString(x_left + pad, y, line)
+
+        self.restoreState()
+
+# ═══════════════════════════════════════════════════════════════
 # PDF BUILDER
 # ═══════════════════════════════════════════════════════════════
 def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
-              font_bold_path: str = None, bg_image_path: str = None) -> BytesIO:
+              font_bold_path: str = None, bg_image_path: str = None,
+              show_answers: bool = True) -> BytesIO:
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
@@ -594,12 +651,16 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     HR_COLOR = colors.HexColor("#CFD8DC")
     story    = []
 
+    answer_pairs = []  # (question_number, letter) for the bottom-right answer key
+
     for idx, item in enumerate(items, 1):
+        block = []  # everything for this one question — kept together on one page
+
         q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
-        story.append(Paragraph(q_num_label, NUM_STYLE))
+        block.append(Paragraph(q_num_label, NUM_STYLE))
 
         if item["type"] == "mcq":
-            story.append(Paragraph(item["q"], Q_STYLE))
+            block.append(Paragraph(item["q"], Q_STYLE))
             if item.get("image"):
                 try:
                     img = RLImage(item["image"])
@@ -607,23 +668,25 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                         scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
                         img.drawWidth  = PDF_MAX_IMG_WIDTH
                         img.drawHeight = img.imageHeight * scale
-                    story.append(Spacer(1, 6))
-                    story.append(img)
-                    story.append(Spacer(1, 6))
+                    block.append(Spacer(1, 6))
+                    block.append(img)
+                    block.append(Spacer(1, 6))
                 except Exception as e:
-                    story.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+                    block.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
             for i, opt in enumerate(item["options"]):
-                if i == item["correct"]:
-                    story.append(Paragraph(f"✓  {opt}", OPT_CORRECT))
+                if show_answers and i == item["correct"]:
+                    block.append(Paragraph(f"✓  {opt}", OPT_CORRECT))
                 else:
-                    story.append(Paragraph(f"     {opt}", OPT_STYLE))
+                    block.append(Paragraph(f"     {opt}", OPT_STYLE))
+            if item.get("correct") is not None:
+                answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
 
         elif item["type"] == "written":
-            story.append(Paragraph(item["title"], WRITTEN_TITLE))
+            block.append(Paragraph(item["title"], WRITTEN_TITLE))
             for line in item["content"].split("\n"):
                 line = line.strip()
                 if line:
-                    story.append(Paragraph(f"• {line}", WRITTEN_BODY))
+                    block.append(Paragraph(f"• {line}", WRITTEN_BODY))
 
         elif item["type"] == "image":
             img_path = item["path"]
@@ -633,19 +696,34 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
                     img.drawWidth  = PDF_MAX_IMG_WIDTH
                     img.drawHeight = img.imageHeight * scale
-                story.append(Spacer(1, 8))
-                story.append(img)
+                block.append(Spacer(1, 8))
+                block.append(img)
                 if item.get("caption"):
-                    story.append(Paragraph(f"📷 {item['caption']}", IMG_CAPTION))
-                story.append(Spacer(1, 4))
+                    block.append(Paragraph(f"📷 {item['caption']}", IMG_CAPTION))
+                block.append(Spacer(1, 4))
             except Exception as e:
-                story.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+                block.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+
+        story.append(KeepTogether(block))
 
         if idx < len(items):
             story.append(Spacer(1, 6))
             story.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
 
-    doc.build(story, onFirstPage=draw_header, onLaterPages=draw_header)
+    # The box is stamped onto the last page by the canvas below, so give it
+    # a fresh page of its own — otherwise it can land on top of whatever
+    # question happens to end near the bottom margin.
+    if answer_pairs:
+        story.append(PageBreak())
+        story.append(Spacer(1, 1))  # reportlab drops a trailing PageBreak with nothing after it
+
+    def _make_canvas(*args, **kwargs):
+        return _AnswerKeyCanvas(
+            *args, answer_pairs=answer_pairs,
+            font_name=font_name, font_name_bold=font_name_bold, **kwargs,
+        )
+
+    doc.build(story, onFirstPage=draw_header, onLaterPages=draw_header, canvasmaker=_make_canvas)
     buffer.seek(0)
     return buffer
 
@@ -776,8 +854,74 @@ def _add_docx_page_background(doc, image_path: str) -> None:
         drawing.remove(inline)
         drawing.append(anchor)
 
+def _apply_keep_together(paragraphs: list) -> None:
+    """Chains a group of paragraphs so Word never breaks a page inside the
+    group — the DOCX equivalent of the PDF's KeepTogether. keep_together
+    stops a single paragraph splitting mid-text; keep_with_next glues each
+    paragraph to the one after it, so the whole chain moves to the next
+    page together if it doesn't fit."""
+    for i, p in enumerate(paragraphs):
+        p.paragraph_format.keep_together = True
+        if i < len(paragraphs) - 1:
+            p.paragraph_format.keep_with_next = True
+
+def _add_docx_answer_key(doc, pairs: list) -> None:
+    """Adds a small bordered box listing every MCQ's number and correct
+    letter, pinned to the bottom-right corner of the page — the DOCX
+    equivalent of the PDF's answer-key overlay. Built as a legacy VML
+    textbox (w:pict/v:rect) rather than a modern DrawingML text box because
+    VML's 'mso-position-*:right/bottom' keywords let Word do the page-edge
+    math itself; there's no way to know where the "last page" lands ahead
+    of time in a flowing Word document, so this is attached to a paragraph
+    appended right after the final question — wherever that paragraph
+    renders is the page the box appears on, which in practice is the last
+    page."""
+    if not pairs:
+        return
+
+    per_row = 5
+    lines = [
+        "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
+        for i in range(0, len(pairs), per_row)
+    ]
+    body_runs = "".join(
+        ("<w:br/>" if i else "") + f'<w:t xml:space="preserve">{html.escape(line)}</w:t>'
+        for i, line in enumerate(lines)
+    )
+    box_height_pt = 34 + 14 * len(lines)  # title row + one row per line, plus padding
+    xml = f'''<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                       xmlns:v="urn:schemas-microsoft-com:vml"
+                       xmlns:o="urn:schemas-microsoft-com:office:office">
+<v:rect id="AnswerKeyBox" o:spid="_x0000_s2001"
+        style="position:absolute;width:190pt;height:{box_height_pt}pt;
+               mso-position-horizontal:right;mso-position-horizontal-relative:margin;
+               mso-position-vertical:bottom;mso-position-vertical-relative:margin;
+               mso-width-percent:0;mso-height-percent:0;
+               z-index:251659264"
+        fillcolor="#F5F7F8" strokecolor="#90A4AE" strokeweight=".75pt">
+  <v:textbox inset="8pt,6pt,8pt,6pt">
+    <w:txbxContent>
+      <w:p>
+        <w:pPr><w:spacing w:after="80"/></w:pPr>
+        <w:r><w:rPr><w:b/><w:sz w:val="20"/><w:color w:val="1A1A2E"/></w:rPr><w:t>Answer Key</w:t></w:r>
+      </w:p>
+      <w:p>
+        <w:pPr><w:spacing w:after="0"/></w:pPr>
+        <w:r><w:rPr><w:sz w:val="18"/><w:color w:val="1A1A2E"/></w:rPr>{body_runs}</w:r>
+      </w:p>
+    </w:txbxContent>
+  </v:textbox>
+</v:rect>
+</w:pict>'''
+
+    anchor_p = doc.add_paragraph()
+    anchor_p.paragraph_format.space_before = Pt(0)
+    anchor_p.paragraph_format.space_after  = Pt(0)
+    anchor_p.add_run()._r.append(parse_xml(xml))
+
 def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
-               font_bold_path: str = None, bg_image_path: str = None) -> BytesIO:
+               font_bold_path: str = None, bg_image_path: str = None,
+               show_answers: bool = True) -> BytesIO:
     doc = DocxDocument()
 
     font_bold_display_name = None
@@ -807,16 +951,24 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     header_para.paragraph_format.space_after = Pt(8)
     _set_header_border(header_para)
 
+    answer_pairs = []  # (question_number, letter) for the bottom-right answer key
+
     for idx, item in enumerate(items, 1):
+        block_paragraphs = []  # everything for this one question — kept together on one page
+
         q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
-        _add_paragraph(doc, q_num_label, bold=True, size_pt=8,
-                       color_hex="90A4AE", space_before=10, space_after=2,
-                       font_name=font_bold_display_name)
+        block_paragraphs.append(_add_paragraph(
+            doc, q_num_label, bold=True, size_pt=8,
+            color_hex="90A4AE", space_before=10, space_after=2,
+            font_name=font_bold_display_name,
+        ))
 
         if item["type"] == "mcq":
-            _add_paragraph(doc, item["q"], bold=True, size_pt=12,
-                           color_hex="1A1A2E", space_before=0, space_after=4,
-                           font_name=font_bold_display_name)
+            block_paragraphs.append(_add_paragraph(
+                doc, item["q"], bold=True, size_pt=12,
+                color_hex="1A1A2E", space_before=0, space_after=4,
+                font_name=font_bold_display_name,
+            ))
             if item.get("image") and os.path.exists(item["image"]):
                 try:
                     p = doc.add_paragraph()
@@ -825,29 +977,35 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                     p.paragraph_format.space_after  = Pt(6)
                     run = p.add_run()
                     run.add_picture(item["image"], width=Inches(5.5))
+                    block_paragraphs.append(p)
                 except Exception as e:
-                    _add_paragraph(doc, f"[Image error: {e}]",
-                                   size_pt=10, color_hex="B71C1C")
+                    block_paragraphs.append(_add_paragraph(
+                        doc, f"[Image error: {e}]", size_pt=10, color_hex="B71C1C"))
             for i, opt in enumerate(item["options"]):
-                correct = (i == item["correct"])
-                _add_paragraph(
+                correct = show_answers and (i == item["correct"])
+                block_paragraphs.append(_add_paragraph(
                     doc,
                     ("✓  " if correct else "     ") + opt,
                     bold=correct, size_pt=11,
                     color_hex="1B5E20" if correct else "1A1A2E",
                     indent_cm=0.7, space_after=3,
                     font_name=(font_bold_display_name if correct else None),
-                )
+                ))
+            if item.get("correct") is not None:
+                answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
 
         elif item["type"] == "written":
-            _add_paragraph(doc, item["title"], bold=True, size_pt=12,
-                           color_hex="1A1A2E", space_before=0, space_after=4,
-                           font_name=font_bold_display_name)
+            block_paragraphs.append(_add_paragraph(
+                doc, item["title"], bold=True, size_pt=12,
+                color_hex="1A1A2E", space_before=0, space_after=4,
+                font_name=font_bold_display_name,
+            ))
             for line in item["content"].split("\n"):
                 line = line.strip()
                 if line:
-                    _add_paragraph(doc, f"• {line}", bold=False, size_pt=11,
-                                   color_hex="37474F", indent_cm=0.7, space_after=3)
+                    block_paragraphs.append(_add_paragraph(
+                        doc, f"• {line}", bold=False, size_pt=11,
+                        color_hex="37474F", indent_cm=0.7, space_after=3))
 
         elif item["type"] == "image":
             img_path = item.get("path", "")
@@ -859,6 +1017,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                     p.paragraph_format.space_after  = Pt(4)
                     run = p.add_run()
                     run.add_picture(img_path, width=Inches(5.5))
+                    block_paragraphs.append(p)
                     if item.get("caption"):
                         cap = _add_paragraph(
                             doc, f"📷 {item['caption']}",
@@ -866,15 +1025,25 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                             space_after=4,
                         )
                         cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        block_paragraphs.append(cap)
                 except Exception as e:
-                    _add_paragraph(doc, f"[Image error: {e}]",
-                                   size_pt=10, color_hex="B71C1C")
+                    block_paragraphs.append(_add_paragraph(
+                        doc, f"[Image error: {e}]", size_pt=10, color_hex="B71C1C"))
             else:
-                _add_paragraph(doc, "[Image file not found]",
-                               size_pt=10, color_hex="B71C1C")
+                block_paragraphs.append(_add_paragraph(
+                    doc, "[Image file not found]", size_pt=10, color_hex="B71C1C"))
+
+        _apply_keep_together(block_paragraphs)
 
         if idx < len(items):
             _add_horizontal_rule(doc)
+
+    # The box is anchored to whichever paragraph it's attached to, so give
+    # it a fresh page of its own — otherwise it can land on top of the
+    # last question if that page still has room left at the bottom.
+    if answer_pairs:
+        doc.add_page_break()
+    _add_docx_answer_key(doc, answer_pairs)
 
     buffer = BytesIO()
     doc.save(buffer)
@@ -1564,10 +1733,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── EXPORT BUTTONS ──────────────────────────────────────────
-    if query.data in ("gen_pdf", "gen_docx", "clear_pdf") and not _pdf_access_allowed(update):
-        await query.message.reply_text(MSG_PDF_ACCESS_DENIED)
-        return
-
     items = PDF_BUFFER.get(user_id, [])
     name  = PDF_NAMES.get(user_id, "questions")
 
@@ -1645,10 +1810,12 @@ def _reset_pdf_session(user_id: int) -> None:
 
 async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
                                items: list, name: str, fmt: str) -> bool:
-    """Builds a PDF or DOCX (fmt='pdf'|'docx') from items, sends it via
-    message.reply_document, and resets the session. Returns False (having
-    already replied with the reason) if DOCX isn't available or the build
-    blew up."""
+    """Builds a PDF or DOCX (fmt='pdf'|'docx') from items and sends TWO
+    versions via message.reply_document — one with correct options marked
+    in green plus the answer key, one with no options marked but still
+    carrying the answer key — then resets the session. Returns False
+    (having already replied with the reason) if DOCX isn't available or a
+    build blew up."""
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
     font_path      = PDF_FONT_PATH.get(session_id)
     font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
@@ -1660,9 +1827,15 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             await message.reply_text(MSG_DOCX_UNAVAILABLE)
             return False
         try:
-            doc_bytes = await asyncio.to_thread(
+            answered_bytes = await asyncio.to_thread(
                 build_docx, items, name, font_path=font_path,
                 font_bold_path=font_bold_path, bg_image_path=bg_path,
+                show_answers=True,
+            )
+            blank_bytes = await asyncio.to_thread(
+                build_docx, items, name, font_path=font_path,
+                font_bold_path=font_bold_path, bg_image_path=bg_path,
+                show_answers=False,
             )
         except Exception as e:
             print("DOCX ERROR:", e)
@@ -1672,15 +1845,28 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             )
             return False
         await message.reply_document(
-            document=doc_bytes, filename=f"{safe}.docx",
-            caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            document=answered_bytes, filename=f"{safe}_answered.docx",
+            caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, label=LABEL_ANSWERED,
+                                             quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
+        await message.reply_document(
+            document=blank_bytes, filename=f"{safe}_blank.docx",
+            caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, label=LABEL_BLANK,
+                                             quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
             parse_mode=ParseMode.HTML,
         )
     else:
         try:
-            pdf_bytes = await asyncio.to_thread(
+            answered_bytes = await asyncio.to_thread(
                 build_pdf, items, name, font_path=font_path,
                 font_bold_path=font_bold_path, bg_image_path=bg_path,
+                show_answers=True,
+            )
+            blank_bytes = await asyncio.to_thread(
+                build_pdf, items, name, font_path=font_path,
+                font_bold_path=font_bold_path, bg_image_path=bg_path,
+                show_answers=False,
             )
         except Exception as e:
             print("PDF ERROR:", e)
@@ -1690,8 +1876,15 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             )
             return False
         await message.reply_document(
-            document=pdf_bytes, filename=f"{safe}.pdf",
-            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            document=answered_bytes, filename=f"{safe}_answered.pdf",
+            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_ANSWERED,
+                                            quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
+        await message.reply_document(
+            document=blank_bytes, filename=f"{safe}_blank.pdf",
+            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_BLANK,
+                                            quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
             parse_mode=ParseMode.HTML,
         )
 
@@ -1702,18 +1895,12 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
 # PDF COMMANDS
 # ═══════════════════════════════════════════════════════════════
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _pdf_access_allowed(update):
-        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
-        return
     user_id = update.effective_chat.id
     _reset_pdf_session(user_id)
     AWAITING_NAME[user_id] = True
     await update.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
 
 async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _pdf_access_allowed(update):
-        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
-        return
     user_id = update.effective_chat.id
     items   = PDF_BUFFER.get(user_id, [])
     if not items:
@@ -1724,9 +1911,6 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _export_pdf_session(context, update.message, user_id, items, name, fmt="pdf")
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _pdf_access_allowed(update):
-        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
-        return
     user_id = update.effective_chat.id
     _reset_pdf_session(user_id)
     await update.message.reply_text(MSG_PDF_CLEARED)
