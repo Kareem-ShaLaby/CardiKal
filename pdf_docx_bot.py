@@ -1,0 +1,1835 @@
+import re
+import string
+import random
+import os
+import html
+import tempfile
+import traceback
+from io import BytesIO
+
+# ═══════════════════════════════════════════════════════════════
+# FILE INDEX
+# ═══════════════════════════════════════════════════════════════
+#  This is a surgical extraction of ONLY the PDF/DOCX collection-and-export
+#  feature out of the original Quizician bot.py — no XP/analytics, no
+#  lecture/quiz-channel system, no Daily Quiz, no settings, no backups.
+#  PDF_BUFFER (and everything else below) is in-memory only, same as it
+#  always was in the original bot — a restart mid-collection loses
+#  whatever wasn't exported yet, exactly like before.
+#
+#   50   FONT SETUP
+#   90   CONFIG (BOT_TOKEN, ADMIN_ID, PDF_ALLOWED_USER_IDS)
+#  110   QUIZZY — flavor text
+#  140   MESSAGES
+#  160   STATE
+#  180   HELPERS (MCQ/written-block parsing)
+#  260   PROGRESS MESSAGE BUILDER
+#  300   KEYBOARD HELPERS
+#  360   HOW TO USE TEXT
+#  380   PDF BUILDER
+#  520   DOCX BUILDER
+#  770   SLEEP / WAKE
+#  790   FORWARDED POLL HANDLER
+#  840   POLL UPDATE HANDLER (passive correct-answer backfill)
+#  880   CLARIFY QUEUE
+#  920   QUESTION REVIEW / EDIT
+#  980   IMAGE HANDLER
+# 1060   FONT UPLOAD HANDLER
+# 1090   DOCUMENT HANDLER (captioned PDFs)
+# 1120   TEXT MESSAGE HANDLER
+# 1260   INLINE BUTTON HANDLER
+# 1440   EXPORT (build+send PDF/DOCX, session reset)
+# 1500   PDF COMMANDS (/pdf_start, /pdf_generate, /pdf_clear, /cancel)
+# 1540   START / HELP
+# 1570   MAIN
+# ═══════════════════════════════════════════════════════════════
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    PollHandler,
+    filters,
+    ContextTypes,
+    AIORateLimiter,
+)
+from telegram.constants import ParseMode
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Image as RLImage
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+try:
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Inches, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    DOCX_AVAILABLE = True
+except ImportError:
+    # python-docx (and its lxml dependency) not installed — DOCX export is
+    # simply disabled until it's installed; PDF export works fine either way.
+    DOCX_AVAILABLE = False
+
+# ═══════════════════════════════════════════════════════════════
+# FONT SETUP
+# ═══════════════════════════════════════════════════════════════
+_POPPINS_REG  = "/usr/share/fonts/truetype/google-fonts/Poppins-Regular.ttf"
+_POPPINS_BOLD = "/usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf"
+
+FONT_NAME      = "Helvetica"
+FONT_NAME_BOLD = "Helvetica-Bold"
+
+if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
+    try:
+        pdfmetrics.registerFont(TTFont("Poppins",      _POPPINS_REG))
+        pdfmetrics.registerFont(TTFont("Poppins-Bold", _POPPINS_BOLD))
+        FONT_NAME      = "Poppins"
+        FONT_NAME_BOLD = "Poppins-Bold"
+        print("Poppins font loaded")
+    except Exception as e:
+        print(f"Poppins load error: {e} — using Helvetica")
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in your host's env vars — use a DIFFERENT token/bot than Quizician itself
+# NOTE: AIORateLimiter (used below when building `app`) needs the extra:
+#   pip install "python-telegram-bot[rate-limiter]"
+
+# Portable temp dir: tempfile.gettempdir() respects $TMPDIR, so this resolves
+# to a writable path on both Railway (/tmp) and Termux ($PREFIX/tmp) — a
+# hardcoded "/tmp" fails on Android, which has no writable /tmp.
+IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_pdf_imgs")
+FONT_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_pdf_fonts")
+
+# Preset fonts bundled with the bot itself (not user-uploaded) — put the
+# actual font files in a `fonts/` folder next to this script. Either .ttf
+# or .otf works fine — just match the base filename below.
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+FONTS_DIR = os.path.join(BASE_DIR, "fonts")
+
+def _find_font_file(base_name: str):
+    for ext in (".otf", ".ttf", ".OTF", ".TTF"):
+        path = os.path.join(FONTS_DIR, base_name + ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+BUNDLED_FONTS = {
+    "Comic Sans": {
+        "regular": _find_font_file("ComicSans"),
+        "bold":    _find_font_file("ComicSans-Bold"),
+    },
+    "Canva Sans": {
+        "regular": _find_font_file("CanvaSans"),
+        "bold":    _find_font_file("CanvaSans-Bold"),
+    },
+    "Times New Roman": {
+        "regular": _find_font_file("TimesNewRoman"),
+        "bold":    _find_font_file("TimesNewRoman-Bold"),
+    },
+    "Amaranth": {
+        "regular": _find_font_file("Amaranth"),
+        "bold":    _find_font_file("Amaranth-Bold"),
+    },
+}
+
+# ── Replace with YOUR Telegram numeric user ID ──────────────────
+ADMIN_ID = 940770584
+
+# ── Access whitelist ──────────────────────────────────────────
+# Empty set = nobody but you has been added yet; add numeric Telegram user
+# IDs (same way as ADMIN_ID above) as you approve people.
+PDF_ALLOWED_USER_IDS: set[int] = set()
+
+def _pdf_access_allowed(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    return uid is not None and (uid == ADMIN_ID or uid in PDF_ALLOWED_USER_IDS)
+
+# ═══════════════════════════════════════════════════════════════
+# QUIZZY — flavor text (kept purely cosmetic, no dependency on anything else)
+# ═══════════════════════════════════════════════════════════════
+QUIZZY_WELCOME_ART = (
+    " /\\_/\\ \n"
+    "( ⌒.⌒ )\n"
+    "  > ^ <  "
+)
+QUIZZY_SLEEPING_ART = (
+    " /\\_/\\ \n"
+    "(  -.- ) zzz\n"
+    " > ^ <  "
+)
+QUIZZY_OOPS_ART = (
+    " /\\_/\\ \n"
+    "( ×_× )\n"
+    " > ~ <  "
+)
+QUIZZY_WELCOME_LINES = [
+    "صباح (أو مساء) الورد 🌹",
+    "باشا البلد",
+    "الله أكبر أخيرا قررت تذاكر",
+]
+QUIZZY_SUCCESS_LINES = [
+    "تحياتي 🫡",
+    "مش بقول باشا 😎",
+    "قدوة 😌🙌",
+]
+QUIZZY_ERROR_LINES = [
+    "كويزي وقع على دماغه من الصدمة، بس متقلقش هنظبطها 😓",
+    "كويزي شايف إن المشكلة دي معندهاش داعي، جرب تاني 😓",
+    "احنا مش عارفين إيه اللي حصل، بس كويزي واثق إنها هتتحل 😓",
+]
+
+def quizzy_block(art: str, line: str) -> str:
+    return f"<pre>{html.escape(art)}</pre>\n<i>{html.escape(line)}</i>"
+
+# ═══════════════════════════════════════════════════════════════
+# MESSAGES
+# ═══════════════════════════════════════════════════════════════
+MSG_PDF_ACCESS_DENIED = "🚫 مميزة PDF/DOCX مش متاحة لحسابك دلوقتي."
+MSG_PDF_ASK_NAME = (
+    "✏️ <b>اكتب اسم التوحفة الفنية (الملف) اللي عايزه:</b>\n"
+    "<i>Lecture 1 Anatomy Questions</i>"
+)
+MSG_PDF_EMPTY = "❌ لا يوجد أسئلة محفوظة"
+MSG_EXPORT_EMPTY = "❌ لا يوجد أسئلة محفوظة بعد"
+MSG_EXPORT_GENERATING = "⏳ جاري توليد {kind} لـ {count} عنصر..."
+MSG_PDF_GENERATING = "⏳ جاري توليد PDF لـ {count} عنصر..."
+MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ❤️\n\n <i>{quizzy_line}</i>"
+MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ❤️\n\n <i>{quizzy_line}</i>"
+MSG_DOCX_UNAVAILABLE = (
+    "❌ DOCX export مش متاح دلوقتي (python-docx مش متثبت). "
+    "استخدم PDF Export بدل كده، أو ثبّت python-docx وأعد التشغيل."
+)
+MSG_PDF_CLEARED = "🗑 تم قرار إزالة يا دولي"
+MSG_EXPORT_CLEARED_ALL = "🗑 تم قرار إزاله يا دولي"
+MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
+MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
+MSG_NOT_IN_SESSION = "📄 ابدأ الأول بـ /pdf_start عشان تبدأ تجمع الأسئلة."
+
+# ═══════════════════════════════════════════════════════════════
+# STATE — all in-memory only, exactly like the original bot (a restart
+# loses whatever's mid-collection and hasn't been exported yet)
+# ═══════════════════════════════════════════════════════════════
+PDF_BUFFER             = {}    # user_id -> list of item dicts
+PDF_NAMES              = {}    # user_id -> str
+AWAITING_NAME          = {}    # user_id -> True
+PDF_FONT_PATH          = {}    # user_id -> path to a regular-weight .ttf/.otf, or absent for the default font
+PDF_FONT_BOLD_PATH     = {}    # user_id -> path to that font's bold weight, if one's available (presets only —
+                                # a single user upload has no bold companion, so bold text just reuses it)
+PDF_BG_IMAGE_PATH      = {}    # user_id -> path to an uploaded per-page background image, or absent for none
+AWAITING_FONT          = {}    # user_id -> True, while the /pdf_start setup flow is waiting on a font file/skip
+AWAITING_BG            = {}    # user_id -> True, while the /pdf_start setup flow is waiting on a background image/skip
+SLEEPING               = set()
+PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
+PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
+CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
+POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
+PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
+                                # awaiting free-text replacement for one field of a just-added question
+
+PDF_MAX_IMG_WIDTH = 13 * cm
+
+# ═══════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════
+def clean_option(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^[A-Ea-e1-5][).\-]\s*", "", line)
+    line = re.sub(r"^[-•]\s*", "", line)
+    return line.strip()
+
+def strip_leading_letter_prefix(option: str) -> str:
+    return re.sub(r"^[A-Ea-e]\)\s*", "", option).strip()
+
+_MCQ_OPTION_PREFIX_RE = re.compile(r"^[A-Ea-e1-5][).\-]\s*")
+
+def _looks_like_mcq_attempt(lines: list) -> bool:
+    """True if at least one line looks like someone attempting an MCQ
+    option (starts with a "a)"/"b)"/"1." style prefix — same pattern
+    clean_option() strips), even though the block as a whole fell short
+    of the 3+ lines normalize_mcq_block needs to treat it as a real
+    question. Used to tell an ordinary chat message apart from a
+    genuine-but-broken question attempt."""
+    return any(_MCQ_OPTION_PREFIX_RE.match(l) for l in lines)
+
+def normalize_mcq_block(block: str):
+    block = block.strip()
+    if "\n" in block:
+        return [l.strip() for l in block.split("\n") if l.strip()]
+    match = re.search(r"\b([A-Ea-e1-5])[).]", block)
+    if not match:
+        return [block]
+    question     = block[:match.start()].strip()
+    options_part = block[match.start():]
+    parts = re.split(r"(?=\b[A-Ea-e1-5][).])", options_part)
+    return [question] + [p.strip() for p in parts if p.strip()]
+
+def strip_spoiler_markers(text: str) -> str:
+    return re.sub(r"\|\|(.+?)\|\|", r"\1", text, flags=re.DOTALL)
+
+def parse_mcq_lines(lines: list):
+    """
+    Given already-normalized MCQ lines (question line + option lines),
+    extracts (question, raw_options, correct_index, explanation).
+    correct_index is None if no option was marked correct.
+    """
+    question      = lines[0]
+    options       = []
+    correct_index = None
+    explanation   = None
+
+    for line in lines[1:]:
+        ex_match = re.match(r"^ex:\s*(.+)", line, re.IGNORECASE)
+        if ex_match:
+            explanation = ex_match.group(1).strip()
+            continue
+
+        opt       = clean_option(line)
+        has_z_end = re.search(r"\s+[zZ]\s*$", opt)
+        has_check = "✅" in opt
+
+        if has_z_end or has_check:
+            opt           = opt.replace("✅", "")
+            opt           = re.sub(r"\s+[zZ]\s*$", "", opt).strip()
+            correct_index = len(options)
+
+        if opt:
+            options.append(opt)
+
+    return question, options, correct_index, explanation
+
+def parse_mcq_block(block: str):
+    """
+    Full validation on top of parse_mcq_lines: returns
+    (question, raw_options, correct_index, explanation) only if the block
+    is a COMPLETE, valid MCQ (>=3 lines, a correct answer marked).
+    Returns None otherwise. Used to detect a fully-formed question in an
+    image caption so we don't need to ask the user to resend it.
+    """
+    lines = normalize_mcq_block(block.strip())
+    if len(lines) < 3:
+        return None
+    question, options, correct_index, explanation = parse_mcq_lines(lines)
+    if correct_index is None or correct_index >= len(options):
+        return None
+    return question, options, correct_index, explanation
+
+def parse_written_question(block: str):
+    block = strip_spoiler_markers(block)
+    lines = [l.rstrip() for l in block.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return None
+    title = re.sub(r'[\""\']+$', "", lines[0]).strip()
+    content_lines = lines[1:]
+    content = "\n".join(content_lines).strip()
+    if not content:
+        return None
+    if content.startswith(".") and content.endswith("."):
+        content = content[1:-1].strip()
+        return title, content
+    if content:
+        return title, content
+    return None
+
+def _cleanup_images(user_id: int):
+    import shutil
+    img_dir = os.path.join(IMG_BASE_DIR, str(user_id))
+    if os.path.exists(img_dir):
+        shutil.rmtree(img_dir, ignore_errors=True)
+
+def _clear_pending_image(user_id: int):
+    """Drop any image that's still waiting for a question, deleting its file."""
+    path = PENDING_IMAGE.pop(user_id, None)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+def _clear_pending_edit(user_id: int):
+    """Drop any pending 'send new text for this field' state for this user."""
+    PENDING_EDIT.pop(user_id, None)
+
+def _clear_clarify_queue(user_id: int):
+    """Drop any pending 'choose the correct answer' queue/watches for this user."""
+    CLARIFY_QUEUE.pop(user_id, None)
+    stale_poll_ids = [pid for pid, (uid, _) in POLL_WATCH.items() if uid == user_id]
+    for pid in stale_poll_ids:
+        POLL_WATCH.pop(pid, None)
+
+# ═══════════════════════════════════════════════════════════════
+# PROGRESS MESSAGE BUILDER
+# ═══════════════════════════════════════════════════════════════
+def build_progress_text(items: list, latest_label: str = "") -> str:
+    count   = len(items)
+    bar_len = 4   # smaller block = the bar fills up faster (2 items = 50% full)
+
+    if count == 0:
+        filled = 0
+    else:
+        filled = count % bar_len or bar_len   # land on a full bar, not an empty one
+    bar = "█" * filled + "░" * (bar_len - filled)
+
+    type_counts = {"mcq": 0, "written": 0, "image": 0}
+    for it in items:
+        t = it.get("type", "mcq")
+        if t in type_counts:
+            type_counts[t] += 1
+
+    breakdown = []
+    if type_counts["mcq"]:
+        breakdown.append(f"❓ {type_counts['mcq']} MCQ")
+    if type_counts["written"]:
+        breakdown.append(f"📝 {type_counts['written']} Written")
+    if type_counts["image"]:
+        breakdown.append(f"🖼 {type_counts['image']} Image")
+
+    text = (
+        f"📄 <b>PDF Collection Mode</b>\n"
+        f"<code>{bar}</code>\n"
+        f"Collected: <b>{count}</b> item{'s' if count != 1 else ''}"
+    )
+    if breakdown:
+        text += f"\n{' · '.join(breakdown)}"
+    return text
+
+async def update_progress(context, user_id: int, chat_id: int, latest_label: str = ""):
+    """Edit the existing progress message, or send a new one and store its id."""
+    items    = PDF_BUFFER.get(user_id, [])
+    text     = build_progress_text(items, latest_label)
+    keyboard = export_keyboard()
+    msg_id   = PROGRESS_MSG_ID.get(user_id)
+
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            pass  # message too old / deleted — fall through to send new
+
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    PROGRESS_MSG_ID[user_id] = sent.message_id
+
+# ═══════════════════════════════════════════════════════════════
+# KEYBOARD HELPERS
+# ═══════════════════════════════════════════════════════════════
+def export_keyboard():
+    row = [InlineKeyboardButton("📄 Export as PDF", callback_data="gen_pdf")]
+    if DOCX_AVAILABLE:
+        row.append(InlineKeyboardButton("📝 Export as DOCX", callback_data="gen_docx"))
+    return InlineKeyboardMarkup([
+        row,
+        [InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
+        [InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
+    ])
+
+def _item_preview_label(item: dict, max_len: int = 40) -> str:
+    """First few words of a buffered item, for the edit-picker list."""
+    if item["type"] == "written":
+        text = item.get("title", "")
+    elif item["type"] == "image":
+        text = item.get("caption") or "(صورة من غير نص)"
+    else:
+        text = item.get("q", "")
+    text = text.strip()
+    return text[:max_len] + ("…" if len(text) > max_len else "")
+
+def edit_pick_keyboard(items: list) -> InlineKeyboardMarkup:
+    """Numbered grid (1, 2, 3...) — one button per buffered question, each
+    jumping straight into the existing per-question edit menu."""
+    buttons = [
+        InlineKeyboardButton(str(i + 1), callback_data=f"revedit:{i}:open")
+        for i in range(len(items))
+    ]
+    rows = [buttons[i:i + 6] for i in range(0, len(buttons), 6)]
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="edit_pick_back")])
+    return InlineKeyboardMarkup(rows)
+
+def font_prompt_keyboard() -> InlineKeyboardMarkup:
+    """Preset font buttons (bundled .otf files, see BUNDLED_FONTS) plus
+    Skip — shown alongside the option to just upload a font file instead."""
+    names = list(BUNDLED_FONTS.keys())
+    rows  = [
+        [InlineKeyboardButton(names[i], callback_data=f"font_preset:{i}") for i in range(0, 2)],
+        [InlineKeyboardButton(names[i], callback_data=f"font_preset:{i}") for i in range(2, 4)],
+        [InlineKeyboardButton("⏭ Skip", callback_data="font_skip")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+# ═══════════════════════════════════════════════════════════════
+# HOW TO USE TEXT
+# ═══════════════════════════════════════════════════════════════
+HOW_TO_USE_TEXT = (
+    "📄 <b>How To Use — Quizician PDF/DOCX Bot</b>\n\n"
+    "<b>1) Start a session</b>\n"
+    "/pdf_start — pick a name, a font, and a page background, then start sending content.\n\n"
+    "<b>2) Normal MCQ</b>\n"
+    "<code>Question?\n"
+    "a) Option A\n"
+    "b) Option B z   ← mark correct with z\n"
+    "c) Option C\n"
+    "ex: Explanation here (optional)</code>\n\n"
+    "<b>3) Single-line MCQ</b>\n"
+    "<code>Question? a) A b) B z c) C</code>\n\n"
+    "<b>4) Written / Flashcard</b>\n"
+    "<code>Title\n"
+    "answer line 1\n"
+    "answer line 2</code>\n\n"
+    "<b>5) Images</b>\n"
+    "Send a photo — with a full question as its caption to pair them, with a "
+    "plain caption to add it as a standalone image, or with no caption to be "
+    "asked for the question next.\n\n"
+    "<b>6) Forwarded Quiz Polls</b>\n"
+    "Forward any Telegram quiz — it's added straight to the buffer, using "
+    "Telegram's revealed correct answer where available or asking you to tap "
+    "it otherwise.\n\n"
+    "<b>7) Captioned PDFs</b>\n"
+    "Send a PDF file with a full question as its caption.\n\n"
+    "<b>8) Export</b>\n"
+    "/pdf_generate — builds a PDF from everything collected so far.\n"
+    "Or use the ✏️ Edit / 📄 Export as PDF / 📝 Export as DOCX / 🗑 Clear buttons "
+    "on the progress message.\n\n"
+    "/pdf_clear — clears the current session.\n"
+    "/cancel — cancels whatever's in progress (session, pending image, setup step).\n"
+    "😴 /sleep — mute the bot until /start"
+)
+
+# ═══════════════════════════════════════════════════════════════
+# PDF BUILDER
+# ═══════════════════════════════════════════════════════════════
+def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
+              font_bold_path: str = None, bg_image_path: str = None) -> BytesIO:
+    buffer = BytesIO()
+
+    # Custom font: registered under a name unique to this call so two users'
+    # uploaded fonts (built around the same time) can never clobber each
+    # other in reportlab's global font registry. If a genuine bold weight
+    # file is available (bundled presets only), register it separately so
+    # bold text — the question itself — actually renders heavier than the
+    # options, not just as the same glyphs relabeled "bold". Falls back to
+    # reusing the regular file for bold otherwise (e.g. a plain user
+    # upload, which never comes with a bold companion).
+    font_name, font_name_bold = FONT_NAME, FONT_NAME_BOLD
+    if font_path and os.path.exists(font_path):
+        try:
+            custom_name = f"CustomFont_{abs(hash(font_path)) % 10**8}"
+            pdfmetrics.registerFont(TTFont(custom_name, font_path))
+            font_name = font_name_bold = custom_name
+            if font_bold_path and os.path.exists(font_bold_path):
+                custom_bold_name = f"CustomFontBold_{abs(hash(font_bold_path)) % 10**8}"
+                pdfmetrics.registerFont(TTFont(custom_bold_name, font_bold_path))
+                font_name_bold = custom_bold_name
+        except Exception as e:
+            print(f"Custom PDF font load error: {e} — using default")
+
+    def draw_header(canvas, doc):
+        canvas.saveState()
+        if bg_image_path and os.path.exists(bg_image_path):
+            try:
+                canvas.drawImage(
+                    bg_image_path, 0, 0, width=A4[0], height=A4[1],
+                    preserveAspectRatio=False, mask="auto",
+                )
+            except Exception as e:
+                print(f"PDF background image draw error: {e}")
+        canvas.setStrokeColor(colors.HexColor("#CFD8DC"))
+        canvas.setLineWidth(0.5)
+        canvas.line(2 * cm, A4[1] - 1.65 * cm, A4[0] - 2 * cm, A4[1] - 1.65 * cm)
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2.5*cm, bottomMargin=2*cm,
+    )
+
+    Q_STYLE = ParagraphStyle(
+        "QStyle", fontName=font_name_bold, fontSize=12, leading=16,
+        textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=14,
+    )
+    OPT_STYLE = ParagraphStyle(
+        "OptStyle", fontName=font_name, fontSize=11, leading=15,
+        textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=3,
+    )
+    OPT_CORRECT = ParagraphStyle(
+        "OptCorrect", fontName=font_name_bold, fontSize=11, leading=15,
+        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=3,
+    )
+    WRITTEN_TITLE = ParagraphStyle(
+        "WTitle", fontName=font_name_bold, fontSize=12, leading=16,
+        textColor=colors.HexColor("#1A1A2E"), spaceAfter=4, spaceBefore=14,
+    )
+    WRITTEN_BODY = ParagraphStyle(
+        "WBody", fontName=font_name, fontSize=11, leading=15,
+        textColor=colors.HexColor("#37474F"), leftIndent=14, spaceAfter=6,
+    )
+    NUM_STYLE = ParagraphStyle(
+        "NumStyle", fontName=font_name_bold, fontSize=9,
+        textColor=colors.HexColor("#90A4AE"), spaceAfter=2,
+    )
+    IMG_CAPTION = ParagraphStyle(
+        "ImgCaption", fontName=font_name, fontSize=9, leading=12,
+        textColor=colors.HexColor("#78909C"), spaceAfter=6, spaceBefore=4,
+    )
+
+    HR_COLOR = colors.HexColor("#CFD8DC")
+    story    = []
+
+    for idx, item in enumerate(items, 1):
+        q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
+        story.append(Paragraph(q_num_label, NUM_STYLE))
+
+        if item["type"] == "mcq":
+            story.append(Paragraph(item["q"], Q_STYLE))
+            if item.get("image"):
+                try:
+                    img = RLImage(item["image"])
+                    if img.imageWidth > PDF_MAX_IMG_WIDTH:
+                        scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
+                        img.drawWidth  = PDF_MAX_IMG_WIDTH
+                        img.drawHeight = img.imageHeight * scale
+                    story.append(Spacer(1, 6))
+                    story.append(img)
+                    story.append(Spacer(1, 6))
+                except Exception as e:
+                    story.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+            for i, opt in enumerate(item["options"]):
+                if i == item["correct"]:
+                    story.append(Paragraph(f"✓  {opt}", OPT_CORRECT))
+                else:
+                    story.append(Paragraph(f"     {opt}", OPT_STYLE))
+
+        elif item["type"] == "written":
+            story.append(Paragraph(item["title"], WRITTEN_TITLE))
+            for line in item["content"].split("\n"):
+                line = line.strip()
+                if line:
+                    story.append(Paragraph(f"• {line}", WRITTEN_BODY))
+
+        elif item["type"] == "image":
+            img_path = item["path"]
+            try:
+                img = RLImage(img_path)
+                if img.imageWidth > PDF_MAX_IMG_WIDTH:
+                    scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
+                    img.drawWidth  = PDF_MAX_IMG_WIDTH
+                    img.drawHeight = img.imageHeight * scale
+                story.append(Spacer(1, 8))
+                story.append(img)
+                if item.get("caption"):
+                    story.append(Paragraph(f"📷 {item['caption']}", IMG_CAPTION))
+                story.append(Spacer(1, 4))
+            except Exception as e:
+                story.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+
+        if idx < len(items):
+            story.append(Spacer(1, 6))
+            story.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
+
+    doc.build(story, onFirstPage=draw_header, onLaterPages=draw_header)
+    buffer.seek(0)
+    return buffer
+
+# ═══════════════════════════════════════════════════════════════
+# DOCX BUILDER  — pure Python, no Node.js
+# ═══════════════════════════════════════════════════════════════
+def _hex_to_rgb(hex_color: str):
+    h = hex_color.lstrip("#")
+    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+def _add_paragraph(doc, text: str, bold=False, size_pt=11,
+                   color_hex="1A1A2E", indent_cm=0,
+                   space_before=0, space_after=6,
+                   align=WD_ALIGN_PARAGRAPH.LEFT, font_name: str = None) -> None:
+    p   = doc.add_paragraph()
+    p.alignment = align
+    pf  = p.paragraph_format
+    pf.space_before = Pt(space_before)
+    pf.space_after  = Pt(space_after)
+    if indent_cm:
+        pf.left_indent = Cm(indent_cm)
+    run = p.add_run(text)
+    run.bold        = bold
+    run.font.size   = Pt(size_pt)
+    run.font.color.rgb = _hex_to_rgb(color_hex)
+    if font_name:
+        run.font.name = font_name
+        rpr = run._element.get_or_add_rPr()
+        rFonts = rpr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rpr.append(rFonts)
+        for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+            rFonts.set(qn(attr), font_name)
+    return p
+
+def _add_horizontal_rule(doc):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(4)
+    p.paragraph_format.space_after  = Pt(4)
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"),   "single")
+    bottom.set(qn("w:sz"),    "4")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "CFD8DC")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+def _set_header_border(para):
+    pPr   = para._p.get_or_add_pPr()
+    pBdr  = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"),   "single")
+    bottom.set(qn("w:sz"),    "4")
+    bottom.set(qn("w:space"), "4")
+    bottom.set(qn("w:color"), "CFD8DC")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+def _set_style_font(style, font_name: str) -> None:
+    """Sets a style's font across every script slot Word actually checks —
+    python-docx's high-level Font.name only touches ascii/hAnsi, but Arabic
+    renders off the w:cs slot specifically, so that has to be set
+    explicitly or the custom font silently never applies to Arabic text."""
+    style.font.name = font_name
+    rpr = style.element.get_or_add_rPr()
+    rFonts = rpr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rpr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rFonts.set(qn(attr), font_name)
+
+def _add_docx_page_background(doc, image_path: str) -> None:
+    """Inserts image_path into every section's header as a full-page image
+    anchored behind the text (not a plain inline header image, and not
+    Word's native w:background element — that one's web-layout-only and
+    typically doesn't survive printing or PDF export)."""
+    for section in doc.sections:
+        section.header.is_linked_to_previous = False
+        header = section.header
+        p   = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+        run = p.add_run()
+        run.add_picture(image_path, width=section.page_width, height=section.page_height)
+
+        drawing = run._element.find(qn("w:drawing"))
+        inline  = drawing.find(qn("wp:inline"))
+        extent  = inline.find(qn("wp:extent"))
+        docpr   = inline.find(qn("wp:docPr"))
+        graphic = inline.find(qn("a:graphic"))
+
+        anchor = OxmlElement("wp:anchor")
+        for attr, val in (
+            ("distT", "0"), ("distB", "0"), ("distL", "0"), ("distR", "0"),
+            ("simplePos", "0"), ("relativeHeight", "0"), ("behindDoc", "1"),
+            ("locked", "0"), ("layoutInCell", "1"), ("allowOverlap", "1"),
+        ):
+            anchor.set(attr, val)
+
+        simple_pos = OxmlElement("wp:simplePos")
+        simple_pos.set("x", "0")
+        simple_pos.set("y", "0")
+
+        pos_h = OxmlElement("wp:positionH")
+        pos_h.set("relativeFrom", "page")
+        pos_h_off = OxmlElement("wp:posOffset")
+        pos_h_off.text = "0"
+        pos_h.append(pos_h_off)
+
+        pos_v = OxmlElement("wp:positionV")
+        pos_v.set("relativeFrom", "page")
+        pos_v_off = OxmlElement("wp:posOffset")
+        pos_v_off.text = "0"
+        pos_v.append(pos_v_off)
+
+        effect_extent = OxmlElement("wp:effectExtent")
+        for attr in ("l", "t", "r", "b"):
+            effect_extent.set(attr, "0")
+
+        wrap_none = OxmlElement("wp:wrapNone")
+        cnv_graphic_frame_pr = OxmlElement("wp:cNvGraphicFramePr")
+
+        for el in (simple_pos, pos_h, pos_v, extent, effect_extent, wrap_none, docpr, cnv_graphic_frame_pr, graphic):
+            anchor.append(el)
+
+        drawing.remove(inline)
+        drawing.append(anchor)
+
+def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
+               font_bold_path: str = None, bg_image_path: str = None) -> BytesIO:
+    doc = DocxDocument()
+
+    font_bold_display_name = None
+    if font_path and os.path.exists(font_path):
+        try:
+            font_display_name = TTFont("Probe", font_path).face.name or os.path.splitext(os.path.basename(font_path))[0]
+            _set_style_font(doc.styles["Normal"], font_display_name)
+            if font_bold_path and os.path.exists(font_bold_path):
+                font_bold_display_name = TTFont("Probe", font_bold_path).face.name \
+                    or os.path.splitext(os.path.basename(font_bold_path))[0]
+        except Exception as e:
+            print(f"Custom DOCX font apply error: {e}")
+
+    for section in doc.sections:
+        section.top_margin    = Cm(2.0)
+        section.bottom_margin = Cm(2.0)
+        section.left_margin   = Cm(2.0)
+        section.right_margin  = Cm(2.0)
+
+    if bg_image_path and os.path.exists(bg_image_path):
+        try:
+            _add_docx_page_background(doc, bg_image_path)
+        except Exception as e:
+            print(f"DOCX background image error: {e}")
+
+    header_para = doc.add_paragraph()
+    header_para.paragraph_format.space_after = Pt(8)
+    _set_header_border(header_para)
+
+    for idx, item in enumerate(items, 1):
+        q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
+        _add_paragraph(doc, q_num_label, bold=True, size_pt=8,
+                       color_hex="90A4AE", space_before=10, space_after=2,
+                       font_name=font_bold_display_name)
+
+        if item["type"] == "mcq":
+            _add_paragraph(doc, item["q"], bold=True, size_pt=12,
+                           color_hex="1A1A2E", space_before=0, space_after=4,
+                           font_name=font_bold_display_name)
+            if item.get("image") and os.path.exists(item["image"]):
+                try:
+                    p = doc.add_paragraph()
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.paragraph_format.space_before = Pt(4)
+                    p.paragraph_format.space_after  = Pt(6)
+                    run = p.add_run()
+                    run.add_picture(item["image"], width=Inches(5.5))
+                except Exception as e:
+                    _add_paragraph(doc, f"[Image error: {e}]",
+                                   size_pt=10, color_hex="B71C1C")
+            for i, opt in enumerate(item["options"]):
+                correct = (i == item["correct"])
+                _add_paragraph(
+                    doc,
+                    ("✓  " if correct else "     ") + opt,
+                    bold=correct, size_pt=11,
+                    color_hex="1B5E20" if correct else "1A1A2E",
+                    indent_cm=0.7, space_after=3,
+                    font_name=(font_bold_display_name if correct else None),
+                )
+
+        elif item["type"] == "written":
+            _add_paragraph(doc, item["title"], bold=True, size_pt=12,
+                           color_hex="1A1A2E", space_before=0, space_after=4,
+                           font_name=font_bold_display_name)
+            for line in item["content"].split("\n"):
+                line = line.strip()
+                if line:
+                    _add_paragraph(doc, f"• {line}", bold=False, size_pt=11,
+                                   color_hex="37474F", indent_cm=0.7, space_after=3)
+
+        elif item["type"] == "image":
+            img_path = item.get("path", "")
+            if img_path and os.path.exists(img_path):
+                try:
+                    p = doc.add_paragraph()
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.paragraph_format.space_before = Pt(6)
+                    p.paragraph_format.space_after  = Pt(4)
+                    run = p.add_run()
+                    run.add_picture(img_path, width=Inches(5.5))
+                    if item.get("caption"):
+                        cap = _add_paragraph(
+                            doc, f"📷 {item['caption']}",
+                            bold=False, size_pt=9, color_hex="78909C",
+                            space_after=4,
+                        )
+                        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                except Exception as e:
+                    _add_paragraph(doc, f"[Image error: {e}]",
+                                   size_pt=10, color_hex="B71C1C")
+            else:
+                _add_paragraph(doc, "[Image file not found]",
+                               size_pt=10, color_hex="B71C1C")
+
+        if idx < len(items):
+            _add_horizontal_rule(doc)
+
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+# ═══════════════════════════════════════════════════════════════
+# SLEEP / WAKE
+# ═══════════════════════════════════════════════════════════════
+async def sleep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    SLEEPING.add(user_id)
+    await update.message.reply_text(
+        f"{quizzy_block(QUIZZY_SLEEPING_ART, 'قوزي نام، وأنا نايم معاه 😴')}\n\n"
+        "نادينا بـ /start لما تحتاجنا تاني",
+        parse_mode=ParseMode.HTML,
+    )
+
+# ═══════════════════════════════════════════════════════════════
+# FORWARDED POLL HANDLER
+# ═══════════════════════════════════════════════════════════════
+async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A forwarded (or directly sent) Telegram quiz poll — added straight
+    to the buffer. If Telegram hasn't revealed the correct answer (open
+    quiz not made by this bot), it's queued for a quick button tap
+    instead (see the clarify flow below)."""
+    if not update.message or not update.message.poll:
+        return
+
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+
+    poll = update.message.poll
+    question    = poll.question
+    raw_options = [strip_leading_letter_prefix(opt.text) for opt in poll.options]
+    # Telegram only reveals correct_option_ids if the quiz is closed, or was
+    # sent by our own bot / directly to it — an open quiz forwarded from
+    # someone else comes back empty. We must NOT guess in that case.
+    correct_index = poll.correct_option_ids[0] if poll.correct_option_ids else None
+
+    pending_img = PENDING_IMAGE.pop(user_id, None)
+
+    if user_id not in PDF_BUFFER:
+        await update.message.reply_text(MSG_NOT_IN_SESSION)
+        return
+
+    labeled_options = [
+        f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+    ]
+    item = {
+        "type": "mcq", "q": question,
+        "options": labeled_options, "correct": correct_index,  # None = unknown
+        "poll_id": poll.id,
+    }
+    if pending_img:
+        item["image"] = pending_img
+
+    PDF_BUFFER[user_id].append(item)
+    item_index = len(PDF_BUFFER[user_id]) - 1
+
+    label = ("🖼 " if pending_img else "") + ("~" if correct_index is None else "") \
+            + question[:50] + ("…" if len(question) > 50 else "")
+    await update_progress(context, user_id, update.effective_chat.id, latest_label=label)
+
+    if correct_index is None:
+        # Telegram hid the answer (quiz still open, not ours) — queue it
+        # for a quick button tap instead of silently guessing.
+        POLL_WATCH[poll.id] = (user_id, item_index)
+        queue = CLARIFY_QUEUE.setdefault(user_id, [])
+        queue.append(item_index)
+        if len(queue) == 1:  # nothing else currently being asked
+            await _ask_next_clarification(context, user_id, update.effective_chat.id)
+    else:
+        short = question[:50] + ("…" if len(question) > 50 else "")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ اتسجل: {html.escape(short)}",
+            parse_mode=ParseMode.HTML,
+        )
+
+# ═══════════════════════════════════════════════════════════════
+# POLL UPDATE HANDLER — passive correct-answer backfill. Telegram pushes a
+# fresh Update.poll (with correct_option_ids filled in) to any bot that
+# has previously seen a poll, once that poll is stopped — even for polls
+# the bot didn't create. If the original quiz's creator later ends it, we
+# quietly backfill the answer with no user action needed.
+# ═══════════════════════════════════════════════════════════════
+async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    poll = update.poll
+    if poll is None or not poll.correct_option_ids:
+        return
+
+    watch = POLL_WATCH.pop(poll.id, None)
+    if not watch:
+        return
+    user_id, item_index = watch
+
+    items = PDF_BUFFER.get(user_id)
+    if not items or item_index >= len(items) or items[item_index]["correct"] is not None:
+        return  # buffer changed, or already resolved manually — skip
+
+    item = items[item_index]
+    correct_id = poll.correct_option_ids[0]
+    item["correct"] = correct_id
+
+    queue = CLARIFY_QUEUE.get(user_id, [])
+    if item_index in queue:
+        queue.remove(item_index)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"✅ الكويز الأصلي لسؤال Q{item_index + 1} اتقفل وتليجرام بعت الإجابة الصح تلقائي: "
+                f"{item['options'][correct_id]}"
+            ),
+        )
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
+# CLARIFY QUEUE — when Telegram hasn't revealed a forwarded quiz's correct
+# answer, ask the user directly with A/B/C… buttons.
+# ═══════════════════════════════════════════════════════════════
+async def _ask_next_clarification(context, user_id: int, chat_id: int):
+    """Pop-free peek at the front of the clarify queue and ask about it with
+    inline A/B/C… buttons. Skips (and drops) any stale entries whose buffer
+    item no longer exists (e.g. buffer was cleared mid-queue)."""
+    queue = CLARIFY_QUEUE.get(user_id)
+    while queue:
+        item_index = queue[0]
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items) or items[item_index]["correct"] is not None:
+            queue.pop(0)  # stale or already resolved — skip it
+            continue
+
+        item        = items[item_index]
+        q_num       = item_index + 1
+        first_words = " ".join(item["q"].split()[:5])
+        options_txt = "\n".join(item["options"])  # already "A) ..." labeled
+
+        buttons = [
+            InlineKeyboardButton(string.ascii_uppercase[i], callback_data=f"clarify:{item_index}:{i}")
+            for i in range(len(item["options"]))
+        ]
+        rows = [buttons[i:i + 6] for i in range(0, len(buttons), 6)]
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❓ <b>Choose the correct answer</b>\n"
+                f"for Q{q_num}: {first_words}…\n\n{options_txt}"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    CLARIFY_QUEUE.pop(user_id, None)
+
+# ═══════════════════════════════════════════════════════════════
+# QUESTION REVIEW / EDIT — after a question lands in the buffer, tweak
+# the question text, any option's text, or which option is correct.
+# ═══════════════════════════════════════════════════════════════
+def _review_text(item: dict) -> str:
+    if item["type"] == "written":
+        return f"📝 <b>{html.escape(item['title'])}</b>\n{html.escape(item['content'])}"
+    lines = [f"❓ {html.escape(item['q'])}"]
+    for i, opt in enumerate(item["options"]):
+        mark = "  ✅" if i == item.get("correct") else ""
+        lines.append(html.escape(opt) + mark)
+    return "\n".join(lines)
+
+def _review_buttons(item_index: int, item: dict) -> InlineKeyboardMarkup:
+    if item["type"] == "written":
+        rows = [
+            [InlineKeyboardButton("✏️ عدّل العنوان", callback_data=f"revedit:{item_index}:title")],
+            [InlineKeyboardButton("✏️ عدّل المحتوى", callback_data=f"revedit:{item_index}:content")],
+            [InlineKeyboardButton("✅ تمام، مفيش تعديل", callback_data=f"revedit:{item_index}:done")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    opt_buttons = [
+        InlineKeyboardButton(f"✏️ {string.ascii_uppercase[i]}", callback_data=f"revedit:{item_index}:opt:{i}")
+        for i in range(len(item["options"]))
+    ]
+    rows = [opt_buttons[i:i + 6] for i in range(0, len(opt_buttons), 6)]
+    rows.append([InlineKeyboardButton("✏️ عدّل نص السؤال", callback_data=f"revedit:{item_index}:q")])
+    if item.get("correct") is not None:
+        rows.append([InlineKeyboardButton("🔁 غيّر الإجابة الصح", callback_data=f"revedit:{item_index}:correct")])
+    rows.append([InlineKeyboardButton("✅ تمام، مفيش تعديل", callback_data=f"revedit:{item_index}:done")])
+    return InlineKeyboardMarkup(rows)
+
+# ═══════════════════════════════════════════════════════════════
+# IMAGE HANDLER
+# ═══════════════════════════════════════════════════════════════
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+
+    photo = update.message.photo[-1] if update.message.photo else None
+    if not photo:
+        return
+
+    # ── AWAITING BACKGROUND IMAGE (part of the /pdf_start setup flow) ──
+    if AWAITING_BG.get(user_id):
+        bg_dir  = os.path.join(IMG_BASE_DIR, str(user_id))
+        os.makedirs(bg_dir, exist_ok=True)
+        bg_path = os.path.join(bg_dir, "page_background.jpg")
+        tg_file = await context.bot.get_file(photo.file_id)
+        await tg_file.download_to_drive(bg_path)
+        PDF_BG_IMAGE_PATH[user_id] = bg_path
+        del AWAITING_BG[user_id]
+        await _finish_pdf_setup(context, user_id, update.message)
+        return
+
+    if user_id not in PDF_BUFFER:
+        await update.message.reply_text(MSG_NOT_IN_SESSION)
+        return
+
+    caption = (update.message.caption or "").strip()
+
+    img_dir = os.path.join(IMG_BASE_DIR, str(user_id))
+    os.makedirs(img_dir, exist_ok=True)
+    img_path = os.path.join(img_dir, f"img_{photo.file_unique_id}.jpg")
+    tg_file  = await context.bot.get_file(photo.file_id)
+    await tg_file.download_to_drive(img_path)
+
+    # ── Case 1: caption already IS a complete quiz question ─────────
+    parsed = parse_mcq_block(caption) if caption else None
+    if parsed:
+        question, raw_options, correct_index, explanation = parsed
+        labeled_options = [
+            f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+        ]
+        PDF_BUFFER[user_id].append({
+            "type": "mcq", "q": question,
+            "options": labeled_options, "correct": correct_index,
+            "image": img_path,
+        })
+        await update_progress(
+            context, user_id, update.effective_chat.id,
+            latest_label=f"🖼 {question[:50]}" + ("…" if len(question) > 50 else ""),
+        )
+        return
+
+    # ── Case 2: non-empty caption that ISN'T a full question — save as a
+    # standalone image item (e.g. comparison charts / tables) ──────────
+    if caption:
+        PDF_BUFFER[user_id].append({
+            "type": "image", "path": img_path, "caption": caption,
+        })
+        await update_progress(
+            context, user_id, update.effective_chat.id,
+            latest_label=f"Image — {caption}",
+        )
+        return
+
+    # ── Case 3: no caption — park the image and ask for the question ──
+    _clear_pending_image(user_id)
+    PENDING_IMAGE[user_id] = img_path
+    await update.message.reply_text(
+        "🖼 <b>استلمت الصورة!</b>\n"
+        "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
+        "وهيتضاف الصورة تلقائي للسؤال ده.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Font file (.ttf/.otf) uploaded during the /pdf_start setup flow.
+    Registered on a filter that only matches those two extensions, but
+    still guarded by AWAITING_FONT — an unsolicited font upload outside
+    the setup flow is just ignored, not treated as a command."""
+    if not update.message or not update.message.document:
+        return
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+    if not AWAITING_FONT.get(user_id):
+        return
+
+    doc      = update.message.document
+    font_dir = os.path.join(FONT_BASE_DIR, str(user_id))
+    os.makedirs(font_dir, exist_ok=True)
+    ext       = ".otf" if (doc.file_name or "").lower().endswith(".otf") else ".ttf"
+    font_path = os.path.join(font_dir, f"font{ext}")
+    tg_file   = await context.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(font_path)
+
+    PDF_FONT_PATH[user_id] = font_path
+    PDF_FONT_BOLD_PATH.pop(user_id, None)   # single upload has no bold companion — clear any stale preset one
+    del AWAITING_FONT[user_id]
+    AWAITING_BG[user_id] = True
+    await update.message.reply_text(
+        "✅ الخط اتسجل!\n\n"
+        "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
+        ]]),
+    )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PDFs sent in a private DM: captioned = treated as a manual question
+    (caption parsed as the MCQ text — no attachment, since Telegram polls
+    can only carry a photo, not a PDF). Uncaptioned PDFs are silently ignored."""
+    if not update.message or not update.message.document:
+        return
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+    doc = update.message.document
+    if doc.mime_type != "application/pdf":
+        return
+
+    caption = (update.message.caption or "").strip()
+    if not caption:
+        return
+
+    if user_id not in PDF_BUFFER:
+        await update.message.reply_text(MSG_NOT_IN_SESSION)
+        return
+
+    parsed = parse_mcq_block(caption)
+    if not parsed:
+        await update.message.reply_text(
+            "⚠️ الكابشن مش صيغة سؤال كاملة (لازم سؤال + اختيارات + إجابة صح متعلّم عليها بـ z)."
+        )
+        return
+    question, raw_options, correct_index, explanation = parsed
+    labeled_options = [f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)]
+    PDF_BUFFER[user_id].append({"type": "mcq", "q": question, "options": labeled_options, "correct": correct_index})
+    await update_progress(
+        context, user_id, update.effective_chat.id,
+        latest_label=f"📄 {question[:50]}" + ("…" if len(question) > 50 else ""),
+    )
+
+# ═══════════════════════════════════════════════════════════════
+# TEXT MESSAGE HANDLER
+# ═══════════════════════════════════════════════════════════════
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING:
+        return
+
+    text = update.message.text.strip()
+
+    # ── AWAITING A QUESTION EDIT (from the review/edit prompt) ───
+    pending_edit = PENDING_EDIT.pop(user_id, None)
+    if pending_edit:
+        items = PDF_BUFFER.get(user_id)
+        idx   = pending_edit["index"]
+        if not items or idx >= len(items):
+            await update.message.reply_text("⚠️ السؤال ده مش موجود في البافر دلوقتي.")
+            return
+        item  = items[idx]
+        field = pending_edit["field"]
+
+        if field == "option":
+            opt_idx = pending_edit["opt_index"]
+            if 0 <= opt_idx < len(item["options"]):
+                letter = string.ascii_uppercase[opt_idx]
+                item["options"][opt_idx] = f"{letter}) {text}"
+        elif field in ("q", "title", "content"):
+            item[field] = text
+
+        await update.message.reply_text(
+            "👀 <b>راجع السؤال:</b>\n\n" + _review_text(item) + "\n\nفيه حاجة تانية عايز تعدلها؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_review_buttons(idx, item),
+        )
+        return
+
+    # ── AWAITING PDF NAME ────────────────────────────────────────
+    if AWAITING_NAME.get(user_id):
+        name = text.strip()
+        PDF_NAMES[user_id] = name
+        del AWAITING_NAME[user_id]
+        AWAITING_FONT[user_id] = True
+        await update.message.reply_text(
+            f"📥 <b>الاسم اتسجل:</b> <i>{name}</i>\n\n"
+            "اختار خط جاهز، أو ابعت ملف خط (.ttf أو .otf) بنفسك، أو دوس Skip لو عايز الخط الافتراضي.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=font_prompt_keyboard(),
+        )
+        return
+
+    # ── AWAITING FONT FILE (reminder — the real handling is in
+    #    handle_font_upload/the font_skip button; this only fires if the
+    #    user sends plain text instead) ─────────────────────────────
+    if AWAITING_FONT.get(user_id):
+        await update.message.reply_text(
+            "⚠️ اختار خط من الأزرار فوق، ابعت ملف خط (.ttf أو .otf)، أو دوس Skip.",
+        )
+        return
+
+    # ── AWAITING BACKGROUND IMAGE (same — reminder only) ────────────
+    if AWAITING_BG.get(user_id):
+        await update.message.reply_text(
+            "⚠️ محتاج تبعت صورة كخلفية، أو دوس Skip فوق.",
+        )
+        return
+
+    if user_id not in PDF_BUFFER:
+        await update.message.reply_text(MSG_NOT_IN_SESSION)
+        return
+
+    try:
+        blocks     = re.split(r"\n\s*\n", text)
+        any_saved  = False
+        last_label = ""
+
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+
+            # ── WRITTEN ─────────────────────────────────────────
+            written = parse_written_question(block)
+            if written:
+                title, content = written
+                PDF_BUFFER[user_id].append({
+                    "type":    "written",
+                    "title":   title,
+                    "content": content,
+                })
+                any_saved  = True
+                last_label = title[:50] + ("…" if len(title) > 50 else "")
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"✅ اتسجل: <b>{html.escape(last_label)}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+                continue
+
+            # ── MCQ ─────────────────────────────────────────────
+            lines = normalize_mcq_block(block)
+            if len(lines) < 3:
+                if _looks_like_mcq_attempt(lines):
+                    await update.message.reply_text(
+                        "⚠️ <b>الصياغة غلط!</b>\n\n"
+                        "الشكل الصح هو:\n"
+                        "<code>السؤال\n"
+                        "a) خيار 1\n"
+                        "b) خيار 2 z  ← علّم الصح بـ z\n"
+                        "c) خيار 3\n"
+                        "ex: الشرح (اختياري)</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                continue
+
+            question, raw_options, correct_index, explanation = parse_mcq_lines(lines)
+
+            if correct_index is None or correct_index >= len(raw_options):
+                await update.message.reply_text(
+                    "⚠️ <b>ما فيش إجابة صح!</b>\n\n"
+                    "علّم الإجابة الصحيحة بـ <code>z</code> في نهايتها:\n"
+                    "<code>b) الإجابة الصح z</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                continue
+
+            # An image sent (with no caption / unparseable caption) just
+            # before this message is paired with this question.
+            pending_img = PENDING_IMAGE.pop(user_id, None)
+
+            labeled_options = [
+                f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
+            ]
+            item = {
+                "type": "mcq", "q": question,
+                "options": labeled_options, "correct": correct_index,
+            }
+            if pending_img:
+                item["image"] = pending_img
+            PDF_BUFFER[user_id].append(item)
+            any_saved  = True
+            last_label = ("🖼 " if pending_img else "") + question[:50] + ("…" if len(question) > 50 else "")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ اتسجل: {html.escape(last_label)}",
+                parse_mode=ParseMode.HTML,
+            )
+
+        if any_saved:
+            await update_progress(context, user_id, update.effective_chat.id, last_label)
+
+    except Exception as e:
+        print("ERROR:", e)
+
+# ═══════════════════════════════════════════════════════════════
+# INLINE BUTTON HANDLER
+# ═══════════════════════════════════════════════════════════════
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    if query.data.startswith("clarify:"):
+        _, item_index_str, choice_str = query.data.split(":")
+        item_index = int(item_index_str)
+        choice     = int(choice_str)
+
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items) or items[item_index]["correct"] is not None:
+            await query.edit_message_text("⚠️ السؤال ده اتحل أو اتشال بالفعل.")
+            return
+
+        item = items[item_index]
+        if not (0 <= choice < len(item["options"])):
+            return
+
+        item["correct"] = choice
+        POLL_WATCH.pop(item.get("poll_id"), None)
+
+        queue = CLARIFY_QUEUE.get(user_id, [])
+        if item_index in queue:
+            queue.remove(item_index)
+
+        await query.edit_message_text(
+            f"✅ Q{item_index + 1}: {html.escape(item['options'][choice])}",
+            parse_mode=ParseMode.HTML,
+        )
+
+        if queue:
+            await _ask_next_clarification(context, user_id, query.message.chat_id)
+        else:
+            CLARIFY_QUEUE.pop(user_id, None)
+        return
+
+    # ── QUESTION REVIEW / EDIT ──────────────────────────────────
+    if query.data == "edit_pick":
+        items = PDF_BUFFER.get(user_id, [])
+        if not items:
+            await query.answer("مفيش أسئلة دلوقتي", show_alert=True)
+            return
+        lines = ["✏️ <b>اختار رقم السؤال اللي عايز تعدله:</b>\n"]
+        for i, item in enumerate(items):
+            lines.append(f"{i + 1}. {html.escape(_item_preview_label(item))}")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            reply_markup=edit_pick_keyboard(items),
+        )
+        return
+
+    if query.data == "edit_pick_back":
+        items = PDF_BUFFER.get(user_id, [])
+        await query.edit_message_text(
+            build_progress_text(items), parse_mode=ParseMode.HTML,
+            reply_markup=export_keyboard(),
+        )
+        return
+
+    if query.data.startswith("revedit:"):
+        parts      = query.data.split(":")
+        item_index = int(parts[1])
+        action     = parts[2]
+
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items):
+            await query.edit_message_text("⚠️ السؤال ده مش موجود في البافر دلوقتي.")
+            return
+        item = items[item_index]
+
+        if action == "open":
+            await query.edit_message_text(
+                "✏️ <b>إيه اللي عايز تعدله؟</b>\n\n" + _review_text(item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_review_buttons(item_index, item),
+            )
+            return
+
+        if action == "done":
+            await query.edit_message_text(
+                "✅ <b>خلاص، اتسجل:</b>\n\n" + _review_text(item), parse_mode=ParseMode.HTML
+            )
+            return
+
+        if action in ("q", "title", "content"):
+            PENDING_EDIT[user_id] = {"index": item_index, "field": action}
+            prompt = {
+                "q":       "✏️ اكتب نص السؤال الجديد:",
+                "title":   "✏️ اكتب العنوان الجديد:",
+                "content": "✏️ اكتب المحتوى الجديد:",
+            }[action]
+            await query.edit_message_text(prompt)
+            return
+
+        if action == "opt":
+            opt_idx = int(parts[3])
+            if not (0 <= opt_idx < len(item["options"])):
+                return
+            PENDING_EDIT[user_id] = {"index": item_index, "field": "option", "opt_index": opt_idx}
+            letter = string.ascii_uppercase[opt_idx]
+            await query.edit_message_text(f"✏️ اكتب النص الجديد للاختيار {letter} (من غير الحرف):")
+            return
+
+        if action == "correct":
+            buttons = [
+                InlineKeyboardButton(string.ascii_uppercase[i], callback_data=f"revcorrect:{item_index}:{i}")
+                for i in range(len(item["options"]))
+            ]
+            rows = [buttons[i:i + 6] for i in range(0, len(buttons), 6)]
+            await query.edit_message_text("🔁 اختار الإجابة الصح:", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        return
+
+    if query.data.startswith("revcorrect:"):
+        _, item_index_str, choice_str = query.data.split(":")
+        item_index = int(item_index_str)
+        choice     = int(choice_str)
+
+        items = PDF_BUFFER.get(user_id)
+        if not items or item_index >= len(items):
+            await query.edit_message_text("⚠️ السؤال ده مش موجود في البافر دلوقتي.")
+            return
+        item = items[item_index]
+        if not (0 <= choice < len(item["options"])):
+            return
+
+        item["correct"] = choice
+        await query.edit_message_text(
+            "👀 <b>راجع السؤال:</b>\n\n" + _review_text(item) + "\n\nفيه حاجة تانية عايز تعدلها؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_review_buttons(item_index, item),
+        )
+        return
+
+    # ── PDF SETUP FLOW: font/background skip buttons ────────────────
+    if query.data.startswith("font_preset:"):
+        if not AWAITING_FONT.get(user_id):
+            return
+        idx   = int(query.data.split(":")[1])
+        names = list(BUNDLED_FONTS.keys())
+        if idx >= len(names):
+            return
+        name      = names[idx]
+        font_path = BUNDLED_FONTS[name]["regular"]
+        if not font_path or not os.path.exists(font_path):
+            await query.answer(f"⚠️ ملف {name} مش موجود على السيرفر دلوقتي.", show_alert=True)
+            return
+        bold_path = BUNDLED_FONTS[name]["bold"]
+        PDF_FONT_PATH[user_id] = font_path
+        if bold_path and os.path.exists(bold_path):
+            PDF_FONT_BOLD_PATH[user_id] = bold_path
+        else:
+            PDF_FONT_BOLD_PATH.pop(user_id, None)
+        del AWAITING_FONT[user_id]
+        AWAITING_BG[user_id] = True
+        await query.edit_message_text(
+            f"✅ خط <b>{name}</b> اتحدد!\n\n"
+            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
+            ]]),
+        )
+        return
+
+    if query.data == "font_skip":
+        if not AWAITING_FONT.get(user_id):
+            return
+        PDF_FONT_PATH.pop(user_id, None)
+        PDF_FONT_BOLD_PATH.pop(user_id, None)
+        del AWAITING_FONT[user_id]
+        AWAITING_BG[user_id] = True
+        await query.edit_message_text(
+            "⏭ اتخطيت اختيار الخط.\n\n"
+            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
+            ]]),
+        )
+        return
+
+    if query.data == "bg_skip":
+        if not AWAITING_BG.get(user_id):
+            return
+        del AWAITING_BG[user_id]
+        await _finish_pdf_setup(context, user_id, query.message, edit=True)
+        return
+
+    # ── EXPORT BUTTONS ──────────────────────────────────────────
+    if query.data in ("gen_pdf", "gen_docx", "clear_pdf") and not _pdf_access_allowed(update):
+        await query.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
+
+    items = PDF_BUFFER.get(user_id, [])
+    name  = PDF_NAMES.get(user_id, "questions")
+
+    if query.data == "gen_pdf":
+        if not items:
+            await query.message.reply_text(MSG_EXPORT_EMPTY)
+            return
+        await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="PDF", count=len(items)))
+        await _export_pdf_session(context, query.message, user_id, items, name, fmt="pdf")
+
+    elif query.data == "gen_docx":
+        if not items:
+            await query.message.reply_text(MSG_EXPORT_EMPTY)
+            return
+        await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="DOCX", count=len(items)))
+        await _export_pdf_session(context, query.message, user_id, items, name, fmt="docx")
+
+    elif query.data == "clear_pdf":
+        _reset_pdf_session(user_id)
+        await query.message.reply_text(MSG_EXPORT_CLEARED_ALL)
+
+# ═══════════════════════════════════════════════════════════════
+# EXPORT — build+send PDF/DOCX, then reset the session
+# ═══════════════════════════════════════════════════════════════
+async def _finish_pdf_setup(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+    """Last step of the /pdf_start flow (name → font → background) — opens
+    the actual question buffer and shows the 'PDF mode activated' message.
+    edit=True rewrites reply_target in place (the bg_skip button flow);
+    edit=False sends a fresh reply (there's no bot-owned message to edit
+    when this follows an uploaded background photo instead)."""
+    PDF_BUFFER[user_id] = []
+    PROGRESS_MSG_ID.pop(user_id, None)
+    _clear_pending_image(user_id)
+    _clear_clarify_queue(user_id)
+    _clear_pending_edit(user_id)
+    name = PDF_NAMES.get(user_id, "questions")
+    text = (
+        f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
+        "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
+        "• أو <b>فوروارد</b> كويزات أو صور/جداول مقارنة\n\n"
+        "اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص 👇"
+    )
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(text, parse_mode=ParseMode.HTML)
+
+def _reset_pdf_session(user_id: int) -> None:
+    """Clears everything tied to an in-progress PDF-collection session —
+    used after a successful export and by explicit clear/cancel alike."""
+    _cleanup_images(user_id)
+    _clear_pending_image(user_id)
+    _clear_clarify_queue(user_id)
+    _clear_pending_edit(user_id)
+    PDF_BUFFER.pop(user_id, None)
+    PDF_NAMES.pop(user_id, None)
+    AWAITING_NAME.pop(user_id, None)
+    AWAITING_FONT.pop(user_id, None)
+    AWAITING_BG.pop(user_id, None)
+    PROGRESS_MSG_ID.pop(user_id, None)
+    font_path = PDF_FONT_PATH.pop(user_id, None)
+    # Only delete it if it's a per-user upload (under FONT_BASE_DIR) — never
+    # a bundled preset (under FONTS_DIR), which is a shared asset every
+    # future user picks from, not something owned by this one session.
+    if font_path and font_path.startswith(FONT_BASE_DIR) and os.path.exists(font_path):
+        try:
+            os.remove(font_path)
+        except Exception:
+            pass
+    PDF_FONT_BOLD_PATH.pop(user_id, None)   # always a bundled preset path (or absent) — never a per-user file, nothing to delete
+    bg_path = PDF_BG_IMAGE_PATH.pop(user_id, None)
+    if bg_path and os.path.exists(bg_path):
+        try:
+            os.remove(bg_path)
+        except Exception:
+            pass
+
+async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
+                               items: list, name: str, fmt: str) -> bool:
+    """Builds a PDF or DOCX (fmt='pdf'|'docx') from items, sends it via
+    message.reply_document, and resets the session. Returns False (having
+    already replied with the reason) if DOCX isn't available or the build
+    blew up."""
+    safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
+    font_path      = PDF_FONT_PATH.get(session_id)
+    font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
+    bg_path        = PDF_BG_IMAGE_PATH.get(session_id)
+
+    import asyncio
+    if fmt == "docx":
+        if not DOCX_AVAILABLE:
+            await message.reply_text(MSG_DOCX_UNAVAILABLE)
+            return False
+        try:
+            doc_bytes = await asyncio.to_thread(
+                build_docx, items, name, font_path=font_path,
+                font_bold_path=font_bold_path, bg_image_path=bg_path,
+            )
+        except Exception as e:
+            print("DOCX ERROR:", e)
+            await message.reply_text(
+                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{e}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        await message.reply_document(
+            document=doc_bytes, filename=f"{safe}.docx",
+            caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        try:
+            pdf_bytes = await asyncio.to_thread(
+                build_pdf, items, name, font_path=font_path,
+                font_bold_path=font_bold_path, bg_image_path=bg_path,
+            )
+        except Exception as e:
+            print("PDF ERROR:", e)
+            await message.reply_text(
+                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{e}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return False
+        await message.reply_document(
+            document=pdf_bytes, filename=f"{safe}.pdf",
+            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
+
+    _reset_pdf_session(session_id)
+    return True
+
+# ═══════════════════════════════════════════════════════════════
+# PDF COMMANDS
+# ═══════════════════════════════════════════════════════════════
+async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _pdf_access_allowed(update):
+        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
+    user_id = update.effective_chat.id
+    _reset_pdf_session(user_id)
+    AWAITING_NAME[user_id] = True
+    await update.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
+
+async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _pdf_access_allowed(update):
+        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
+    user_id = update.effective_chat.id
+    items   = PDF_BUFFER.get(user_id, [])
+    if not items:
+        await update.message.reply_text(MSG_PDF_EMPTY)
+        return
+    name = PDF_NAMES.get(user_id, "questions")
+    await update.message.reply_text(MSG_PDF_GENERATING.format(count=len(items)))
+    await _export_pdf_session(context, update.message, user_id, items, name, fmt="pdf")
+
+async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _pdf_access_allowed(update):
+        await update.message.reply_text(MSG_PDF_ACCESS_DENIED)
+        return
+    user_id = update.effective_chat.id
+    _reset_pdf_session(user_id)
+    await update.message.reply_text(MSG_PDF_CLEARED)
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bails out of whatever's in progress: PDF collection session (or its
+    font/background setup step) or a pending image waiting for its question."""
+    user_id = update.effective_chat.id
+    was_doing_something = bool(
+        PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
+        or AWAITING_FONT.get(user_id) or AWAITING_BG.get(user_id)
+        or PENDING_IMAGE.get(user_id)
+    )
+    _reset_pdf_session(user_id)
+    if was_doing_something:
+        await update.message.reply_text(MSG_CANCEL_DONE)
+    else:
+        await update.message.reply_text(MSG_CANCEL_NOTHING)
+
+# ═══════════════════════════════════════════════════════════════
+# START / HELP
+# ═══════════════════════════════════════════════════════════════
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    SLEEPING.discard(chat_id)
+    await update.message.reply_text(
+        f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
+        "📄 <b>Quizician PDF/DOCX Bot</b>\n\n"
+        "استخدم /pdf_start عشان تبدأ تجمع أسئلة وتصدرها PDF أو DOCX.\n"
+        "/c لعرض كل الأوامر.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [
+        "📖 <b>Available commands:</b>\n",
+        "/start — greeting",
+        "/pdf_start — starts a session collecting questions for a PDF/DOCX",
+        "/pdf_generate — builds a PDF from what you've collected so far",
+        "/pdf_clear — clears the current session",
+        "/cancel — cancels whatever's currently in progress",
+        "😴 /sleep — pauses the bot temporarily in this chat",
+        "/c — this list",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def how_to_use_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
+# GLOBAL ERROR HANDLER — no ERROR_LOG_GROUP_ID channel here (that whole
+# system stayed behind in the main bot); just a stderr traceback so a bad
+# update never silently vanishes without at least a console trace.
+# ═══════════════════════════════════════════════════════════════
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print("UNHANDLED ERROR:", context.error)
+    traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .rate_limiter(AIORateLimiter())
+    .build()
+)
+
+app.add_error_handler(global_error_handler)
+
+app.add_handler(CommandHandler("start",        start))
+app.add_handler(CommandHandler("c",            commands_cmd))
+app.add_handler(CommandHandler("how_to_use",   how_to_use_cmd))
+app.add_handler(CommandHandler("cancel",       cancel_cmd))
+app.add_handler(CommandHandler("sleep",        sleep_cmd))
+app.add_handler(CommandHandler("pdf_start",    pdf_start))
+app.add_handler(CommandHandler("pdf_generate", pdf_generate))
+app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
+
+# Poll handler before text handler (forwarded OR own quiz polls)
+app.add_handler(MessageHandler(filters.POLL, handle_poll))
+
+# Image handler (photos)
+app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+
+# Font-file handler (.ttf/.otf uploads during /pdf_start setup) — must be
+# registered before the general PDF/document handler below since it's a
+# different mime/extension entirely.
+app.add_handler(MessageHandler(
+    filters.Document.FileExtension("ttf") | filters.Document.FileExtension("otf"),
+    handle_font_upload,
+))
+
+# PDF handler — captioned PDFs in a private DM are parsed as manual MCQs.
+app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+
+# Inline buttons
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(PollHandler(poll_update_handler))
+
+# Text handler last
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+if __name__ == "__main__":
+    print("Quizician PDF/DOCX bot starting…")
+    app.run_polling()
