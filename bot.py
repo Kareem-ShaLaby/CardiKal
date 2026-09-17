@@ -1938,7 +1938,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SLEEPING.discard(chat_id)
     await update.message.reply_text(
         f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
-        "📄 <b>Quizician PDF/DOCX Bot</b>\n\n"
+        "📄 <b>أنا كارديكال، بس تقدر تناديني كاردي 😉 </b>\n\n"
         "استخدم /pdf_start عشان تبدأ تجمع أسئلة وتصدرها PDF أو DOCX.\n"
         "/c لعرض كل الأوامر.",
         parse_mode=ParseMode.HTML,
