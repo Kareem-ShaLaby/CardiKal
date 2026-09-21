@@ -10,7 +10,7 @@ from io import BytesIO
 # ═══════════════════════════════════════════════════════════════
 # FILE INDEX
 # ═══════════════════════════════════════════════════════════════
-#  This is a surgical extraction of ONLY the PDF/DOCX collection-and-export
+#  This is a surgical extraction of ONLY the PDF collection-and-export
 #  feature out of the original Quizician bot.py — no XP/analytics, no
 #  lecture/quiz-channel system, no Daily Quiz, no settings, no backups.
 #  PDF_BUFFER (and everything else below) is in-memory only, same as it
@@ -27,7 +27,6 @@ from io import BytesIO
 #  300   KEYBOARD HELPERS
 #  360   HOW TO USE TEXT
 #  380   PDF BUILDER
-#  520   DOCX BUILDER
 #  770   SLEEP / WAKE
 #  790   FORWARDED POLL HANDLER
 #  840   POLL UPDATE HANDLER (passive correct-answer backfill)
@@ -38,7 +37,7 @@ from io import BytesIO
 # 1090   DOCUMENT HANDLER (captioned PDFs)
 # 1120   TEXT MESSAGE HANDLER
 # 1260   INLINE BUTTON HANDLER
-# 1440   EXPORT (build+send PDF/DOCX, session reset)
+# 1440   EXPORT (build+send PDF, session reset)
 # 1500   PDF COMMANDS (/pdf_start, /pdf_generate, /pdf_clear, /cancel)
 # 1540   START / HELP
 # 1570   MAIN
@@ -65,18 +64,6 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas as _canvas
-
-try:
-    from docx import Document as DocxDocument
-    from docx.shared import Pt, RGBColor, Inches, Cm
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement, parse_xml
-    DOCX_AVAILABLE = True
-except ImportError:
-    # python-docx (and its lxml dependency) not installed — DOCX export is
-    # simply disabled until it's installed; PDF export works fine either way.
-    DOCX_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════
 # FONT SETUP
@@ -146,24 +133,34 @@ _FALLBACK_CANDIDATES = [
     ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/segoeuib.ttf"),
 ]
 
-def _discover_extra_fallbacks():
-    """Any .ttf/.ttc dropped into ./fonts/fallback/ joins the chain."""
-    extra = []
+def _discover_bundled_fallbacks():
+    """Fonts shipped WITH the bot in ./fonts/fallback/ (DejaVu is included).
+    These come FIRST in the chain and are the reason glyphs still render on
+    a bare host image that has no system fonts installed. Pairs like
+    Foo.ttf + Foo-Bold.ttf are matched up automatically; any extra .ttf you
+    drop in there joins the chain too."""
+    found = []
     try:
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "fallback")
         if os.path.isdir(d):
-            for fn in sorted(os.listdir(d)):
-                if fn.lower().endswith((".ttf", ".ttc")):
-                    extra.append((os.path.join(d, fn), None))
-    except Exception:
-        pass
-    return extra
+            files = sorted(f for f in os.listdir(d) if f.lower().endswith((".ttf", ".ttc")))
+            lower = {f.lower(): f for f in files}
+            for fn in files:
+                stem, ext = os.path.splitext(fn)
+                if stem.lower().endswith(("-bold", "bold")) and stem.lower() != "bold":
+                    continue                                   # attached to its regular below
+                bold = lower.get((stem + "-Bold" + ext).lower()) or lower.get((stem + "Bold" + ext).lower())
+                found.append((os.path.join(d, fn), os.path.join(d, bold) if bold else None))
+    except Exception as e:
+        print(f"fallback folder scan error: {e}")
+    return found
 
 # Chains hold registered reportlab font NAMES, in priority order.
 FALLBACK_CHAIN:      list = []
 FALLBACK_CHAIN_BOLD: list = []
 _seen_fallback_paths = set()
-for _i, (_reg_path, _bold_path) in enumerate(_FALLBACK_CANDIDATES + _discover_extra_fallbacks()):
+# Bundled fonts first (guaranteed present), then whatever the host happens to have.
+for _i, (_reg_path, _bold_path) in enumerate(_discover_bundled_fallbacks() + _FALLBACK_CANDIDATES):
     if not os.path.exists(_reg_path) or _reg_path in _seen_fallback_paths:
         continue
     _seen_fallback_paths.add(_reg_path)
@@ -188,6 +185,17 @@ for _i, (_reg_path, _bold_path) in enumerate(_FALLBACK_CANDIDATES + _discover_ex
 # still sees a single "primary" fallback name.
 FALLBACK_FONT_NAME      = FALLBACK_CHAIN[0]      if FALLBACK_CHAIN      else None
 FALLBACK_FONT_NAME_BOLD = FALLBACK_CHAIN_BOLD[0] if FALLBACK_CHAIN_BOLD else None
+
+if not FALLBACK_CHAIN:
+    # This is THE cause of '?' in the PDF: with no fallback font, every
+    # character Poppins lacks (superscripts, arrows, Greek, math, Arabic…)
+    # has nowhere to go. Say so loudly instead of failing quietly.
+    print("=" * 70)
+    print("WARNING: NO FALLBACK FONTS LOADED — special characters will print as '?'.")
+    print("  Expected DejaVuSans.ttf in:",
+          os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "fallback"))
+    print("  Fix: make sure the fonts/ folder is deployed alongside bot.py.")
+    print("=" * 70)
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -284,13 +292,8 @@ MSG_EXPORT_EMPTY = "❌ لا يوجد أسئلة محفوظة بعد"
 MSG_EXPORT_GENERATING = "⏳ جاري توليد {kind} لـ {count} عنصر..."
 MSG_PDF_GENERATING = "⏳ جاري توليد PDF لـ {count} عنصر..."
 MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ({label}) ❤️\n\n <i>{quizzy_line}</i>"
-MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ({label}) ❤️\n\n <i>{quizzy_line}</i>"
 LABEL_ANSWERED = "بالإجابات"
 LABEL_BLANK = "بدون إجابات"
-MSG_DOCX_UNAVAILABLE = (
-    "❌ DOCX export مش متاح دلوقتي (python-docx مش متثبت). "
-    "استخدم PDF Export بدل كده، أو ثبّت python-docx وأعد التشغيل."
-)
 MSG_PDF_CLEARED = "🗑 تم قرار إزالة يا دولي"
 MSG_EXPORT_CLEARED_ALL = "🗑 تم قرار إزاله يا دولي"
 MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
@@ -428,7 +431,7 @@ def parse_written_question(block: str):
 
 # ═══════════════════════════════════════════════════════════════
 # GLYPH SAFETY — makes sure no character ever renders as a blank box
-# or crashes the PDF/DOCX build. Three layers:
+# or crashes the PDF build. Three layers:
 #   1. normalize_text()     — strips invisible junk, maps emoji → drawable
 #                             symbols, shapes Arabic (optional libs)
 #   2. pdf_safe_markup()    — per-character fallback down the font CHAIN
@@ -582,7 +585,7 @@ def normalize_text(text, shape_rtl: bool = False) -> str:
     - NFC-normalizes (so 'é' as e+◌́ becomes a single drawable glyph)
     - maps emoji/odd spaces to drawable equivalents
     - drops invisible / crashing characters
-    - optionally shapes Arabic/Hebrew (PDF only; Word does its own shaping)"""
+    - optionally shapes Arabic/Hebrew (PDF text is drawn with no shaper, so we do it)"""
     import unicodedata
     if text is None:
         return ""
@@ -727,17 +730,6 @@ def pdf_safe_markup(text: str, font_name: str, fallback_name: str = None,
         out.append("</font>")
     return "".join(out)
 
-def docx_safe_text(text) -> str:
-    """DOCX variant: same emoji/invisible-char cleanup, but NO Arabic
-    shaping/reordering — Word shapes and orders RTL text itself, and
-    pre-shaped glyphs would come out doubly-processed (broken). Crucially
-    strips NUL/control chars/lone surrogates, which make python-docx raise
-    'All strings must be XML compatible'."""
-    try:
-        return normalize_text(text, shape_rtl=False)
-    except Exception:
-        return "".join(c for c in str(text or "") if c == "\n" or (ord(c) >= 32 and not 0xD800 <= ord(c) <= 0xDFFF))
-
 _LEADING_BULLET_RE = re.compile(r"^\s*(?:[•●○◦▪▫■□◆◇▸▹►▻‣⁃∙·*\-–—✓✔☑➤➢➔→»]+\s+)+")
 
 def _strip_leading_bullet(line: str) -> str:
@@ -856,8 +848,6 @@ async def update_progress(context, user_id: int, chat_id: int, latest_label: str
 # ═══════════════════════════════════════════════════════════════
 def export_keyboard():
     row = [InlineKeyboardButton("📄 Export as PDF", callback_data="gen_pdf")]
-    if DOCX_AVAILABLE:
-        row.append(InlineKeyboardButton("📝 Export as DOCX", callback_data="gen_docx"))
     return InlineKeyboardMarkup([
         row,
         [InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
@@ -901,7 +891,7 @@ def font_prompt_keyboard() -> InlineKeyboardMarkup:
 # HOW TO USE TEXT
 # ═══════════════════════════════════════════════════════════════
 HOW_TO_USE_TEXT = (
-    "📄 <b>How To Use — Quizician PDF/DOCX Bot</b>\n\n"
+    "📄 <b>How To Use — Quizician PDF Bot</b>\n\n"
     "<b>1) Start a session</b>\n"
     "/pdf_start — pick a name, a font, and a page background, then start sending content.\n\n"
     "<b>2) Normal MCQ</b>\n"
@@ -928,7 +918,7 @@ HOW_TO_USE_TEXT = (
     "Send a PDF file with a full question as its caption.\n\n"
     "<b>8) Export</b>\n"
     "/pdf_generate — builds a PDF from everything collected so far.\n"
-    "Or use the ✏️ Edit / 📄 Export as PDF / 📝 Export as DOCX / 🗑 Clear buttons "
+    "Or use the ✏️ Edit / 📄 Export as PDF / 🗑 Clear buttons "
     "on the progress message.\n\n"
     "/pdf_clear — clears the current session.\n"
     "/cancel — cancels whatever's in progress (session, pending image, setup step).\n"
@@ -1213,349 +1203,6 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         )
 
     doc.build(story, onFirstPage=draw_header, onLaterPages=draw_header, canvasmaker=_make_canvas)
-    buffer.seek(0)
-    return buffer
-
-# ═══════════════════════════════════════════════════════════════
-# DOCX BUILDER  — pure Python, no Node.js
-# ═══════════════════════════════════════════════════════════════
-def _hex_to_rgb(hex_color: str):
-    h = hex_color.lstrip("#")
-    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
-
-def _add_paragraph(doc, text: str, bold=False, size_pt=11,
-                   color_hex="1A1A2E", indent_cm=0,
-                   space_before=0, space_after=6,
-                   align=WD_ALIGN_PARAGRAPH.LEFT, font_name: str = None) -> None:
-    p   = doc.add_paragraph()
-    p.alignment = align
-    pf  = p.paragraph_format
-    pf.space_before = Pt(space_before)
-    pf.space_after  = Pt(space_after)
-    if indent_cm:
-        pf.left_indent = Cm(indent_cm)
-    run = p.add_run(docx_safe_text(text))
-    run.bold        = bold
-    run.font.size   = Pt(size_pt)
-    run.font.color.rgb = _hex_to_rgb(color_hex)
-    if font_name:
-        run.font.name = font_name
-        rpr = run._element.get_or_add_rPr()
-        rFonts = rpr.find(qn("w:rFonts"))
-        if rFonts is None:
-            rFonts = OxmlElement("w:rFonts")
-            rpr.append(rFonts)
-        for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
-            rFonts.set(qn(attr), font_name)
-    return p
-
-def _add_horizontal_rule(doc):
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(4)
-    p.paragraph_format.space_after  = Pt(4)
-    pPr = p._p.get_or_add_pPr()
-    pBdr = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"),   "single")
-    bottom.set(qn("w:sz"),    "4")
-    bottom.set(qn("w:space"), "1")
-    bottom.set(qn("w:color"), "CFD8DC")
-    pBdr.append(bottom)
-    pPr.append(pBdr)
-
-def _set_header_border(para):
-    pPr   = para._p.get_or_add_pPr()
-    pBdr  = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"),   "single")
-    bottom.set(qn("w:sz"),    "4")
-    bottom.set(qn("w:space"), "4")
-    bottom.set(qn("w:color"), "CFD8DC")
-    pBdr.append(bottom)
-    pPr.append(pBdr)
-
-def _set_style_font(style, font_name: str) -> None:
-    """Sets a style's font across every script slot Word actually checks —
-    python-docx's high-level Font.name only touches ascii/hAnsi, but Arabic
-    renders off the w:cs slot specifically, so that has to be set
-    explicitly or the custom font silently never applies to Arabic text."""
-    style.font.name = font_name
-    rpr = style.element.get_or_add_rPr()
-    rFonts = rpr.find(qn("w:rFonts"))
-    if rFonts is None:
-        rFonts = OxmlElement("w:rFonts")
-        rpr.append(rFonts)
-    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
-        rFonts.set(qn(attr), font_name)
-
-def _add_docx_page_background(doc, image_path: str) -> None:
-    """Inserts image_path into every section's header as a full-page image
-    anchored behind the text (not a plain inline header image, and not
-    Word's native w:background element — that one's web-layout-only and
-    typically doesn't survive printing or PDF export)."""
-    for section in doc.sections:
-        section.header.is_linked_to_previous = False
-        header = section.header
-        p   = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
-        run = p.add_run()
-        run.add_picture(image_path, width=section.page_width, height=section.page_height)
-
-        drawing = run._element.find(qn("w:drawing"))
-        inline  = drawing.find(qn("wp:inline"))
-        extent  = inline.find(qn("wp:extent"))
-        docpr   = inline.find(qn("wp:docPr"))
-        graphic = inline.find(qn("a:graphic"))
-
-        anchor = OxmlElement("wp:anchor")
-        for attr, val in (
-            ("distT", "0"), ("distB", "0"), ("distL", "0"), ("distR", "0"),
-            ("simplePos", "0"), ("relativeHeight", "0"), ("behindDoc", "1"),
-            ("locked", "0"), ("layoutInCell", "1"), ("allowOverlap", "1"),
-        ):
-            anchor.set(attr, val)
-
-        simple_pos = OxmlElement("wp:simplePos")
-        simple_pos.set("x", "0")
-        simple_pos.set("y", "0")
-
-        pos_h = OxmlElement("wp:positionH")
-        pos_h.set("relativeFrom", "page")
-        pos_h_off = OxmlElement("wp:posOffset")
-        pos_h_off.text = "0"
-        pos_h.append(pos_h_off)
-
-        pos_v = OxmlElement("wp:positionV")
-        pos_v.set("relativeFrom", "page")
-        pos_v_off = OxmlElement("wp:posOffset")
-        pos_v_off.text = "0"
-        pos_v.append(pos_v_off)
-
-        effect_extent = OxmlElement("wp:effectExtent")
-        for attr in ("l", "t", "r", "b"):
-            effect_extent.set(attr, "0")
-
-        wrap_none = OxmlElement("wp:wrapNone")
-        cnv_graphic_frame_pr = OxmlElement("wp:cNvGraphicFramePr")
-
-        for el in (simple_pos, pos_h, pos_v, extent, effect_extent, wrap_none, docpr, cnv_graphic_frame_pr, graphic):
-            anchor.append(el)
-
-        drawing.remove(inline)
-        drawing.append(anchor)
-
-def _apply_keep_together(paragraphs: list) -> None:
-    """Chains a group of paragraphs so Word never breaks a page inside the
-    group — the DOCX equivalent of the PDF's KeepTogether. keep_together
-    stops a single paragraph splitting mid-text; keep_with_next glues each
-    paragraph to the one after it, so the whole chain moves to the next
-    page together if it doesn't fit."""
-    for i, p in enumerate(paragraphs):
-        p.paragraph_format.keep_together = True
-        if i < len(paragraphs) - 1:
-            p.paragraph_format.keep_with_next = True
-
-def _add_docx_answer_key(doc, pairs: list) -> None:
-    """Adds a small bordered box listing the given MCQ number(s)/correct
-    letter(s), pinned to the bottom-right corner of whichever page the
-    anchor paragraph lands on — the DOCX equivalent of the PDF's answer-
-    key overlay. Built as a legacy VML textbox (w:pict/v:rect) rather than
-    a modern DrawingML text box because VML's 'mso-position-*:right/bottom'
-    + 'relative:margin' keywords let Word do the page-edge math itself
-    relative to whatever page the anchor paragraph ends up on — which is
-    what lets this be called once per page (each anchored right after
-    that page's own question) for a true per-page key, not just once at
-    the very end. Each call needs a distinct shape id or Word treats the
-    repeated id as a corrupt duplicate, so it's derived from the first
-    question number in `pairs` (unique per call in practice, since every
-    question number is only ever put in one key)."""
-    if not pairs:
-        return
-
-    shape_suffix = pairs[0][0]
-    per_row = 5
-    lines = [
-        "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
-        for i in range(0, len(pairs), per_row)
-    ]
-    body_runs = "".join(
-        ("<w:br/>" if i else "") + f'<w:t xml:space="preserve">{html.escape(line)}</w:t>'
-        for i, line in enumerate(lines)
-    )
-    box_height_pt = 34 + 14 * len(lines)  # title row + one row per line, plus padding
-    xml = f'''<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-                       xmlns:v="urn:schemas-microsoft-com:vml"
-                       xmlns:o="urn:schemas-microsoft-com:office:office">
-<v:rect id="AnswerKeyBox{shape_suffix}" o:spid="_x0000_s{2001 + shape_suffix}"
-        style="position:absolute;width:190pt;height:{box_height_pt}pt;
-               mso-position-horizontal:right;mso-position-horizontal-relative:margin;
-               mso-position-vertical:bottom;mso-position-vertical-relative:margin;
-               mso-width-percent:0;mso-height-percent:0;
-               z-index:{251659264 + shape_suffix}"
-        fillcolor="#F5F7F8" strokecolor="#90A4AE" strokeweight=".75pt">
-  <v:textbox inset="8pt,6pt,8pt,6pt">
-    <w:txbxContent>
-      <w:p>
-        <w:pPr><w:spacing w:after="80"/></w:pPr>
-        <w:r><w:rPr><w:b/><w:sz w:val="20"/><w:color w:val="1A1A2E"/></w:rPr><w:t>Answer Key</w:t></w:r>
-      </w:p>
-      <w:p>
-        <w:pPr><w:spacing w:after="0"/></w:pPr>
-        <w:r><w:rPr><w:sz w:val="18"/><w:color w:val="1A1A2E"/></w:rPr>{body_runs}</w:r>
-      </w:p>
-    </w:txbxContent>
-  </v:textbox>
-</v:rect>
-</w:pict>'''
-
-    anchor_p = doc.add_paragraph()
-    anchor_p.paragraph_format.space_before = Pt(0)
-    anchor_p.paragraph_format.space_after  = Pt(0)
-    anchor_p.add_run()._r.append(parse_xml(xml))
-
-def _ttf_display_name(path: str) -> str:
-    """A TTF's internal family name as a real str. reportlab's face.name is
-    a TTFNameBytes (bytes subclass) in current versions, which python-docx
-    rejects ('value must be a string') — that silently disabled custom
-    fonts in DOCX. Falls back to the filename if the name can't be read."""
-    fallback = os.path.splitext(os.path.basename(path))[0]
-    try:
-        n = TTFont("Probe", path).face.name
-        if isinstance(n, (bytes, bytearray)):
-            n = bytes(n).decode("utf-8", "ignore")
-        n = str(n).strip() if n else ""
-        return n or fallback
-    except Exception:
-        return fallback
-
-def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
-               font_bold_path: str = None, bg_image_path: str = None,
-               show_answers: bool = True) -> BytesIO:
-    doc = DocxDocument()
-
-    font_bold_display_name = None
-    if font_path and os.path.exists(font_path):
-        try:
-            font_display_name = _ttf_display_name(font_path)
-            _set_style_font(doc.styles["Normal"], font_display_name)
-            if font_bold_path and os.path.exists(font_bold_path):
-                font_bold_display_name = _ttf_display_name(font_bold_path)
-        except Exception as e:
-            print(f"Custom DOCX font apply error: {e}")
-
-    for section in doc.sections:
-        section.top_margin    = Cm(2.0)
-        section.bottom_margin = Cm(2.0)
-        section.left_margin   = Cm(2.0)
-        section.right_margin  = Cm(2.0)
-
-    if bg_image_path and os.path.exists(bg_image_path):
-        try:
-            _add_docx_page_background(doc, bg_image_path)
-        except Exception as e:
-            print(f"DOCX background image error: {e}")
-
-    header_para = doc.add_paragraph()
-    header_para.paragraph_format.space_after = Pt(8)
-    _set_header_border(header_para)
-
-    answer_pairs = []  # (question_number, letter) for the bottom-right answer key
-
-    for idx, item in enumerate(items, 1):
-        block_paragraphs = []  # everything for this one question — kept together on one page
-
-        q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
-        block_paragraphs.append(_add_paragraph(
-            doc, q_num_label, bold=True, size_pt=8,
-            color_hex="90A4AE", space_before=10, space_after=2,
-            font_name=font_bold_display_name,
-        ))
-
-        if item["type"] == "mcq":
-            block_paragraphs.append(_add_paragraph(
-                doc, item["q"], bold=True, size_pt=12,
-                color_hex="1A1A2E", space_before=0, space_after=4,
-                font_name=font_bold_display_name,
-            ))
-            if item.get("image") and os.path.exists(item["image"]):
-                try:
-                    p = doc.add_paragraph()
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    p.paragraph_format.space_before = Pt(4)
-                    p.paragraph_format.space_after  = Pt(6)
-                    run = p.add_run()
-                    run.add_picture(item["image"], width=Inches(5.5))
-                    block_paragraphs.append(p)
-                except Exception as e:
-                    block_paragraphs.append(_add_paragraph(
-                        doc, f"[Image error: {e}]", size_pt=10, color_hex="B71C1C"))
-            for i, opt in enumerate(item["options"]):
-                correct = show_answers and (i == item["correct"])
-                block_paragraphs.append(_add_paragraph(
-                    doc,
-                    ("✓  " if correct else "     ") + opt,
-                    bold=correct, size_pt=11,
-                    color_hex="1B5E20" if correct else "1A1A2E",
-                    indent_cm=0.7, space_after=3,
-                    font_name=(font_bold_display_name if correct else None),
-                ))
-            if item.get("correct") is not None:
-                answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
-
-        elif item["type"] == "written":
-            block_paragraphs.append(_add_paragraph(
-                doc, item["title"], bold=True, size_pt=12,
-                color_hex="1A1A2E", space_before=0, space_after=4,
-                font_name=font_bold_display_name,
-            ))
-            for line in item["content"].split("\n"):
-                line = line.strip()
-                if line:
-                    block_paragraphs.append(_add_paragraph(
-                        doc, f"• {_strip_leading_bullet(line)}", bold=False, size_pt=11,
-                        color_hex="37474F", indent_cm=0.7, space_after=3))
-
-        elif item["type"] == "image":
-            img_path = item.get("path", "")
-            if img_path and os.path.exists(img_path):
-                try:
-                    p = doc.add_paragraph()
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    p.paragraph_format.space_before = Pt(6)
-                    p.paragraph_format.space_after  = Pt(4)
-                    run = p.add_run()
-                    run.add_picture(img_path, width=Inches(5.5))
-                    block_paragraphs.append(p)
-                    if item.get("caption"):
-                        cap = _add_paragraph(
-                            doc, f"{item['caption']}",
-                            bold=False, size_pt=9, color_hex="78909C",
-                            space_after=4,
-                        )
-                        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        block_paragraphs.append(cap)
-                except Exception as e:
-                    block_paragraphs.append(_add_paragraph(
-                        doc, f"[Image error: {e}]", size_pt=10, color_hex="B71C1C"))
-            else:
-                block_paragraphs.append(_add_paragraph(
-                    doc, "[Image file not found]", size_pt=10, color_hex="B71C1C"))
-
-        _apply_keep_together(block_paragraphs)
-
-        # Word decides its own page breaks at display time (depending on
-        # the reader's fonts, zoom, page size) so there's no way to know
-        # ahead of time which questions will share a page, unlike the PDF
-        # where we control layout directly. The only reliable way to give
-        # each page its own answer key here is to force exactly one
-        # question per page, then anchor that question's own key to it.
-        if item.get("type") == "mcq" and item.get("correct") is not None:
-            _add_docx_answer_key(doc, [answer_pairs[-1]])
-
-        if idx < len(items):
-            doc.add_page_break()
-
-    buffer = BytesIO()
-    doc.save(buffer)
     buffer.seek(0)
     return buffer
 
@@ -1852,7 +1499,7 @@ async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     AWAITING_BG[user_id] = True
     await update.message.reply_text(
         "✅ الخط اتسجل!\n\n"
-        "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+        "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
         ]]),
@@ -2210,7 +1857,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         AWAITING_BG[user_id] = True
         await query.edit_message_text(
             f"✅ خط <b>{name}</b> اتحدد!\n\n"
-            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
@@ -2227,7 +1874,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         AWAITING_BG[user_id] = True
         await query.edit_message_text(
             "⏭ اتخطيت اختيار الخط.\n\n"
-            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF/DOCX، أو دوس Skip لو مش عايز خلفية.",
+            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
             ]]),
@@ -2250,21 +1897,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(MSG_EXPORT_EMPTY)
             return
         await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="PDF", count=len(items)))
-        await _export_pdf_session(context, query.message, user_id, items, name, fmt="pdf")
-
-    elif query.data == "gen_docx":
-        if not items:
-            await query.message.reply_text(MSG_EXPORT_EMPTY)
-            return
-        await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="DOCX", count=len(items)))
-        await _export_pdf_session(context, query.message, user_id, items, name, fmt="docx")
+        await _export_pdf_session(context, query.message, user_id, items, name)
 
     elif query.data == "clear_pdf":
         _reset_pdf_session(user_id)
         await query.message.reply_text(MSG_EXPORT_CLEARED_ALL)
 
 # ═══════════════════════════════════════════════════════════════
-# EXPORT — build+send PDF/DOCX, then reset the session
+# EXPORT — build+send PDF, then reset the session
 # ═══════════════════════════════════════════════════════════════
 async def _finish_pdf_setup(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
     """Last step of the /pdf_start flow (name → font → background) — opens
@@ -2282,7 +1922,7 @@ async def _finish_pdf_setup(context: ContextTypes.DEFAULT_TYPE, user_id: int, re
         f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
         "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
         "• أو <b>فوروارد</b> كويزات أو صور/جداول مقارنة\n\n"
-        "اضغط <b>Export as PDF</b> أو <b>Export as DOCX</b> لما تخلص 👇"
+        "اضغط <b>Export as PDF</b> لما تخلص 👇"
     )
     send = reply_target.edit_text if edit else reply_target.reply_text
     await send(text, parse_mode=ParseMode.HTML)
@@ -2318,84 +1958,49 @@ def _reset_pdf_session(user_id: int) -> None:
             pass
 
 async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
-                               items: list, name: str, fmt: str) -> bool:
-    """Builds a PDF or DOCX (fmt='pdf'|'docx') from items and sends TWO
-    versions via message.reply_document — one with correct options marked
-    in green plus the answer key, one with no options marked but still
-    carrying the answer key — then resets the session. Returns False
-    (having already replied with the reason) if DOCX isn't available or a
-    build blew up."""
+                               items: list, name: str) -> bool:
+    """Builds the PDF from items and sends TWO versions via
+    message.reply_document — one with correct options marked in green plus
+    the answer key, one with no options marked but still carrying the answer
+    key — then resets the session. Returns False (having already replied
+    with the reason) if a build blew up."""
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
     font_path      = PDF_FONT_PATH.get(session_id)
     font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
     bg_path        = PDF_BG_IMAGE_PATH.get(session_id)
 
     import asyncio
-    if fmt == "docx":
-        if not DOCX_AVAILABLE:
-            await message.reply_text(MSG_DOCX_UNAVAILABLE)
-            return False
-        try:
-            answered_bytes = await asyncio.to_thread(
-                build_docx, items, name, font_path=font_path,
-                font_bold_path=font_bold_path, bg_image_path=bg_path,
-                show_answers=True,
-            )
-            blank_bytes = await asyncio.to_thread(
-                build_docx, items, name, font_path=font_path,
-                font_bold_path=font_bold_path, bg_image_path=bg_path,
-                show_answers=False,
-            )
-        except Exception as e:
-            print("DOCX ERROR:", e)
-            await message.reply_text(
-                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{e}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return False
-        await message.reply_document(
-            document=answered_bytes, filename=f"{safe}_answered.docx",
-            caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, label=LABEL_ANSWERED,
-                                             quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+    try:
+        answered_bytes = await asyncio.to_thread(
+            build_pdf, items, name, font_path=font_path,
+            font_bold_path=font_bold_path, bg_image_path=bg_path,
+            show_answers=True,
+        )
+        blank_bytes = await asyncio.to_thread(
+            build_pdf, items, name, font_path=font_path,
+            font_bold_path=font_bold_path, bg_image_path=bg_path,
+            show_answers=False,
+        )
+    except Exception as e:
+        print("PDF ERROR:", e)
+        traceback.print_exc()
+        await message.reply_text(
+            f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{html.escape(str(e))}</code>",
             parse_mode=ParseMode.HTML,
         )
-        await message.reply_document(
-            document=blank_bytes, filename=f"{safe}_blank.docx",
-            caption=MSG_DOCX_CAPTION.format(count=len(items), name=name, label=LABEL_BLANK,
-                                             quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        try:
-            answered_bytes = await asyncio.to_thread(
-                build_pdf, items, name, font_path=font_path,
-                font_bold_path=font_bold_path, bg_image_path=bg_path,
-                show_answers=True,
-            )
-            blank_bytes = await asyncio.to_thread(
-                build_pdf, items, name, font_path=font_path,
-                font_bold_path=font_bold_path, bg_image_path=bg_path,
-                show_answers=False,
-            )
-        except Exception as e:
-            print("PDF ERROR:", e)
-            await message.reply_text(
-                f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{e}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return False
-        await message.reply_document(
-            document=answered_bytes, filename=f"{safe}_answered.pdf",
-            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_ANSWERED,
-                                            quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-            parse_mode=ParseMode.HTML,
-        )
-        await message.reply_document(
-            document=blank_bytes, filename=f"{safe}_blank.pdf",
-            caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_BLANK,
-                                            quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-            parse_mode=ParseMode.HTML,
-        )
+        return False
+    await message.reply_document(
+        document=answered_bytes, filename=f"{safe}_answered.pdf",
+        caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_ANSWERED,
+                                        quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+        parse_mode=ParseMode.HTML,
+    )
+    await message.reply_document(
+        document=blank_bytes, filename=f"{safe}_blank.pdf",
+        caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_BLANK,
+                                        quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+        parse_mode=ParseMode.HTML,
+    )
 
     _reset_pdf_session(session_id)
     return True
@@ -2417,7 +2022,7 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     name = PDF_NAMES.get(user_id, "questions")
     await update.message.reply_text(MSG_PDF_GENERATING.format(count=len(items)))
-    await _export_pdf_session(context, update.message, user_id, items, name, fmt="pdf")
+    await _export_pdf_session(context, update.message, user_id, items, name)
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
@@ -2448,7 +2053,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
         "📄 <b>أنا كارديكال، بس تقدر تناديني كاردي 😉 </b>\n\n"
-        "استخدم /pdf_start عشان تبدأ تجمع أسئلة وتصدرها PDF أو DOCX.\n"
+        "استخدم /pdf_start عشان تبدأ تجمع أسئلة وتصدرها PDF.\n"
         "/c لعرض كل الأوامر.",
         parse_mode=ParseMode.HTML,
     )
@@ -2457,7 +2062,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         "📖 <b>Available commands:</b>\n",
         "/start — greeting",
-        "/pdf_start — starts a session collecting questions for a PDF/DOCX",
+        "/pdf_start — starts a session collecting questions for a PDF",
         "/pdf_generate — builds a PDF from what you've collected so far",
         "/pdf_clear — clears the current session",
         "/cancel — cancels whatever's currently in progress",
@@ -2524,5 +2129,5 @@ app.add_handler(PollHandler(poll_update_handler))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
 if __name__ == "__main__":
-    print("Quizician PDF/DOCX bot starting…")
+    print("Quizician PDF bot starting…")
     app.run_polling()

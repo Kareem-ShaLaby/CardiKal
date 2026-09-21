@@ -1,5 +1,6 @@
-python-telegram-bot[job-queue,rate-limiter]>=21.0
+python-telegram-bot[rate-limiter]
 reportlab
-python-docx
-requests
-PyMuPDF
+# Needed for Arabic (and Hebrew) to render joined and in the right direction.
+# Without these the bot still runs, but Arabic text comes out disconnected/reversed.
+arabic-reshaper
+python-bidi
