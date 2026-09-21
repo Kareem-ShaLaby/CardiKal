@@ -57,7 +57,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Image as RLImage, KeepTogether, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Image as RLImage, KeepTogether, Flowable
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -96,6 +96,39 @@ if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
         print("Poppins font loaded")
     except Exception as e:
         print(f"Poppins load error: {e} — using Helvetica")
+
+# A broad-Unicode fallback used ONLY for individual characters the active
+# PDF font can't display (superscripts like ⁻¹⁵, arrows ↑→↓, math/Greek
+# symbols, Arabic, etc.) — none of Poppins or the bundled preset fonts
+# cover these, so those characters were silently rendering blank. DejaVu
+# Sans covers all of the above and ships as a standard system package
+# (fonts-dejavu-core) on most Linux hosts, including typical Railway
+# images, so this is best-effort: if it isn't present, text just falls
+# back to the old behavior instead of erroring.
+_FALLBACK_CANDIDATES = [
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+    ("/usr/share/fonts/dejavu/DejaVuSans.ttf",
+     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
+]
+FALLBACK_FONT_NAME      = None
+FALLBACK_FONT_NAME_BOLD = None
+for _reg_path, _bold_path in _FALLBACK_CANDIDATES:
+    if os.path.exists(_reg_path):
+        try:
+            pdfmetrics.registerFont(TTFont("PDFFallback", _reg_path))
+            FALLBACK_FONT_NAME = "PDFFallback"
+            if os.path.exists(_bold_path):
+                pdfmetrics.registerFont(TTFont("PDFFallback-Bold", _bold_path))
+                FALLBACK_FONT_NAME_BOLD = "PDFFallback-Bold"
+            else:
+                FALLBACK_FONT_NAME_BOLD = FALLBACK_FONT_NAME
+            print(f"PDF fallback glyph font loaded from {_reg_path}")
+            break
+        except Exception as e:
+            print(f"Fallback font load error ({_reg_path}): {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -238,7 +271,11 @@ def clean_option(line: str) -> str:
     return line.strip()
 
 def strip_leading_letter_prefix(option: str) -> str:
-    return re.sub(r"^[A-Ea-e]\)\s*", "", option).strip()
+    # Was only stripping "a)"-style markers, not "a." or "a-" — kept via
+    # clean_option so every path that later prepends "A) " (forwarded
+    # polls included) strips the SAME set of original markers first,
+    # instead of forwarded polls double-labeling as "A) a. text".
+    return clean_option(option)
 
 _MCQ_OPTION_PREFIX_RE = re.compile(r"^[A-Ea-e1-5][).\-]\s*")
 
@@ -329,6 +366,63 @@ def parse_written_question(block: str):
     if content:
         return title, content
     return None
+
+def _font_has_glyph(font_name: str, ch: str) -> bool:
+    """Best-effort check for whether a registered PDF font can display a
+    given character. TTF-based fonts (Poppins, bundled presets, a user's
+    uploaded font, our DejaVu fallback) expose the set of codepoints they
+    actually contain via face.charWidths; for the base14 standard fonts
+    (plain Helvetica) that don't, fall back to assuming Latin-1 coverage,
+    which is what those fonts can actually reach without embedding."""
+    try:
+        face = pdfmetrics.getFont(font_name).face
+        widths = getattr(face, "charWidths", None)
+        if widths is not None:
+            return ord(ch) in widths
+    except Exception:
+        pass
+    return ord(ch) < 256
+
+def pdf_safe_markup(text: str, font_name: str, fallback_name: str = None) -> str:
+    """Escapes text for use inside a reportlab Paragraph (which parses a
+    small XML-like markup language) and wraps any run of characters the
+    active font can't display — superscripts like ⁻¹⁵, arrows ↑→↓, Greek/
+    math symbols, Arabic when the active font doesn't cover it, etc. — in
+    a <font face="..."> span pointing at a broad-coverage fallback font,
+    so those characters actually render instead of silently vanishing.
+    Falls back to plain escaping if no fallback font was loaded."""
+    if not text:
+        return ""
+    if not fallback_name:
+        return html.escape(text)
+
+    out, buf, in_fallback = [], [], False
+
+    def flush():
+        if buf:
+            out.append(html.escape("".join(buf)))
+            buf.clear()
+
+    for ch in text:
+        # Control chars (newlines etc.) ride along with whatever run
+        # they're already in — checking them against font coverage isn't
+        # meaningful and would wrongly force a font switch around them.
+        if ord(ch) < 32:
+            needs_fallback = in_fallback
+        else:
+            needs_fallback = (not _font_has_glyph(font_name, ch)) and _font_has_glyph(fallback_name, ch)
+        if needs_fallback != in_fallback:
+            flush()
+            if in_fallback:
+                out.append("</font>")
+            in_fallback = needs_fallback
+            if in_fallback:
+                out.append(f'<font face="{fallback_name}">')
+        buf.append(ch)
+    flush()
+    if in_fallback:
+        out.append("</font>")
+    return "".join(out)
 
 def _cleanup_images(user_id: int):
     import shutil
@@ -504,19 +598,45 @@ HOW_TO_USE_TEXT = (
     "😴 /sleep — mute the bot until /start"
 )
 
+class _PageRecorder(Flowable):
+    """Zero-size flowable placed right after a scored MCQ (inside the same
+    KeepTogether block, so it always lands on that question's page). When
+    Platypus actually draws it, self.canv.getPageNumber() tells us which
+    physical page the question ended up on — the only way to know that,
+    since page breaks aren't decided until the story is flowed. Recorded
+    into `record[key]`, read back afterwards to group answer_pairs by
+    page for the per-page answer key."""
+    def __init__(self, record: dict, key):
+        Flowable.__init__(self)
+        self.width  = 0
+        self.height = 0
+        self._record = record
+        self._key    = key
+
+    def wrap(self, availWidth, availHeight):
+        return (0, 0)
+
+    def draw(self):
+        self._record[self._key] = self.canv.getPageNumber()
+
 # ═══════════════════════════════════════════════════════════════
 # ANSWER KEY OVERLAY — a small bordered box stamped onto the bottom-right
-# corner of the LAST page only. Reportlab's Platypus flow can't know where
-# the last page ends until the whole document has been laid out, so this
-# uses the standard two-pass Canvas trick: buffer every page via showPage(),
-# then on save() replay them, drawing the box on top of the final one only.
+# corner of EVERY page that has at least one scored MCQ, listing only
+# that page's questions. Reportlab's Platypus flow can't know where page
+# breaks fall until the whole document has been laid out, so this uses
+# the standard two-pass Canvas trick: buffer every page via showPage(),
+# then on save() replay them, drawing each page's own box on top.
+# `page_of_idx` (question number -> 1-indexed page number) is filled in
+# by _PageRecorder flowables during the same build() pass, and is fully
+# populated by the time save() runs at the very end of it.
 # ═══════════════════════════════════════════════════════════════
 class _AnswerKeyCanvas(_canvas.Canvas):
-    def __init__(self, *args, answer_pairs=None, font_name=FONT_NAME,
-                 font_name_bold=FONT_NAME_BOLD, **kwargs):
+    def __init__(self, *args, answer_pairs=None, page_of_idx=None,
+                 font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD, **kwargs):
         super().__init__(*args, **kwargs)
         self._ak_pages      = []
         self._answer_pairs  = answer_pairs or []
+        self._page_of_idx   = page_of_idx if page_of_idx is not None else {}
         self._ak_font       = font_name
         self._ak_font_bold  = font_name_bold
 
@@ -526,15 +646,24 @@ class _AnswerKeyCanvas(_canvas.Canvas):
 
     def save(self):
         total = len(self._ak_pages)
+        # Group each answer pair under the page its question was recorded
+        # on; a pair whose page never got recorded (shouldn't normally
+        # happen) safely falls off rather than crashing the export.
+        pairs_by_page = {}
+        for q_num, letter in self._answer_pairs:
+            page_no = self._page_of_idx.get(q_num)
+            if page_no:
+                pairs_by_page.setdefault(page_no, []).append((q_num, letter))
+
         for i, state in enumerate(self._ak_pages):
             self.__dict__.update(state)
-            if i == total - 1 and self._answer_pairs:
-                self._draw_answer_key()
+            page_pairs = pairs_by_page.get(i + 1)
+            if page_pairs:
+                self._draw_answer_key(page_pairs)
             super().showPage()
         super().save()
 
-    def _draw_answer_key(self):
-        pairs   = self._answer_pairs
+    def _draw_answer_key(self, pairs):
         per_row = 5
         lines   = [
             "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
@@ -616,7 +745,12 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     doc = SimpleDocTemplate(
         buffer, pagesize=A4,
         leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=2.5*cm, bottomMargin=2*cm,
+        topMargin=2.5*cm,
+        # Extra bottom margin (vs. the plain 2cm content uses elsewhere)
+        # reserves room for the per-page answer-key box so normal flowing
+        # text doesn't get laid out underneath where that box will later
+        # be stamped on top of it.
+        bottomMargin=3.6*cm,
     )
 
     Q_STYLE = ParagraphStyle(
@@ -651,7 +785,8 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     HR_COLOR = colors.HexColor("#CFD8DC")
     story    = []
 
-    answer_pairs = []  # (question_number, letter) for the bottom-right answer key
+    answer_pairs = []  # (question_number, letter) for the per-page answer key
+    page_of_idx  = {}   # question_number -> 1-indexed page it lands on, filled in during doc.build()
 
     for idx, item in enumerate(items, 1):
         block = []  # everything for this one question — kept together on one page
@@ -660,7 +795,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         block.append(Paragraph(q_num_label, NUM_STYLE))
 
         if item["type"] == "mcq":
-            block.append(Paragraph(item["q"], Q_STYLE))
+            block.append(Paragraph(pdf_safe_markup(item["q"], font_name_bold, FALLBACK_FONT_NAME_BOLD), Q_STYLE))
             if item.get("image"):
                 try:
                     img = RLImage(item["image"])
@@ -672,21 +807,23 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     block.append(img)
                     block.append(Spacer(1, 6))
                 except Exception as e:
-                    block.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+                    block.append(Paragraph(f"[Image error: {html.escape(str(e))}]", WRITTEN_BODY))
             for i, opt in enumerate(item["options"]):
+                safe_opt = pdf_safe_markup(opt, font_name, FALLBACK_FONT_NAME)
                 if show_answers and i == item["correct"]:
-                    block.append(Paragraph(f"✓  {opt}", OPT_CORRECT))
+                    block.append(Paragraph(f"✓  {safe_opt}", OPT_CORRECT))
                 else:
-                    block.append(Paragraph(f"     {opt}", OPT_STYLE))
+                    block.append(Paragraph(f"     {safe_opt}", OPT_STYLE))
             if item.get("correct") is not None:
                 answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
+                block.append(_PageRecorder(page_of_idx, idx))
 
         elif item["type"] == "written":
-            block.append(Paragraph(item["title"], WRITTEN_TITLE))
+            block.append(Paragraph(pdf_safe_markup(item["title"], font_name_bold, FALLBACK_FONT_NAME_BOLD), WRITTEN_TITLE))
             for line in item["content"].split("\n"):
                 line = line.strip()
                 if line:
-                    block.append(Paragraph(f"• {line}", WRITTEN_BODY))
+                    block.append(Paragraph(f"• {pdf_safe_markup(line, font_name, FALLBACK_FONT_NAME)}", WRITTEN_BODY))
 
         elif item["type"] == "image":
             img_path = item["path"]
@@ -699,10 +836,11 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 block.append(Spacer(1, 8))
                 block.append(img)
                 if item.get("caption"):
-                    block.append(Paragraph(f"📷 {item['caption']}", IMG_CAPTION))
+                    safe_cap = pdf_safe_markup(item["caption"], font_name, FALLBACK_FONT_NAME)
+                    block.append(Paragraph(f"📷 {safe_cap}", IMG_CAPTION))
                 block.append(Spacer(1, 4))
             except Exception as e:
-                block.append(Paragraph(f"[Image error: {e}]", WRITTEN_BODY))
+                block.append(Paragraph(f"[Image error: {html.escape(str(e))}]", WRITTEN_BODY))
 
         story.append(KeepTogether(block))
 
@@ -710,16 +848,9 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             story.append(Spacer(1, 6))
             story.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
 
-    # The box is stamped onto the last page by the canvas below, so give it
-    # a fresh page of its own — otherwise it can land on top of whatever
-    # question happens to end near the bottom margin.
-    if answer_pairs:
-        story.append(PageBreak())
-        story.append(Spacer(1, 1))  # reportlab drops a trailing PageBreak with nothing after it
-
     def _make_canvas(*args, **kwargs):
         return _AnswerKeyCanvas(
-            *args, answer_pairs=answer_pairs,
+            *args, answer_pairs=answer_pairs, page_of_idx=page_of_idx,
             font_name=font_name, font_name_bold=font_name_bold, **kwargs,
         )
 
@@ -866,19 +997,23 @@ def _apply_keep_together(paragraphs: list) -> None:
             p.paragraph_format.keep_with_next = True
 
 def _add_docx_answer_key(doc, pairs: list) -> None:
-    """Adds a small bordered box listing every MCQ's number and correct
-    letter, pinned to the bottom-right corner of the page — the DOCX
-    equivalent of the PDF's answer-key overlay. Built as a legacy VML
-    textbox (w:pict/v:rect) rather than a modern DrawingML text box because
-    VML's 'mso-position-*:right/bottom' keywords let Word do the page-edge
-    math itself; there's no way to know where the "last page" lands ahead
-    of time in a flowing Word document, so this is attached to a paragraph
-    appended right after the final question — wherever that paragraph
-    renders is the page the box appears on, which in practice is the last
-    page."""
+    """Adds a small bordered box listing the given MCQ number(s)/correct
+    letter(s), pinned to the bottom-right corner of whichever page the
+    anchor paragraph lands on — the DOCX equivalent of the PDF's answer-
+    key overlay. Built as a legacy VML textbox (w:pict/v:rect) rather than
+    a modern DrawingML text box because VML's 'mso-position-*:right/bottom'
+    + 'relative:margin' keywords let Word do the page-edge math itself
+    relative to whatever page the anchor paragraph ends up on — which is
+    what lets this be called once per page (each anchored right after
+    that page's own question) for a true per-page key, not just once at
+    the very end. Each call needs a distinct shape id or Word treats the
+    repeated id as a corrupt duplicate, so it's derived from the first
+    question number in `pairs` (unique per call in practice, since every
+    question number is only ever put in one key)."""
     if not pairs:
         return
 
+    shape_suffix = pairs[0][0]
     per_row = 5
     lines = [
         "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
@@ -892,12 +1027,12 @@ def _add_docx_answer_key(doc, pairs: list) -> None:
     xml = f'''<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                        xmlns:v="urn:schemas-microsoft-com:vml"
                        xmlns:o="urn:schemas-microsoft-com:office:office">
-<v:rect id="AnswerKeyBox" o:spid="_x0000_s2001"
+<v:rect id="AnswerKeyBox{shape_suffix}" o:spid="_x0000_s{2001 + shape_suffix}"
         style="position:absolute;width:190pt;height:{box_height_pt}pt;
                mso-position-horizontal:right;mso-position-horizontal-relative:margin;
                mso-position-vertical:bottom;mso-position-vertical-relative:margin;
                mso-width-percent:0;mso-height-percent:0;
-               z-index:251659264"
+               z-index:{251659264 + shape_suffix}"
         fillcolor="#F5F7F8" strokecolor="#90A4AE" strokeweight=".75pt">
   <v:textbox inset="8pt,6pt,8pt,6pt">
     <w:txbxContent>
@@ -1035,15 +1170,17 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
 
         _apply_keep_together(block_paragraphs)
 
-        if idx < len(items):
-            _add_horizontal_rule(doc)
+        # Word decides its own page breaks at display time (depending on
+        # the reader's fonts, zoom, page size) so there's no way to know
+        # ahead of time which questions will share a page, unlike the PDF
+        # where we control layout directly. The only reliable way to give
+        # each page its own answer key here is to force exactly one
+        # question per page, then anchor that question's own key to it.
+        if item.get("type") == "mcq" and item.get("correct") is not None:
+            _add_docx_answer_key(doc, [answer_pairs[-1]])
 
-    # The box is anchored to whichever paragraph it's attached to, so give
-    # it a fresh page of its own — otherwise it can land on top of the
-    # last question if that page still has room left at the bottom.
-    if answer_pairs:
-        doc.add_page_break()
-    _add_docx_answer_key(doc, answer_pairs)
+        if idx < len(items):
+            doc.add_page_break()
 
     buffer = BytesIO()
     doc.save(buffer)
