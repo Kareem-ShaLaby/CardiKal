@@ -97,38 +97,97 @@ if os.path.exists(_POPPINS_REG) and os.path.exists(_POPPINS_BOLD):
     except Exception as e:
         print(f"Poppins load error: {e} — using Helvetica")
 
-# A broad-Unicode fallback used ONLY for individual characters the active
-# PDF font can't display (superscripts like ⁻¹⁵, arrows ↑→↓, math/Greek
-# symbols, Arabic, etc.) — none of Poppins or the bundled preset fonts
-# cover these, so those characters were silently rendering blank. DejaVu
-# Sans covers all of the above and ships as a standard system package
-# (fonts-dejavu-core) on most Linux hosts, including typical Railway
-# images, so this is best-effort: if it isn't present, text just falls
-# back to the old behavior instead of erroring.
+# ─── FALLBACK FONT CHAIN ────────────────────────────────────────
+# No single font covers every script/symbol, so instead of one fallback we
+# keep an ORDERED CHAIN. For each character the active font can't draw, we
+# walk the chain and use the first font that actually has that glyph.
+#
+# IMPORTANT reportlab limitation: it can only embed TrueType-outline fonts.
+# CFF/PostScript-outline .otf files, most .ttc collections (e.g. Noto CJK)
+# and colour-emoji fonts raise TTFError, so those are skipped automatically
+# by the try/except below — they are NOT an error, just unusable here.
+#
+# Order matters: broad symbol/math/Arabic/Cyrillic coverage first, then
+# progressively more exotic scripts. Every path is best-effort — anything
+# missing on the host is silently skipped. To extend coverage on your host,
+# just drop a .ttf into ./fonts/fallback/ (picked up automatically) or
+# `apt install fonts-dejavu-core fonts-freefont-ttf fonts-noto-core
+# fonts-wqy-zenhei`.
 _FALLBACK_CANDIDATES = [
+    # (regular, bold-or-None)
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-    ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
     ("/usr/share/fonts/dejavu/DejaVuSans.ttf",
      "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+    ("/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+     "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf"),
+    ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+     "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"),
+    ("/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf", None),
+    ("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf", None),
+    ("/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf", None),
+    ("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+     "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"),
+    ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", None),           # CJK + Hangul
+    ("/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf", None),      # Japanese
+    ("/usr/share/fonts/truetype/fonts-japanese-gothic.ttf", None),
+    ("/usr/share/fonts/truetype/unifont/unifont.ttf", None),          # huge BMP coverage
+    ("/usr/share/fonts/truetype/ttf-bitstream-vera/Vera.ttf", None),
+    ("/Library/Fonts/Arial Unicode.ttf", None),                       # macOS
+    ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", None),
+    ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),   # Windows
+    ("C:/Windows/Fonts/seguisym.ttf", None),
+    ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/segoeuib.ttf"),
 ]
-FALLBACK_FONT_NAME      = None
-FALLBACK_FONT_NAME_BOLD = None
-for _reg_path, _bold_path in _FALLBACK_CANDIDATES:
-    if os.path.exists(_reg_path):
-        try:
-            pdfmetrics.registerFont(TTFont("PDFFallback", _reg_path))
-            FALLBACK_FONT_NAME = "PDFFallback"
-            if os.path.exists(_bold_path):
-                pdfmetrics.registerFont(TTFont("PDFFallback-Bold", _bold_path))
-                FALLBACK_FONT_NAME_BOLD = "PDFFallback-Bold"
-            else:
-                FALLBACK_FONT_NAME_BOLD = FALLBACK_FONT_NAME
-            print(f"PDF fallback glyph font loaded from {_reg_path}")
-            break
-        except Exception as e:
-            print(f"Fallback font load error ({_reg_path}): {e}")
+
+def _discover_extra_fallbacks():
+    """Any .ttf/.ttc dropped into ./fonts/fallback/ joins the chain."""
+    extra = []
+    try:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "fallback")
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                if fn.lower().endswith((".ttf", ".ttc")):
+                    extra.append((os.path.join(d, fn), None))
+    except Exception:
+        pass
+    return extra
+
+# Chains hold registered reportlab font NAMES, in priority order.
+FALLBACK_CHAIN:      list = []
+FALLBACK_CHAIN_BOLD: list = []
+_seen_fallback_paths = set()
+for _i, (_reg_path, _bold_path) in enumerate(_FALLBACK_CANDIDATES + _discover_extra_fallbacks()):
+    if not os.path.exists(_reg_path) or _reg_path in _seen_fallback_paths:
+        continue
+    _seen_fallback_paths.add(_reg_path)
+    try:
+        _reg_name = f"PDFFallback{_i}"
+        pdfmetrics.registerFont(TTFont(_reg_name, _reg_path))
+        _bold_name = _reg_name
+        if _bold_path and os.path.exists(_bold_path):
+            try:
+                _bold_name = f"PDFFallback{_i}-Bold"
+                pdfmetrics.registerFont(TTFont(_bold_name, _bold_path))
+            except Exception:
+                _bold_name = _reg_name
+        FALLBACK_CHAIN.append(_reg_name)
+        FALLBACK_CHAIN_BOLD.append(_bold_name)
+        print(f"PDF fallback font loaded: {os.path.basename(_reg_path)}")
+    except Exception as e:
+        # Expected for CFF .otf / colour-emoji / some .ttc — reportlab can't embed them.
+        print(f"PDF fallback skipped ({os.path.basename(_reg_path)}): {str(e)[:70]}")
+
+# Back-compat aliases: the rest of the file (and anything importing this)
+# still sees a single "primary" fallback name.
+FALLBACK_FONT_NAME      = FALLBACK_CHAIN[0]      if FALLBACK_CHAIN      else None
+FALLBACK_FONT_NAME_BOLD = FALLBACK_CHAIN_BOLD[0] if FALLBACK_CHAIN_BOLD else None
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -367,13 +426,212 @@ def parse_written_question(block: str):
         return title, content
     return None
 
+# ═══════════════════════════════════════════════════════════════
+# GLYPH SAFETY — makes sure no character ever renders as a blank box
+# or crashes the PDF/DOCX build. Three layers:
+#   1. normalize_text()     — strips invisible junk, maps emoji → drawable
+#                             symbols, shapes Arabic (optional libs)
+#   2. pdf_safe_markup()    — per-character fallback down the font CHAIN
+#   3. everything wrapped   — a bad char degrades to "?" and never raises
+# ═══════════════════════════════════════════════════════════════
+
+# Optional Arabic support. If these aren't installed, Arabic is simply left
+# as-is (still renders, just unjoined) instead of the bot failing to start.
+#   pip install arabic-reshaper python-bidi
+try:
+    import arabic_reshaper as _arabic_reshaper
+    from bidi.algorithm import get_display as _bidi_get_display
+    ARABIC_SHAPING_AVAILABLE = True
+except Exception:
+    ARABIC_SHAPING_AVAILABLE = False
+
+# Characters with NO visible glyph in any font. Left in, they show up as
+# empty squares (▯) or stray gaps, so they're removed. NOTE: ZWJ/ZWNJ are
+# only meaningful for scripts that need shaping; since we pre-shape Arabic
+# ourselves and draw with plain TTFs (no shaper), they'd render as boxes.
+_INVISIBLE_CHARS = {
+    0x00AD,                      # soft hyphen
+    0x034F,                      # combining grapheme joiner
+    0x061C,                      # arabic letter mark
+    0x115F, 0x1160, 0x17B4, 0x17B5,
+    0x180B, 0x180C, 0x180D, 0x180E,   # mongolian free variation selectors
+    0x200B, 0x200C, 0x200D, 0x200E, 0x200F,  # zero-width space/joiners/marks
+    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,  # bidi embeddings/overrides
+    0x2060, 0x2061, 0x2062, 0x2063, 0x2064,  # word joiner + invisible operators
+    0x2066, 0x2067, 0x2068, 0x2069,          # bidi isolates
+    0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F,
+    0x3164, 0xFEFF, 0xFFA0,                  # hangul fillers, BOM
+    0xFFF9, 0xFFFA, 0xFFFB,                  # interlinear annotation
+    0xFFFC, 0xFFFD,                          # object replacement / replacement char
+}
+# Variation selectors (VS1–VS16, VS17–VS256) — the emoji "make it colourful"
+# selector (U+FE0F) is the classic cause of a blank box after a ✔/⚠ etc.
+_VARIATION_SELECTORS = set(range(0xFE00, 0xFE10)) | set(range(0xE0100, 0xE01F0))
+# Emoji tag characters used in flag sequences (🏴󠁧󠁢󠁥󠁮󠁧󠁿) — invisible on their own.
+_TAG_CHARS = set(range(0xE0000, 0xE0080))
+# Skin-tone modifiers (🏻–🏿) — they'd render as a coloured box alone.
+_SKIN_TONES = set(range(0x1F3FB, 0x1F400))
+
+# Emoji → a symbol that EXISTS in ordinary monochrome TTFs, so the meaning
+# survives instead of a blank. Anything emoji-ish NOT listed here is handled
+# by the generic fallback in _replace_unrenderable().
+_EMOJI_MAP = {
+    "✅": "✓", "✔": "✓", "☑": "✓", "🗹": "✓", "✓": "✓",
+    "❌": "✗", "✖": "✗", "❎": "✗", "☒": "✗", "🗙": "✗", "✘": "✗",
+    "⚠": "!", "❗": "!", "❕": "!", "‼": "!!", "❓": "?", "❔": "?", "⁉": "?!",
+    "📷": "[img]", "📸": "[img]", "🖼": "[img]", "📹": "[video]", "🎥": "[video]",
+    "📄": "[doc]", "📃": "[doc]", "📑": "[doc]", "📝": "[note]", "📋": "[list]",
+    "📌": "•", "📍": "•", "🔹": "◆", "🔸": "◆", "🔺": "▲", "🔻": "▼",
+    "🔴": "●", "🟠": "●", "🟡": "●", "🟢": "●", "🔵": "●", "🟣": "●", "⚫": "●", "⚪": "○",
+    "🟥": "■", "🟧": "■", "🟨": "■", "🟩": "■", "🟦": "■", "🟪": "■", "⬛": "■", "⬜": "□",
+    "⭐": "★", "🌟": "★", "✨": "*", "💫": "*",
+    "➡": "→", "⬅": "←", "⬆": "↑", "⬇": "↓", "↗": "↗", "↘": "↘", "↙": "↙", "↖": "↖",
+    "▶": "▶", "◀": "◀", "🔼": "▲", "🔽": "▼", "⏩": "»", "⏪": "«",
+    "➕": "+", "➖": "−", "➗": "÷", "✖️": "×",
+    "💡": "*", "🔥": "*", "💯": "100", "🎯": "•", "🏆": "*", "🎓": "•",
+    "📚": "•", "📖": "•", "🔬": "•", "🧪": "•", "🧬": "•", "💊": "•", "💉": "•",
+    "🩺": "•", "🫀": "•", "🧠": "•", "🦠": "•", "🩸": "•", "🫁": "•", "🦴": "•",
+    "👉": "→", "👈": "←", "👆": "↑", "👇": "↓", "👍": "+", "👎": "−",
+    "😀": ":)", "😃": ":)", "😄": ":)", "😁": ":D", "😊": ":)", "🙂": ":)", "😉": ";)",
+    "😢": ":(", "😭": ":'(", "😞": ":(", "🙁": ":(", "😡": ">:(", "😮": ":O", "😂": ":D",
+    "❤": "♥", "💙": "♥", "💚": "♥", "💛": "♥", "💜": "♥", "🖤": "♥", "🤍": "♡",
+    "©": "©", "®": "®", "™": "™", "℠": "℠",
+    "\u00a0": " ", "\u2007": " ", "\u202f": " ", "\u2009": " ", "\u200a": " ",
+    "\u2002": " ", "\u2003": " ", "\u2004": " ", "\u2005": " ", "\u2006": " ",
+    "\u2008": " ", "\u205f": " ", "\u3000": " ", "\u1680": " ",
+    "\u2028": "\n", "\u2029": "\n", "\u0085": "\n", "\u000b": "\n", "\u000c": "\n", "\r": "\n",
+    "\t": "    ",
+}
+
+def _is_emoji_codepoint(cp: int) -> bool:
+    """Broad emoji/pictograph block test — used to catch emoji we didn't
+    hand-map so they become a tidy placeholder instead of a blank box."""
+    return (
+        0x1F300 <= cp <= 0x1FAFF      # misc symbols/pictographs, emoticons, transport, supplemental
+        or 0x1F000 <= cp <= 0x1F2FF   # mahjong, dominoes, cards, enclosed alphanumerics
+        or 0x2600 <= cp <= 0x27BF     # misc symbols + dingbats
+        or 0x2B00 <= cp <= 0x2BFF     # misc symbols and arrows
+        or 0x1F900 <= cp <= 0x1F9FF
+        or cp in (0x203C, 0x2049, 0x2122, 0x2139, 0x231A, 0x231B, 0x2328, 0x23CF,
+                  0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23ED, 0x23EE, 0x23EF, 0x23F0,
+                  0x23F1, 0x23F2, 0x23F3, 0x23F8, 0x23F9, 0x23FA, 0x24C2, 0x25AA,
+                  0x25AB, 0x25B6, 0x25C0, 0x25FB, 0x25FC, 0x25FD, 0x25FE, 0x2934,
+                  0x2935, 0x3030, 0x303D, 0x3297, 0x3299)
+    )
+
+def _strip_control_and_invisible(text: str) -> str:
+    """Drops every character that can never draw anything AND can corrupt
+    output: ASCII/C1 control chars (except \n), invisible format chars,
+    variation selectors, emoji tags, lone surrogates, and non-characters.
+    Lone surrogates + NUL are the ones that actually CRASH reportlab/lxml
+    ('All strings must be XML compatible'), not just draw blank."""
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if ch == "\n":
+            out.append(ch)
+        elif cp < 32 or 0x7F <= cp <= 0x9F:                 # C0 / DEL / C1 controls
+            continue
+        elif 0xD800 <= cp <= 0xDFFF:                        # lone surrogates → crash
+            continue
+        elif cp in _INVISIBLE_CHARS or cp in _VARIATION_SELECTORS or cp in _TAG_CHARS:
+            continue
+        elif (cp & 0xFFFE) == 0xFFFE or 0xFDD0 <= cp <= 0xFDEF:  # non-characters
+            continue
+        elif 0xE000 <= cp <= 0xF8FF:                        # private use — never has a glyph
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def _shape_arabic_hebrew(text: str) -> str:
+    """Joins Arabic letters into their connected forms and reorders RTL runs
+    for a left-to-right drawing engine. Reportlab draws glyphs strictly in
+    logical order with no shaping, so without this Arabic comes out as
+    isolated, backwards letters. No-ops (safely) if the libs aren't
+    installed or the text has no RTL characters."""
+    if not ARABIC_SHAPING_AVAILABLE:
+        return text
+    if not any(("\u0590" <= c <= "\u08FF") or ("\uFB1D" <= c <= "\uFDFF") or ("\uFE70" <= c <= "\uFEFF") for c in text):
+        return text
+    try:
+        # Shape line-by-line so newlines/paragraph structure survive bidi.
+        return "\n".join(_bidi_get_display(_arabic_reshaper.reshape(line)) for line in text.split("\n"))
+    except Exception:
+        return text
+
+def _flags_to_codes(text: str) -> str:
+    """🇪🇬 is two 'regional indicator' codepoints (U+1F1EA U+1F1EC) that no
+    monochrome font draws as a flag; convert each pair to its ISO country
+    code ('EG') so the meaning survives instead of showing boxed letters."""
+    out, i = [], 0
+    while i < len(text):
+        c = ord(text[i])
+        if 0x1F1E6 <= c <= 0x1F1FF and i + 1 < len(text) and 0x1F1E6 <= ord(text[i + 1]) <= 0x1F1FF:
+            out.append(chr(c - 0x1F1E6 + 65) + chr(ord(text[i + 1]) - 0x1F1E6 + 65))
+            i += 2
+        elif 0x1F1E6 <= c <= 0x1F1FF:
+            out.append(chr(c - 0x1F1E6 + 65)); i += 1
+        else:
+            out.append(text[i]); i += 1
+    return "".join(out)
+
+def normalize_text(text, shape_rtl: bool = False) -> str:
+    """One entry point for making arbitrary user text safe to draw.
+    - non-str → str, invalid/lone-surrogate bytes replaced
+    - NFC-normalizes (so 'é' as e+◌́ becomes a single drawable glyph)
+    - maps emoji/odd spaces to drawable equivalents
+    - drops invisible / crashing characters
+    - optionally shapes Arabic/Hebrew (PDF only; Word does its own shaping)"""
+    import unicodedata
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return ""
+    try:
+        text = text.encode("utf-8", "replace").decode("utf-8", "replace")
+    except Exception:
+        pass
+    try:
+        text = unicodedata.normalize("NFC", text)
+    except Exception:
+        pass
+    text = _flags_to_codes(text)
+    # Multi-char emoji keys first (e.g. "✖️" with its selector), then singles.
+    for k in sorted((k for k in _EMOJI_MAP if len(k) > 1), key=len, reverse=True):
+        if k in text:
+            text = text.replace(k, _EMOJI_MAP[k])
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if ch in _EMOJI_MAP:
+            out.append(_EMOJI_MAP[ch])
+        elif cp in _SKIN_TONES:
+            continue
+        elif _is_emoji_codepoint(cp):
+            # Unmapped emoji/pictograph: keep it ONLY if some chain font can
+            # really draw it (many dingbats/arrows/symbols can). Otherwise use
+            # a placeholder — but collapse a whole run of them into ONE, so
+            # "🧬🔬💊💉" becomes a single "•" rather than "••••".
+            out.append(ch if _chain_font_for(ch, False) else "•")
+        else:
+            out.append(ch)
+    text = _strip_control_and_invisible("".join(out))
+    # Collapse runs of placeholder bullets that came from emoji ("🧬🔬💊💉"
+    # -> "••••") into one. Only touches 2+ bullets in a row, so a lone
+    # "•" or a deliberate "• item" list marker is never affected.
+    text = re.sub(r"•(?:[ \u00a0]?•)+", "•", text)
+    if shape_rtl:
+        text = _shape_arabic_hebrew(text)
+    return text
+
 def _font_has_glyph(font_name: str, ch: str) -> bool:
-    """Best-effort check for whether a registered PDF font can display a
-    given character. TTF-based fonts (Poppins, bundled presets, a user's
-    uploaded font, our DejaVu fallback) expose the set of codepoints they
-    actually contain via face.charWidths; for the base14 standard fonts
-    (plain Helvetica) that don't, fall back to assuming Latin-1 coverage,
-    which is what those fonts can actually reach without embedding."""
+    """Whether a registered font can draw `ch`. TTF fonts expose the exact
+    codepoints they contain via face.charWidths; base-14 fonts (plain
+    Helvetica) don't, so we assume Latin-1 coverage for those."""
     try:
         face = pdfmetrics.getFont(font_name).face
         widths = getattr(face, "charWidths", None)
@@ -383,20 +641,63 @@ def _font_has_glyph(font_name: str, ch: str) -> bool:
         pass
     return ord(ch) < 256
 
-def pdf_safe_markup(text: str, font_name: str, fallback_name: str = None) -> str:
-    """Escapes text for use inside a reportlab Paragraph (which parses a
-    small XML-like markup language) and wraps any run of characters the
-    active font can't display — superscripts like ⁻¹⁵, arrows ↑→↓, Greek/
-    math symbols, Arabic when the active font doesn't cover it, etc. — in
-    a <font face="..."> span pointing at a broad-coverage fallback font,
-    so those characters actually render instead of silently vanishing.
-    Falls back to plain escaping if no fallback font was loaded."""
+_GLYPH_PICK_CACHE: dict = {}
+
+def _chain_font_for(ch: str, bold: bool, primary: str = None):
+    """Returns the first font in the fallback chain that can draw `ch`, or
+    None if nothing can. Cached — text is drawn char-by-char and chains are
+    short, but a big question bank would otherwise redo this constantly."""
+    key = (ch, bold, primary)
+    hit = _GLYPH_PICK_CACHE.get(key, 0)
+    if hit != 0:
+        return hit
+    chain = FALLBACK_CHAIN_BOLD if bold else FALLBACK_CHAIN
+    found = None
+    for name in chain:
+        if _font_has_glyph(name, ch):
+            found = name
+            break
+    if found is None and bold:                # bold face may lack it; regular might not
+        for name in FALLBACK_CHAIN:
+            if _font_has_glyph(name, ch):
+                found = name
+                break
+    _GLYPH_PICK_CACHE[key] = found
+    return found
+
+def _last_resort_char(font_name: str, bold: bool) -> str:
+    """A character guaranteed drawable in the primary font, used when
+    NOTHING in the chain has the requested glyph."""
+    for cand in ("?", "•", "*", "-", " "):
+        if _font_has_glyph(font_name, cand):
+            return cand
+    return " "
+
+def pdf_safe_markup(text: str, font_name: str, fallback_name: str = None,
+                    bold: bool = None) -> str:
+    """Escapes text for a reportlab Paragraph and, per character, picks the
+    first font that can actually draw it: the active font if it can,
+    otherwise the first font in the fallback chain that can, otherwise a
+    harmless placeholder — so there are no blank boxes and no exceptions.
+
+    `fallback_name` is kept ONLY for backwards compatibility with old call
+    sites; the real chain is FALLBACK_CHAIN / FALLBACK_CHAIN_BOLD, chosen by
+    whether `font_name` is a bold face (or pass bold= explicitly)."""
     if not text:
         return ""
-    if not fallback_name:
-        return html.escape(text)
+    try:
+        text = normalize_text(text, shape_rtl=True)
+    except Exception:
+        text = html.escape(str(text)) if not isinstance(text, str) else text
+    if not text:
+        return ""
 
-    out, buf, in_fallback = [], [], False
+    if bold is None:
+        bold = ("bold" in str(font_name).lower()) or (fallback_name in FALLBACK_CHAIN_BOLD and fallback_name not in FALLBACK_CHAIN)
+        if fallback_name and fallback_name == FALLBACK_FONT_NAME_BOLD and fallback_name != FALLBACK_FONT_NAME:
+            bold = True
+
+    out, buf, current = [], [], None          # current = fallback font name in use, or None for primary
 
     def flush():
         if buf:
@@ -404,25 +705,61 @@ def pdf_safe_markup(text: str, font_name: str, fallback_name: str = None) -> str
             buf.clear()
 
     for ch in text:
-        # Control chars (newlines etc.) ride along with whatever run
-        # they're already in — checking them against font coverage isn't
-        # meaningful and would wrongly force a font switch around them.
-        if ord(ch) < 32:
-            needs_fallback = in_fallback
+        if ch == "\n":
+            target = current                  # newlines ride along with the current run
+        elif _font_has_glyph(font_name, ch):
+            target = None
         else:
-            needs_fallback = (not _font_has_glyph(font_name, ch)) and _font_has_glyph(fallback_name, ch)
-        if needs_fallback != in_fallback:
+            target = _chain_font_for(ch, bold, font_name)
+            if target is None:                # nothing can draw it → placeholder in primary font
+                ch = _last_resort_char(font_name, bold)
+                target = None
+        if target != current:
             flush()
-            if in_fallback:
+            if current is not None:
                 out.append("</font>")
-            in_fallback = needs_fallback
-            if in_fallback:
-                out.append(f'<font face="{fallback_name}">')
+            current = target
+            if current is not None:
+                out.append(f'<font face="{current}">')
         buf.append(ch)
     flush()
-    if in_fallback:
+    if current is not None:
         out.append("</font>")
     return "".join(out)
+
+def docx_safe_text(text) -> str:
+    """DOCX variant: same emoji/invisible-char cleanup, but NO Arabic
+    shaping/reordering — Word shapes and orders RTL text itself, and
+    pre-shaped glyphs would come out doubly-processed (broken). Crucially
+    strips NUL/control chars/lone surrogates, which make python-docx raise
+    'All strings must be XML compatible'."""
+    try:
+        return normalize_text(text, shape_rtl=False)
+    except Exception:
+        return "".join(c for c in str(text or "") if c == "\n" or (ord(c) >= 32 and not 0xD800 <= ord(c) <= 0xDFFF))
+
+_LEADING_BULLET_RE = re.compile(r"^\s*(?:[•●○◦▪▫■□◆◇▸▹►▻‣⁃∙·*\-–—✓✔☑➤➢➔→»]+\s+)+")
+
+def _strip_leading_bullet(line: str) -> str:
+    """Removes bullet-ish markers the user already typed so our own '•'
+    doesn't double up ('• • text'). Requires a following space so it never
+    eats a real leading '-5' or '*args'."""
+    stripped = _LEADING_BULLET_RE.sub("", line, count=1)
+    return stripped if stripped.strip() else line
+
+def _pdf_marker(symbol: str, font_name: str, bold: bool = False) -> str:
+    """Returns a decorative marker (✓ • etc.) ready to embed in a Paragraph,
+    guaranteed to draw something. These literals used to be written straight
+    into paragraphs, bypassing all glyph checks — so with Poppins/Helvetica
+    (which lack ✓) they rendered as blank boxes. Now: primary font if it has
+    it, else the first chain font that does, else a plain ASCII stand-in."""
+    stand_in = {"✓": "v", "✗": "x", "•": "-", "◆": "*", "★": "*", "→": "->"}
+    if _font_has_glyph(font_name, symbol):
+        return html.escape(symbol)
+    f = _chain_font_for(symbol, bold, font_name)
+    if f:
+        return f'<font face="{f}">{html.escape(symbol)}</font>'
+    return html.escape(stand_in.get(symbol, "*"))
 
 def _cleanup_images(user_id: int):
     import shutil
@@ -663,6 +1000,28 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             super().showPage()
         super().save()
 
+    def _draw_safe_string(self, x, y, text, font, size, bold=False):
+        """drawString, but per-character font fallback so nothing in the
+        answer key can ever be a blank box (raw drawString has no fallback)."""
+        try:
+            text = normalize_text(text, shape_rtl=False)
+        except Exception:
+            text = str(text)
+        cur_x = x
+        for ch in text:
+            f = font
+            if not _font_has_glyph(font, ch):
+                f = _chain_font_for(ch, bold, font) or font
+                if not _font_has_glyph(f, ch):
+                    ch = _last_resort_char(font, bold)
+                    f = font
+            self.setFont(f, size)
+            self.drawString(cur_x, y, ch)
+            try:
+                cur_x += pdfmetrics.stringWidth(ch, f, size)
+            except Exception:
+                cur_x += size * 0.5
+
     def _draw_answer_key(self, pairs):
         per_row = 5
         lines   = [
@@ -687,14 +1046,12 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         self.roundRect(x_left, y_bottom, box_w, box_h, 4, stroke=1, fill=1)
 
         self.setFillColor(colors.HexColor("#1A1A2E"))
-        self.setFont(self._ak_font_bold, 10)
         y = y_bottom + box_h - pad - 0.3 * cm
-        self.drawString(x_left + pad, y, "Answer Key")
+        self._draw_safe_string(x_left + pad, y, "Answer Key", self._ak_font_bold, 10, bold=True)
 
-        self.setFont(self._ak_font, 9)
         for line in lines:
             y -= line_h
-            self.drawString(x_left + pad, y, line)
+            self._draw_safe_string(x_left + pad, y, line, self._ak_font, 9, bold=False)
 
         self.restoreState()
 
@@ -795,7 +1152,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         block.append(Paragraph(q_num_label, NUM_STYLE))
 
         if item["type"] == "mcq":
-            block.append(Paragraph(pdf_safe_markup(item["q"], font_name_bold, FALLBACK_FONT_NAME_BOLD), Q_STYLE))
+            block.append(Paragraph(pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
             if item.get("image"):
                 try:
                     img = RLImage(item["image"])
@@ -807,11 +1164,12 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     block.append(img)
                     block.append(Spacer(1, 6))
                 except Exception as e:
-                    block.append(Paragraph(f"[Image error: {html.escape(str(e))}]", WRITTEN_BODY))
+                    block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
             for i, opt in enumerate(item["options"]):
-                safe_opt = pdf_safe_markup(opt, font_name, FALLBACK_FONT_NAME)
+                safe_opt = pdf_safe_markup(opt, font_name_bold if (show_answers and i == item["correct"]) else font_name,
+                                           bold=bool(show_answers and i == item["correct"]))
                 if show_answers and i == item["correct"]:
-                    block.append(Paragraph(f"✓  {safe_opt}", OPT_CORRECT))
+                    block.append(Paragraph(f"{_pdf_marker('✓', font_name_bold, bold=True)}  {safe_opt}", OPT_CORRECT))
                 else:
                     block.append(Paragraph(f"     {safe_opt}", OPT_STYLE))
             if item.get("correct") is not None:
@@ -819,11 +1177,11 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 block.append(_PageRecorder(page_of_idx, idx))
 
         elif item["type"] == "written":
-            block.append(Paragraph(pdf_safe_markup(item["title"], font_name_bold, FALLBACK_FONT_NAME_BOLD), WRITTEN_TITLE))
+            block.append(Paragraph(pdf_safe_markup(item["title"], font_name_bold, bold=True), WRITTEN_TITLE))
             for line in item["content"].split("\n"):
                 line = line.strip()
                 if line:
-                    block.append(Paragraph(f"• {pdf_safe_markup(line, font_name, FALLBACK_FONT_NAME)}", WRITTEN_BODY))
+                    block.append(Paragraph(f"{_pdf_marker('•', font_name)} {pdf_safe_markup(_strip_leading_bullet(line), font_name, bold=False)}", WRITTEN_BODY))
 
         elif item["type"] == "image":
             img_path = item["path"]
@@ -836,11 +1194,11 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 block.append(Spacer(1, 8))
                 block.append(img)
                 if item.get("caption"):
-                    safe_cap = pdf_safe_markup(item["caption"], font_name, FALLBACK_FONT_NAME)
-                    block.append(Paragraph(f"📷 {safe_cap}", IMG_CAPTION))
+                    safe_cap = pdf_safe_markup(item["caption"], font_name, bold=False)
+                    block.append(Paragraph(f"{safe_cap}", IMG_CAPTION))
                 block.append(Spacer(1, 4))
             except Exception as e:
-                block.append(Paragraph(f"[Image error: {html.escape(str(e))}]", WRITTEN_BODY))
+                block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
 
         story.append(KeepTogether(block))
 
@@ -876,7 +1234,7 @@ def _add_paragraph(doc, text: str, bold=False, size_pt=11,
     pf.space_after  = Pt(space_after)
     if indent_cm:
         pf.left_indent = Cm(indent_cm)
-    run = p.add_run(text)
+    run = p.add_run(docx_safe_text(text))
     run.bold        = bold
     run.font.size   = Pt(size_pt)
     run.font.color.rgb = _hex_to_rgb(color_hex)
@@ -1054,6 +1412,21 @@ def _add_docx_answer_key(doc, pairs: list) -> None:
     anchor_p.paragraph_format.space_after  = Pt(0)
     anchor_p.add_run()._r.append(parse_xml(xml))
 
+def _ttf_display_name(path: str) -> str:
+    """A TTF's internal family name as a real str. reportlab's face.name is
+    a TTFNameBytes (bytes subclass) in current versions, which python-docx
+    rejects ('value must be a string') — that silently disabled custom
+    fonts in DOCX. Falls back to the filename if the name can't be read."""
+    fallback = os.path.splitext(os.path.basename(path))[0]
+    try:
+        n = TTFont("Probe", path).face.name
+        if isinstance(n, (bytes, bytearray)):
+            n = bytes(n).decode("utf-8", "ignore")
+        n = str(n).strip() if n else ""
+        return n or fallback
+    except Exception:
+        return fallback
+
 def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                font_bold_path: str = None, bg_image_path: str = None,
                show_answers: bool = True) -> BytesIO:
@@ -1062,11 +1435,10 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     font_bold_display_name = None
     if font_path and os.path.exists(font_path):
         try:
-            font_display_name = TTFont("Probe", font_path).face.name or os.path.splitext(os.path.basename(font_path))[0]
+            font_display_name = _ttf_display_name(font_path)
             _set_style_font(doc.styles["Normal"], font_display_name)
             if font_bold_path and os.path.exists(font_bold_path):
-                font_bold_display_name = TTFont("Probe", font_bold_path).face.name \
-                    or os.path.splitext(os.path.basename(font_bold_path))[0]
+                font_bold_display_name = _ttf_display_name(font_bold_path)
         except Exception as e:
             print(f"Custom DOCX font apply error: {e}")
 
@@ -1139,7 +1511,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                 line = line.strip()
                 if line:
                     block_paragraphs.append(_add_paragraph(
-                        doc, f"• {line}", bold=False, size_pt=11,
+                        doc, f"• {_strip_leading_bullet(line)}", bold=False, size_pt=11,
                         color_hex="37474F", indent_cm=0.7, space_after=3))
 
         elif item["type"] == "image":
@@ -1155,7 +1527,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                     block_paragraphs.append(p)
                     if item.get("caption"):
                         cap = _add_paragraph(
-                            doc, f"📷 {item['caption']}",
+                            doc, f"{item['caption']}",
                             bold=False, size_pt=9, color_hex="78909C",
                             space_after=4,
                         )
