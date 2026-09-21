@@ -1019,15 +1019,15 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             for i in range(0, len(pairs), per_row)
         ]
 
-        pad     = 0.35 * cm
-        line_h  = 0.42 * cm
-        title_h = 0.5 * cm
-        box_w   = 6.6 * cm
+        pad     = 0.3 * cm
+        line_h  = 0.36 * cm
+        title_h = 0.42 * cm
+        box_w   = 5.8 * cm
         box_h   = pad * 2 + title_h + line_h * len(lines)
 
         x_right  = A4[0] - 2 * cm
         x_left   = x_right - box_w
-        y_bottom = 1.3 * cm
+        y_bottom = 2.1 * cm
 
         self.saveState()
         self.setFillColor(colors.HexColor("#F5F7F8"))
@@ -1037,11 +1037,11 @@ class _AnswerKeyCanvas(_canvas.Canvas):
 
         self.setFillColor(colors.HexColor("#1A1A2E"))
         y = y_bottom + box_h - pad - 0.3 * cm
-        self._draw_safe_string(x_left + pad, y, "Answer Key", self._ak_font_bold, 10, bold=True)
+        self._draw_safe_string(x_left + pad, y, "Answer Key", self._ak_font_bold, 8.5, bold=True)
 
         for line in lines:
             y -= line_h
-            self._draw_safe_string(x_left + pad, y, line, self._ak_font, 9, bold=False)
+            self._draw_safe_string(x_left + pad, y, line, self._ak_font, 7.5, bold=False)
 
         self.restoreState()
 
@@ -1084,9 +1084,6 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 )
             except Exception as e:
                 print(f"PDF background image draw error: {e}")
-        canvas.setStrokeColor(colors.HexColor("#CFD8DC"))
-        canvas.setLineWidth(0.5)
-        canvas.line(2 * cm, A4[1] - 1.65 * cm, A4[0] - 2 * cm, A4[1] - 1.65 * cm)
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
@@ -1137,6 +1134,15 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
 
     for idx, item in enumerate(items, 1):
         block = []  # everything for this one question — kept together on one page
+
+        # The separator before this question is glued into THIS question's
+        # KeepTogether block (instead of tacked onto the end of the previous
+        # one) so it always travels to whichever page the question lands on
+        # — it can never end up orphaned as a lone line at the bottom of a
+        # page with nothing under it.
+        if idx > 1:
+            block.append(Spacer(1, 6))
+            block.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
 
         q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
         block.append(Paragraph(q_num_label, NUM_STYLE))
@@ -1191,10 +1197,6 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
 
         story.append(KeepTogether(block))
-
-        if idx < len(items):
-            story.append(Spacer(1, 6))
-            story.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
 
     def _make_canvas(*args, **kwargs):
         return _AnswerKeyCanvas(
