@@ -325,7 +325,9 @@ POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive au
 PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
                                 # awaiting free-text replacement for one field of a just-added question
 
-PDF_MAX_IMG_WIDTH = 13 * cm
+PDF_MAX_IMG_WIDTH  = 13 * cm
+PDF_MAX_IMG_HEIGHT = 9 * cm    # caps height too, so a tall/portrait photo
+                               # can't balloon into taking up the whole page
 
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
@@ -1028,29 +1030,31 @@ class _AnswerKeyCanvas(_canvas.Canvas):
                 cur_x += size * 0.5
 
     def _draw_answer_key(self, pairs):
-        pad    = 0.3 * cm
-        line_h = 0.36 * cm
+        pad = 0.3 * cm
 
         if self._ak_style == "column":
             # One "N. Letter" per line, attached to the frame's right edge
             # as a sidebar column rather than floating — its left edge
-            # touches the content frame's right boundary, and it's
-            # vertically centered on the page (hugging the right wall,
-            # not pinned to the header). No title — the numbered list
-            # speaks for itself.
-            lines = [f"{n}. {letter}" for n, letter in pairs]
-            box_w = 3.0 * cm   # wide enough for double-digit numbers
-            box_h = pad * 2 + line_h * len(lines)
+            # touches the content frame's right boundary, sitting in the
+            # bottom-right corner. No title — the numbered list speaks for
+            # itself. Normal (body-text-sized) font, not a tiny caption.
+            font_size = 11
+            line_h    = 0.55 * cm
+            lines     = [f"{n}. {letter}" for n, letter in pairs]
+            box_w     = 3.6 * cm   # wide enough for double-digit numbers at normal size
+            box_h     = pad * 2 + line_h * len(lines)
 
             x_left   = (A4[0] - self._ak_right_margin) + 0.3 * cm - self._ak_nudge_cm * cm
-            y_bottom = (A4[1] - box_h) / 2
+            y_bottom = 2.1 * cm
 
             fill_color   = colors.HexColor("#EDE4F8")
             stroke_color = colors.HexColor("#B39DDB")
         else:
-            title_h = 0.42 * cm
-            per_row = 5
-            lines   = [
+            font_size = 7.5
+            line_h    = 0.36 * cm
+            title_h   = 0.42 * cm
+            per_row   = 5
+            lines     = [
                 "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
                 for i in range(0, len(pairs), per_row)
             ]
@@ -1077,10 +1081,22 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             y -= line_h
 
         for line in lines:
-            self._draw_safe_string(x_left + pad, y, line, self._ak_font, 7.5, bold=False)
+            self._draw_safe_string(x_left + pad, y, line, self._ak_font, font_size, bold=False)
             y -= line_h
 
         self.restoreState()
+
+def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT):
+    """Loads an image as an RLImage, scaled DOWN (never up) to fit within
+    max_w x max_h while keeping its aspect ratio — so a wide screenshot or
+    a tall portrait photo both come out compressed to a sane on-page size
+    instead of one dimension ballooning to fill the page."""
+    img   = RLImage(path)
+    scale = min(max_w / img.imageWidth, max_h / img.imageHeight, 1.0)
+    if scale < 1.0:
+        img.drawWidth  = img.imageWidth * scale
+        img.drawHeight = img.imageHeight * scale
+    return img
 
 # ═══════════════════════════════════════════════════════════════
 # PDF BUILDER
@@ -1220,11 +1236,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 block.append(Paragraph(pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
                 if item.get("image"):
                     try:
-                        img = RLImage(item["image"])
-                        if img.imageWidth > PDF_MAX_IMG_WIDTH:
-                            scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
-                            img.drawWidth  = PDF_MAX_IMG_WIDTH
-                            img.drawHeight = img.imageHeight * scale
+                        img = _fit_image(item["image"])
                         block.append(Spacer(1, 6))
                         block.append(img)
                         block.append(Spacer(1, 6))
@@ -1250,11 +1262,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             elif item["type"] == "image":
                 img_path = item["path"]
                 try:
-                    img = RLImage(img_path)
-                    if img.imageWidth > PDF_MAX_IMG_WIDTH:
-                        scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
-                        img.drawWidth  = PDF_MAX_IMG_WIDTH
-                        img.drawHeight = img.imageHeight * scale
+                    img = _fit_image(img_path)
                     block.append(Spacer(1, 8))
                     block.append(img)
                     if item.get("caption"):
@@ -1804,17 +1812,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             written = parse_written_question(block)
             if written:
                 title, content = written
-                PDF_BUFFER[user_id].append({
+                item = {
                     "type":    "written",
                     "title":   title,
                     "content": content,
-                })
+                }
+                PDF_BUFFER[user_id].append(item)
+                item_index = len(PDF_BUFFER[user_id]) - 1
                 any_saved  = True
                 last_label = title[:50] + ("…" if len(title) > 50 else "")
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text=f"✅ اتسجل: <b>{html.escape(last_label)}</b>",
+                    text="✅ <b>اتسجل:</b>\n\n" + _review_text(item) + "\n\nعايز تعدل حاجة؟",
                     parse_mode=ParseMode.HTML,
+                    reply_markup=_review_buttons(item_index, item),
                 )
                 continue
 
