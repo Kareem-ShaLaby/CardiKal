@@ -1032,6 +1032,14 @@ class _AnswerKeyCanvas(_canvas.Canvas):
     def _draw_answer_key(self, pairs):
         pad = 0.3 * cm
 
+        # Distance kept from the true physical right edge of the page (the
+        # "wall") — both styles anchor off this now, instead of off the
+        # doc's rightMargin/sidebar reserve, so the box actually runs out
+        # to (near) the edge rather than stopping short of it.
+        AK_WALL_GAP = 0.5 * cm
+        # Extra vertical lift off the default bottom-corner spot.
+        AK_UP_NUDGE = 4 * cm
+
         if self._ak_style == "column":
             # One "N. Letter" per line, attached to the frame's right edge
             # as a sidebar column rather than floating — its left edge
@@ -1044,8 +1052,9 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             box_w     = 3.6 * cm   # wide enough for double-digit numbers at normal size
             box_h     = pad * 2 + line_h * len(lines)
 
-            x_left   = (A4[0] - self._ak_right_margin) + 0.3 * cm - self._ak_nudge_cm * cm
-            y_bottom = 2.1 * cm
+            x_right  = A4[0] - AK_WALL_GAP - self._ak_nudge_cm * cm
+            x_left   = x_right - box_w
+            y_bottom = 2.1 * cm + AK_UP_NUDGE
 
             fill_color   = colors.HexColor("#EDE4F8")
             stroke_color = colors.HexColor("#B39DDB")
@@ -1061,9 +1070,9 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             box_w = 5.8 * cm
             box_h = pad * 2 + title_h + line_h * len(lines)
 
-            x_right  = A4[0] - 2 * cm - self._ak_nudge_cm * cm
+            x_right  = A4[0] - AK_WALL_GAP - self._ak_nudge_cm * cm
             x_left   = x_right - box_w
-            y_bottom = 2.1 * cm
+            y_bottom = 2.1 * cm + AK_UP_NUDGE
 
             fill_color   = colors.HexColor("#F5F7F8")
             stroke_color = colors.HexColor("#90A4AE")
