@@ -313,6 +313,10 @@ PDF_FONT_BOLD_PATH     = {}    # user_id -> path to that font's bold weight, if 
 PDF_BG_IMAGE_PATH      = {}    # user_id -> path to an uploaded per-page background image, or absent for none
 AWAITING_FONT          = {}    # user_id -> True, while the /pdf_start setup flow is waiting on a font file/skip
 AWAITING_BG            = {}    # user_id -> True, while the /pdf_start setup flow is waiting on a background image/skip
+PDF_AK_STYLE           = {}    # user_id -> "grouped" (default, rows of "1-A  2-D") or "column" (one "1. A" per line)
+PDF_AK_NUDGE_CM        = {}    # user_id -> float, how many cm to shift the answer-key box left of its default spot
+AWAITING_AK_STYLE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the answer-key style choice
+AWAITING_AK_NUDGE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the nudge-amount number
 SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
 PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
@@ -926,13 +930,15 @@ HOW_TO_USE_TEXT = (
 )
 
 class _PageRecorder(Flowable):
-    """Zero-size flowable placed right after a scored MCQ (inside the same
-    KeepTogether block, so it always lands on that question's page). When
-    Platypus actually draws it, self.canv.getPageNumber() tells us which
-    physical page the question ended up on — the only way to know that,
-    since page breaks aren't decided until the story is flowed. Recorded
-    into `record[key]`, read back afterwards to group answer_pairs by
-    page for the per-page answer key."""
+    """Zero-size flowable placed right after every item's content (inside
+    the same KeepTogether block, so it always lands on that question's
+    page). When Platypus actually draws it, self.canv.getPageNumber()
+    tells us which physical page the question ended up on — the only way
+    to know that, since page breaks aren't decided until the story is
+    flowed. Recorded into `record[key]`, read back afterwards both to
+    group answer_pairs by page for the per-page answer key, and to work
+    out which questions start/end a page so their separators can be
+    stripped."""
     def __init__(self, record: dict, key):
         Flowable.__init__(self)
         self.width  = 0
@@ -959,13 +965,22 @@ class _PageRecorder(Flowable):
 # ═══════════════════════════════════════════════════════════════
 class _AnswerKeyCanvas(_canvas.Canvas):
     def __init__(self, *args, answer_pairs=None, page_of_idx=None,
-                 font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD, **kwargs):
+                 font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD,
+                 ak_style="grouped", ak_nudge_cm=0.0,
+                 ak_right_margin=2*cm, ak_top_margin=2.5*cm, **kwargs):
         super().__init__(*args, **kwargs)
-        self._ak_pages      = []
-        self._answer_pairs  = answer_pairs or []
-        self._page_of_idx   = page_of_idx if page_of_idx is not None else {}
-        self._ak_font       = font_name
-        self._ak_font_bold  = font_name_bold
+        self._ak_pages       = []
+        self._answer_pairs   = answer_pairs or []
+        self._page_of_idx    = page_of_idx if page_of_idx is not None else {}
+        self._ak_font        = font_name
+        self._ak_font_bold   = font_name_bold
+        self._ak_style       = ak_style if ak_style in ("grouped", "column") else "grouped"
+        self._ak_nudge_cm    = ak_nudge_cm or 0.0
+        # Only used by the "column" style, which attaches its box to the
+        # frame's right edge rather than floating at a fixed spot — needs
+        # to know where that edge actually is.
+        self._ak_right_margin = ak_right_margin
+        self._ak_top_margin   = ak_top_margin
 
     def showPage(self):
         self._ak_pages.append(dict(self.__dict__))
@@ -1013,35 +1028,57 @@ class _AnswerKeyCanvas(_canvas.Canvas):
                 cur_x += size * 0.5
 
     def _draw_answer_key(self, pairs):
-        per_row = 5
-        lines   = [
-            "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
-            for i in range(0, len(pairs), per_row)
-        ]
+        pad    = 0.3 * cm
+        line_h = 0.36 * cm
 
-        pad     = 0.3 * cm
-        line_h  = 0.36 * cm
-        title_h = 0.42 * cm
-        box_w   = 5.8 * cm
-        box_h   = pad * 2 + title_h + line_h * len(lines)
+        if self._ak_style == "column":
+            # One "N. Letter" per line, attached to the frame's right edge
+            # as a sidebar column rather than floating — its left edge
+            # touches the content frame's right boundary, and it's
+            # vertically centered on the page (hugging the right wall,
+            # not pinned to the header). No title — the numbered list
+            # speaks for itself.
+            lines = [f"{n}. {letter}" for n, letter in pairs]
+            box_w = 3.0 * cm   # wide enough for double-digit numbers
+            box_h = pad * 2 + line_h * len(lines)
 
-        x_right  = A4[0] - 2 * cm
-        x_left   = x_right - box_w
-        y_bottom = 2.1 * cm
+            x_left   = (A4[0] - self._ak_right_margin) + 0.3 * cm - self._ak_nudge_cm * cm
+            y_bottom = (A4[1] - box_h) / 2
+
+            fill_color   = colors.HexColor("#EDE4F8")
+            stroke_color = colors.HexColor("#B39DDB")
+        else:
+            title_h = 0.42 * cm
+            per_row = 5
+            lines   = [
+                "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
+                for i in range(0, len(pairs), per_row)
+            ]
+            box_w = 5.8 * cm
+            box_h = pad * 2 + title_h + line_h * len(lines)
+
+            x_right  = A4[0] - 2 * cm - self._ak_nudge_cm * cm
+            x_left   = x_right - box_w
+            y_bottom = 2.1 * cm
+
+            fill_color   = colors.HexColor("#F5F7F8")
+            stroke_color = colors.HexColor("#90A4AE")
 
         self.saveState()
-        self.setFillColor(colors.HexColor("#F5F7F8"))
-        self.setStrokeColor(colors.HexColor("#90A4AE"))
+        self.setFillColor(fill_color)
+        self.setStrokeColor(stroke_color)
         self.setLineWidth(0.75)
         self.roundRect(x_left, y_bottom, box_w, box_h, 4, stroke=1, fill=1)
 
         self.setFillColor(colors.HexColor("#1A1A2E"))
         y = y_bottom + box_h - pad - 0.3 * cm
-        self._draw_safe_string(x_left + pad, y, "Answer Key", self._ak_font_bold, 8.5, bold=True)
+        if self._ak_style != "column":
+            self._draw_safe_string(x_left + pad, y, "Answer Key", self._ak_font_bold, 8.5, bold=True)
+            y -= line_h
 
         for line in lines:
-            y -= line_h
             self._draw_safe_string(x_left + pad, y, line, self._ak_font, 7.5, bold=False)
+            y -= line_h
 
         self.restoreState()
 
@@ -1050,7 +1087,8 @@ class _AnswerKeyCanvas(_canvas.Canvas):
 # ═══════════════════════════════════════════════════════════════
 def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               font_bold_path: str = None, bg_image_path: str = None,
-              show_answers: bool = True) -> BytesIO:
+              show_answers: bool = True, ak_style: str = "grouped",
+              ak_nudge_cm: float = 0.0) -> BytesIO:
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
@@ -1086,16 +1124,30 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 print(f"PDF background image draw error: {e}")
         canvas.restoreState()
 
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=2.5*cm,
-        # Extra bottom margin (vs. the plain 2cm content uses elsewhere)
-        # reserves room for the per-page answer-key box so normal flowing
-        # text doesn't get laid out underneath where that box will later
-        # be stamped on top of it.
-        bottomMargin=3.6*cm,
-    )
+    AK_SIDEBAR_W  = 3.0 * cm   # matches the box_w the "column" style draws in _draw_answer_key
+    TOP_MARGIN    = 2.5 * cm
+
+    if ak_style == "column":
+        _DOC_MARGINS = dict(
+            leftMargin=2*cm,
+            # Extra right margin reserves room for the answer-key sidebar,
+            # which attaches to this margin's inner edge and is vertically
+            # centered on the page — normal flowing text never gets laid
+            # out underneath it.
+            rightMargin=2*cm + AK_SIDEBAR_W + 0.5*cm,
+            topMargin=TOP_MARGIN,
+            bottomMargin=2*cm,
+        )
+    else:
+        _DOC_MARGINS = dict(
+            leftMargin=2*cm, rightMargin=2*cm,
+            topMargin=TOP_MARGIN,
+            # Extra bottom margin (vs. the plain 2cm content uses elsewhere)
+            # reserves room for the per-page answer-key box so normal flowing
+            # text doesn't get laid out underneath where that box will later
+            # be stamped on top of it.
+            bottomMargin=3.6*cm,
+        )
 
     Q_STYLE = ParagraphStyle(
         "QStyle", fontName=font_name_bold, fontSize=12, leading=16,
@@ -1127,81 +1179,144 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     )
 
     HR_COLOR = colors.HexColor("#CFD8DC")
-    story    = []
 
-    answer_pairs = []  # (question_number, letter) for the per-page answer key
-    page_of_idx  = {}   # question_number -> 1-indexed page it lands on, filled in during doc.build()
+    def _build_story(skip_sep_indices, page_of_idx):
+        """Builds one fresh set of flowables. `skip_sep_indices` is the set
+        of question numbers whose LEADING separator (the line glued to the
+        top of their KeepTogether block) should be omitted — used to strip
+        the separator that would otherwise land at the very top of a page
+        AND the one that would land as the last line before a page break.
+        `page_of_idx` is a fresh dict that _PageRecorder fills in with
+        question_number -> 1-indexed page as doc.build() actually draws
+        each block; a recorder is attached to EVERY item (not just scored
+        MCQs) so every question's page is known, which is what lets us
+        compute skip_sep_indices for the real pass below."""
+        story        = []
+        answer_pairs = []  # (question_number, letter) for the per-page answer key
 
-    for idx, item in enumerate(items, 1):
-        block = []  # everything for this one question — kept together on one page
+        for idx, item in enumerate(items, 1):
+            block = []  # everything for this one question — kept together on one page
 
-        # The separator before this question is glued into THIS question's
-        # KeepTogether block (instead of tacked onto the end of the previous
-        # one) so it always travels to whichever page the question lands on
-        # — it can never end up orphaned as a lone line at the bottom of a
-        # page with nothing under it.
-        if idx > 1:
-            block.append(Spacer(1, 6))
-            block.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
+            # Every question gets a little breathing room before it starts —
+            # whether it's Q1 sitting right below the header, a question
+            # opening a later page (whose separator was stripped as a
+            # top-of-page one), or one flowing normally after another on the
+            # same page.
+            block.append(Spacer(1, 18))
 
-        q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
-        block.append(Paragraph(q_num_label, NUM_STYLE))
+            # The separator before this question is glued into THIS question's
+            # KeepTogether block (instead of tacked onto the end of the previous
+            # one) so it always travels to whichever page the question lands on
+            # — it can never end up orphaned as a lone line at the bottom of a
+            # page with nothing under it. Skipped entirely for any idx in
+            # skip_sep_indices (top-of-page or bottom-of-page separators).
+            if idx > 1 and idx not in skip_sep_indices:
+                block.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
 
-        if item["type"] == "mcq":
-            block.append(Paragraph(pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
-            if item.get("image"):
+            q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
+            block.append(Paragraph(q_num_label, NUM_STYLE))
+
+            if item["type"] == "mcq":
+                block.append(Paragraph(pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
+                if item.get("image"):
+                    try:
+                        img = RLImage(item["image"])
+                        if img.imageWidth > PDF_MAX_IMG_WIDTH:
+                            scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
+                            img.drawWidth  = PDF_MAX_IMG_WIDTH
+                            img.drawHeight = img.imageHeight * scale
+                        block.append(Spacer(1, 6))
+                        block.append(img)
+                        block.append(Spacer(1, 6))
+                    except Exception as e:
+                        block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
+                for i, opt in enumerate(item["options"]):
+                    safe_opt = pdf_safe_markup(opt, font_name_bold if (show_answers and i == item["correct"]) else font_name,
+                                               bold=bool(show_answers and i == item["correct"]))
+                    if show_answers and i == item["correct"]:
+                        block.append(Paragraph(f"{_pdf_marker('✓', font_name_bold, bold=True)}  {safe_opt}", OPT_CORRECT))
+                    else:
+                        block.append(Paragraph(f"     {safe_opt}", OPT_STYLE))
+                if item.get("correct") is not None:
+                    answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
+
+            elif item["type"] == "written":
+                block.append(Paragraph(pdf_safe_markup(item["title"], font_name_bold, bold=True), WRITTEN_TITLE))
+                for line in item["content"].split("\n"):
+                    line = line.strip()
+                    if line:
+                        block.append(Paragraph(f"{_pdf_marker('•', font_name)} {pdf_safe_markup(_strip_leading_bullet(line), font_name, bold=False)}", WRITTEN_BODY))
+
+            elif item["type"] == "image":
+                img_path = item["path"]
                 try:
-                    img = RLImage(item["image"])
+                    img = RLImage(img_path)
                     if img.imageWidth > PDF_MAX_IMG_WIDTH:
                         scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
                         img.drawWidth  = PDF_MAX_IMG_WIDTH
                         img.drawHeight = img.imageHeight * scale
-                    block.append(Spacer(1, 6))
+                    block.append(Spacer(1, 8))
                     block.append(img)
-                    block.append(Spacer(1, 6))
+                    if item.get("caption"):
+                        safe_cap = pdf_safe_markup(item["caption"], font_name, bold=False)
+                        block.append(Paragraph(f"{safe_cap}", IMG_CAPTION))
+                    block.append(Spacer(1, 4))
                 except Exception as e:
                     block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
-            for i, opt in enumerate(item["options"]):
-                safe_opt = pdf_safe_markup(opt, font_name_bold if (show_answers and i == item["correct"]) else font_name,
-                                           bold=bool(show_answers and i == item["correct"]))
-                if show_answers and i == item["correct"]:
-                    block.append(Paragraph(f"{_pdf_marker('✓', font_name_bold, bold=True)}  {safe_opt}", OPT_CORRECT))
-                else:
-                    block.append(Paragraph(f"     {safe_opt}", OPT_STYLE))
-            if item.get("correct") is not None:
-                answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
-                block.append(_PageRecorder(page_of_idx, idx))
 
-        elif item["type"] == "written":
-            block.append(Paragraph(pdf_safe_markup(item["title"], font_name_bold, bold=True), WRITTEN_TITLE))
-            for line in item["content"].split("\n"):
-                line = line.strip()
-                if line:
-                    block.append(Paragraph(f"{_pdf_marker('•', font_name)} {pdf_safe_markup(_strip_leading_bullet(line), font_name, bold=False)}", WRITTEN_BODY))
+            # Recorded for EVERY item (regardless of type / scored-ness) so
+            # page assignment is known for the whole document, not just
+            # scored MCQs — needed to compute top/bottom separators below.
+            block.append(_PageRecorder(page_of_idx, idx))
 
-        elif item["type"] == "image":
-            img_path = item["path"]
-            try:
-                img = RLImage(img_path)
-                if img.imageWidth > PDF_MAX_IMG_WIDTH:
-                    scale          = PDF_MAX_IMG_WIDTH / img.imageWidth
-                    img.drawWidth  = PDF_MAX_IMG_WIDTH
-                    img.drawHeight = img.imageHeight * scale
-                block.append(Spacer(1, 8))
-                block.append(img)
-                if item.get("caption"):
-                    safe_cap = pdf_safe_markup(item["caption"], font_name, bold=False)
-                    block.append(Paragraph(f"{safe_cap}", IMG_CAPTION))
-                block.append(Spacer(1, 4))
-            except Exception as e:
-                block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
+            story.append(KeepTogether(block))
 
-        story.append(KeepTogether(block))
+        return story, answer_pairs
+
+    # ── PASS 1 (dry run, iterated to a fixed point): lay the document out
+    # to learn which question starts/ends each page. Removing a separator
+    # frees up a little space, which can occasionally let one more question
+    # fit on a page than a single dry run assumed — so re-run the layout
+    # with the newly-computed skip set until the page grouping it produces
+    # stops changing (converges in a couple of iterations in practice; capped
+    # so a pathological document can't loop forever). Every iteration is
+    # discarded afterwards — never shown to the user. ──────────────────
+    skip_sep_indices = frozenset()
+    for _ in range(6):
+        dry_page_of_idx = {}
+        dry_story, _    = _build_story(skip_sep_indices=skip_sep_indices, page_of_idx=dry_page_of_idx)
+        dry_buffer      = BytesIO()
+        SimpleDocTemplate(dry_buffer, pagesize=A4, **_DOC_MARGINS).build(dry_story)
+
+        pages = {}
+        for idx, pg in dry_page_of_idx.items():
+            pages.setdefault(pg, []).append(idx)
+        new_skip = set()
+        for idxs in pages.values():
+            idxs.sort()
+            new_skip.add(idxs[0])    # top-of-page separator
+            new_skip.add(idxs[-1])   # bottom-of-page separator
+
+        if new_skip == skip_sep_indices:
+            break
+        skip_sep_indices = new_skip
+    # (idx==1 has no separator to begin with either way, so including it is
+    # harmless.)
+
+    # ── PASS 2 (real): rebuild with those separators omitted, and this
+    # time actually render to `buffer` with the answer-key overlay. ────
+    page_of_idx  = {}
+    story, answer_pairs = _build_story(skip_sep_indices=skip_sep_indices, page_of_idx=page_of_idx)
+
+    doc = SimpleDocTemplate(buffer, pagesize=A4, **_DOC_MARGINS)
 
     def _make_canvas(*args, **kwargs):
         return _AnswerKeyCanvas(
             *args, answer_pairs=answer_pairs, page_of_idx=page_of_idx,
-            font_name=font_name, font_name_bold=font_name_bold, **kwargs,
+            font_name=font_name, font_name_bold=font_name_bold,
+            ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
+            ak_right_margin=_DOC_MARGINS["rightMargin"], ak_top_margin=_DOC_MARGINS["topMargin"],
+            **kwargs,
         )
 
     doc.build(story, onFirstPage=draw_header, onLaterPages=draw_header, canvasmaker=_make_canvas)
@@ -1398,6 +1513,53 @@ def _review_buttons(item_index: int, item: dict) -> InlineKeyboardMarkup:
 # ═══════════════════════════════════════════════════════════════
 # IMAGE HANDLER
 # ═══════════════════════════════════════════════════════════════
+async def _save_bg_photo(context: ContextTypes.DEFAULT_TYPE, user_id: int, file_id: str) -> str:
+    """Downloads a Telegram photo (by file_id) and registers it as this
+    user's per-page PDF background. Shared by the manual upload path and
+    the pinned-image auto-detect path so both save to the same place."""
+    bg_dir  = os.path.join(IMG_BASE_DIR, str(user_id))
+    os.makedirs(bg_dir, exist_ok=True)
+    bg_path = os.path.join(bg_dir, "page_background.jpg")
+    tg_file = await context.bot.get_file(file_id)
+    await tg_file.download_to_drive(bg_path)
+    PDF_BG_IMAGE_PATH[user_id] = bg_path
+    return bg_path
+
+async def _start_bg_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
+    """Step after font selection (font → background → answer-key style →
+    nudge → finish). If the user has a photo pinned in their private chat
+    with the bot, that's grabbed and used as the background automatically
+    — no prompt, straight on to the next step. Otherwise falls back to
+    asking for one like normal."""
+    pinned_photo = None
+    try:
+        chat   = await context.bot.get_chat(user_id)
+        pinned = chat.pinned_message
+        if pinned and pinned.photo:
+            pinned_photo = pinned.photo[-1]
+    except Exception:
+        pinned_photo = None
+
+    if pinned_photo:
+        try:
+            await _save_bg_photo(context, user_id, pinned_photo.file_id)
+            await reply_target.reply_text(
+                "📌 لقيت صورة مثبتة في الشات وحطيتها كخلفية للـ PDF أوتوماتيك.",
+            )
+            await _ask_ak_style(context, user_id, reply_target)
+            return
+        except Exception:
+            pass  # download failed for some reason — fall back to asking normally
+
+    AWAITING_BG[user_id] = True
+    await reply_target.reply_text(
+        "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.\n"
+        "(أو ثبّت صورة في الشات ده والبوت هياخدها تلقائي المرة الجاية.)",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
+        ]]),
+    )
+
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -1412,14 +1574,9 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── AWAITING BACKGROUND IMAGE (part of the /pdf_start setup flow) ──
     if AWAITING_BG.get(user_id):
-        bg_dir  = os.path.join(IMG_BASE_DIR, str(user_id))
-        os.makedirs(bg_dir, exist_ok=True)
-        bg_path = os.path.join(bg_dir, "page_background.jpg")
-        tg_file = await context.bot.get_file(photo.file_id)
-        await tg_file.download_to_drive(bg_path)
-        PDF_BG_IMAGE_PATH[user_id] = bg_path
+        await _save_bg_photo(context, user_id, photo.file_id)
         del AWAITING_BG[user_id]
-        await _finish_pdf_setup(context, user_id, update.message)
+        await _ask_ak_style(context, user_id, update.message)
         return
 
     if user_id not in PDF_BUFFER:
@@ -1498,14 +1655,8 @@ async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     PDF_FONT_PATH[user_id] = font_path
     PDF_FONT_BOLD_PATH.pop(user_id, None)   # single upload has no bold companion — clear any stale preset one
     del AWAITING_FONT[user_id]
-    AWAITING_BG[user_id] = True
-    await update.message.reply_text(
-        "✅ الخط اتسجل!\n\n"
-        "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
-        ]]),
-    )
+    await update.message.reply_text("✅ الخط اتسجل!")
+    await _start_bg_step(context, user_id, update.message)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """PDFs sent in a private DM: captioned = treated as a manual question
@@ -1609,6 +1760,30 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ محتاج تبعت صورة كخلفية، أو دوس Skip فوق.",
         )
+        return
+
+    # ── AWAITING ANSWER-KEY STYLE (reminder only — real handling is the
+    #    ak_style buttons) ──────────────────────────────────────────
+    if AWAITING_AK_STYLE.get(user_id):
+        await update.message.reply_text(
+            "⚠️ اختار شكل صندوق الإجابات من الأزرار فوق.",
+        )
+        return
+
+    # ── AWAITING ANSWER-KEY NUDGE AMOUNT ─────────────────────────────
+    if AWAITING_AK_NUDGE.get(user_id):
+        raw = text.strip().replace(",", ".")
+        try:
+            nudge = float(raw)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ ابعت رقم بس (مثلاً 0 أو 1.5)، بيمثل السنتيمترات.",
+            )
+            return
+        nudge = max(0.0, min(nudge, 15.0))  # sane clamp so the box can't fly off the page
+        PDF_AK_NUDGE_CM[user_id] = nudge
+        del AWAITING_AK_NUDGE[user_id]
+        await _finish_pdf_setup(context, user_id, update.message)
         return
 
     if user_id not in PDF_BUFFER:
@@ -1856,15 +2031,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             PDF_FONT_BOLD_PATH.pop(user_id, None)
         del AWAITING_FONT[user_id]
-        AWAITING_BG[user_id] = True
-        await query.edit_message_text(
-            f"✅ خط <b>{name}</b> اتحدد!\n\n"
-            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
-            ]]),
-        )
+        await query.edit_message_text(f"✅ خط <b>{name}</b> اتحدد!", parse_mode=ParseMode.HTML)
+        await _start_bg_step(context, user_id, query.message)
         return
 
     if query.data == "font_skip":
@@ -1873,21 +2041,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_FONT_PATH.pop(user_id, None)
         PDF_FONT_BOLD_PATH.pop(user_id, None)
         del AWAITING_FONT[user_id]
-        AWAITING_BG[user_id] = True
-        await query.edit_message_text(
-            "⏭ اتخطيت اختيار الخط.\n\n"
-            "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
-            ]]),
-        )
+        await query.edit_message_text("⏭ اتخطيت اختيار الخط.")
+        await _start_bg_step(context, user_id, query.message)
         return
 
     if query.data == "bg_skip":
         if not AWAITING_BG.get(user_id):
             return
         del AWAITING_BG[user_id]
-        await _finish_pdf_setup(context, user_id, query.message, edit=True)
+        await _ask_ak_style(context, user_id, query.message, edit=True)
+        return
+
+    # ── PDF SETUP FLOW: answer-key style choice ──────────────────
+    if query.data.startswith("ak_style:"):
+        if not AWAITING_AK_STYLE.get(user_id):
+            return
+        style = query.data.split(":")[1]
+        if style not in ("grouped", "column"):
+            return
+        PDF_AK_STYLE[user_id] = style
+        del AWAITING_AK_STYLE[user_id]
+        AWAITING_AK_NUDGE[user_id] = True
+        await query.edit_message_text(
+            "📐 اكتب رقم بالسنتيمتر تزحزح بيه صندوق الإجابات لليسار (مثلاً 1 أو 2.5)، "
+            "أو ابعت 0 لو عايزه في مكانه الافتراضي.",
+        )
         return
 
     # ── EXPORT BUTTONS ──────────────────────────────────────────
@@ -1908,6 +2086,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # EXPORT — build+send PDF, then reset the session
 # ═══════════════════════════════════════════════════════════════
+async def _ask_ak_style(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+    """Step after background (font → background → answer-key style → nudge
+    → finish) — asks whether the per-page answer key should be laid out
+    as grouped rows ("1-A  2-D  3-E") or a single vertical column
+    ("1. A" / "2. D" / one per line)."""
+    AWAITING_AK_STYLE[user_id] = True
+    text = (
+        "🔑 <b>شكل صندوق الإجابات إيه؟</b>\n"
+        "اختار واحد من اللي تحت 👇"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("↔️ صفوف (1-A  2-D)", callback_data="ak_style:grouped"),
+        InlineKeyboardButton("↕️ عمود واحد (1. A)", callback_data="ak_style:column"),
+    ]])
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
 async def _finish_pdf_setup(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
     """Last step of the /pdf_start flow (name → font → background) — opens
     the actual question buffer and shows the 'PDF mode activated' message.
@@ -1941,6 +2136,10 @@ def _reset_pdf_session(user_id: int) -> None:
     AWAITING_NAME.pop(user_id, None)
     AWAITING_FONT.pop(user_id, None)
     AWAITING_BG.pop(user_id, None)
+    AWAITING_AK_STYLE.pop(user_id, None)
+    AWAITING_AK_NUDGE.pop(user_id, None)
+    PDF_AK_STYLE.pop(user_id, None)
+    PDF_AK_NUDGE_CM.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     font_path = PDF_FONT_PATH.pop(user_id, None)
     # Only delete it if it's a per-user upload (under FONT_BASE_DIR) — never
@@ -1970,18 +2169,20 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     font_path      = PDF_FONT_PATH.get(session_id)
     font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
     bg_path        = PDF_BG_IMAGE_PATH.get(session_id)
+    ak_style       = PDF_AK_STYLE.get(session_id, "grouped")
+    ak_nudge_cm    = PDF_AK_NUDGE_CM.get(session_id, 0.0)
 
     import asyncio
     try:
         answered_bytes = await asyncio.to_thread(
             build_pdf, items, name, font_path=font_path,
             font_bold_path=font_bold_path, bg_image_path=bg_path,
-            show_answers=True,
+            show_answers=True, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
         )
         blank_bytes = await asyncio.to_thread(
             build_pdf, items, name, font_path=font_path,
             font_bold_path=font_bold_path, bg_image_path=bg_path,
-            show_answers=False,
+            show_answers=False, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
         )
     except Exception as e:
         print("PDF ERROR:", e)
@@ -2038,6 +2239,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
         or AWAITING_FONT.get(user_id) or AWAITING_BG.get(user_id)
+        or AWAITING_AK_STYLE.get(user_id) or AWAITING_AK_NUDGE.get(user_id)
         or PENDING_IMAGE.get(user_id)
     )
     _reset_pdf_session(user_id)
