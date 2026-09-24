@@ -300,6 +300,18 @@ MSG_CANCEL_DONE = "❌ تم نطر أبلكاش"
 MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
 MSG_NOT_IN_SESSION = "📄 ابدأ الأول بـ /pdf_start عشان تبدأ تجمع الأسئلة."
 
+LAYOUT_PROMPT_TEXT = (
+    "📐 <b>ظبط الشكل</b> — ابعت <u>5 أرقام</u> في رسالة واحدة، مفصولين بمسافة أو فاصلة، بالترتيب ده:\n\n"
+    "1️⃣ حجم خط السؤال (الافتراضي 12)\n"
+    "2️⃣ المسافة من فوق للسؤال الأول، بالسنتيمتر (الافتراضي 2.5)\n"
+    "3️⃣ إزاحة صندوق الإجابات لليسار، بالسنتيمتر (الافتراضي 0)\n"
+    "4️⃣ مسافة صندوق الإجابات من الحافة اليمين، بالسنتيمتر (الافتراضي 0.5)\n"
+    "5️⃣ رفع صندوق الإجابات لفوق، بالسنتيمتر (الافتراضي 4)\n\n"
+    "مثال: <code>12 2.5 0 0.5 4</code>\n"
+    "لو عايز رقم معين يفضل زي ما هو، اكتب مكانه <code>-</code>.\n"
+    "أو ابعت <code>-</code> لوحدها عشان تاخد كل الإعدادات الافتراضية."
+)
+
 # ═══════════════════════════════════════════════════════════════
 # STATE — all in-memory only, exactly like the original bot (a restart
 # loses whatever's mid-collection and hasn't been exported yet)
@@ -316,7 +328,20 @@ AWAITING_BG            = {}    # user_id -> True, while the /pdf_start setup flo
 PDF_AK_STYLE           = {}    # user_id -> "grouped" (default, rows of "1-A  2-D") or "column" (one "1. A" per line)
 PDF_AK_NUDGE_CM        = {}    # user_id -> float, how many cm to shift the answer-key box left of its default spot
 AWAITING_AK_STYLE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the answer-key style choice
-AWAITING_AK_NUDGE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the nudge-amount number
+
+# ─── LAYOUT SETTINGS — all asked for in one combined numeric prompt ─────
+PDF_FONT_SIZE          = {}    # user_id -> float, base question font size (other text scales with it)
+PDF_TOP_MARGIN_CM      = {}    # user_id -> float, how far the first question starts from the top of the page
+PDF_AK_WALL_GAP_CM     = {}    # user_id -> float, how close the answer-key box sits to the page's right edge
+PDF_AK_UP_NUDGE_CM     = {}    # user_id -> float, how many cm the answer-key box is lifted above its default corner spot
+AWAITING_LAYOUT        = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the combined layout numbers
+
+# Defaults used for any layout value the user leaves blank/"-"
+DEFAULT_FONT_SIZE      = 12.0
+DEFAULT_TOP_MARGIN_CM  = 2.5
+DEFAULT_AK_NUDGE_CM    = 0.0
+DEFAULT_AK_WALL_GAP_CM = 0.5
+DEFAULT_AK_UP_NUDGE_CM = 4.0
 SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
 PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
@@ -969,7 +994,8 @@ class _AnswerKeyCanvas(_canvas.Canvas):
     def __init__(self, *args, answer_pairs=None, page_of_idx=None,
                  font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD,
                  ak_style="grouped", ak_nudge_cm=0.0,
-                 ak_right_margin=2*cm, ak_top_margin=2.5*cm, **kwargs):
+                 ak_right_margin=2*cm, ak_top_margin=2.5*cm,
+                 ak_wall_gap_cm=0.5, ak_up_nudge_cm=4.0, **kwargs):
         super().__init__(*args, **kwargs)
         self._ak_pages       = []
         self._answer_pairs   = answer_pairs or []
@@ -978,6 +1004,8 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         self._ak_font_bold   = font_name_bold
         self._ak_style       = ak_style if ak_style in ("grouped", "column") else "grouped"
         self._ak_nudge_cm    = ak_nudge_cm or 0.0
+        self._ak_wall_gap_cm = ak_wall_gap_cm
+        self._ak_up_nudge_cm = ak_up_nudge_cm
         # Only used by the "column" style, which attaches its box to the
         # frame's right edge rather than floating at a fixed spot — needs
         # to know where that edge actually is.
@@ -1033,12 +1061,13 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         pad = 0.3 * cm
 
         # Distance kept from the true physical right edge of the page (the
-        # "wall") — both styles anchor off this now, instead of off the
-        # doc's rightMargin/sidebar reserve, so the box actually runs out
-        # to (near) the edge rather than stopping short of it.
-        AK_WALL_GAP = 0.5 * cm
-        # Extra vertical lift off the default bottom-corner spot.
-        AK_UP_NUDGE = 4 * cm
+        # "wall") and the vertical lift off the default bottom-corner spot
+        # — both configurable per-session (see PDF_AK_WALL_GAP_CM /
+        # PDF_AK_UP_NUDGE_CM), both styles anchor off these now instead of
+        # off the doc's rightMargin/sidebar reserve, so the box actually
+        # runs out to (near) the edge rather than stopping short of it.
+        AK_WALL_GAP = self._ak_wall_gap_cm * cm
+        AK_UP_NUDGE = self._ak_up_nudge_cm * cm
 
         if self._ak_style == "column":
             # One "N. Letter" per line, attached to the frame's right edge
@@ -1113,7 +1142,10 @@ def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT):
 def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               font_bold_path: str = None, bg_image_path: str = None,
               show_answers: bool = True, ak_style: str = "grouped",
-              ak_nudge_cm: float = 0.0) -> BytesIO:
+              ak_nudge_cm: float = 0.0, font_size: float = DEFAULT_FONT_SIZE,
+              top_margin_cm: float = DEFAULT_TOP_MARGIN_CM,
+              ak_wall_gap_cm: float = DEFAULT_AK_WALL_GAP_CM,
+              ak_up_nudge_cm: float = DEFAULT_AK_UP_NUDGE_CM) -> BytesIO:
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
@@ -1150,7 +1182,13 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         canvas.restoreState()
 
     AK_SIDEBAR_W  = 3.0 * cm   # matches the box_w the "column" style draws in _draw_answer_key
-    TOP_MARGIN    = 2.5 * cm
+    TOP_MARGIN    = top_margin_cm * cm
+
+    # Every text size below is defined relative to DEFAULT_FONT_SIZE and
+    # scaled by this ratio, so a single "font size" number moves the whole
+    # document's typography up or down together instead of just the
+    # question text.
+    FSCALE = font_size / DEFAULT_FONT_SIZE
 
     if ak_style == "column":
         _DOC_MARGINS = dict(
@@ -1175,31 +1213,31 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         )
 
     Q_STYLE = ParagraphStyle(
-        "QStyle", fontName=font_name_bold, fontSize=12, leading=16,
+        "QStyle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
         textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=14,
     )
     OPT_STYLE = ParagraphStyle(
-        "OptStyle", fontName=font_name, fontSize=11, leading=15,
+        "OptStyle", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
         textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=3,
     )
     OPT_CORRECT = ParagraphStyle(
-        "OptCorrect", fontName=font_name_bold, fontSize=11, leading=15,
+        "OptCorrect", fontName=font_name_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
         textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=3,
     )
     WRITTEN_TITLE = ParagraphStyle(
-        "WTitle", fontName=font_name_bold, fontSize=12, leading=16,
+        "WTitle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
         textColor=colors.HexColor("#1A1A2E"), spaceAfter=4, spaceBefore=14,
     )
     WRITTEN_BODY = ParagraphStyle(
-        "WBody", fontName=font_name, fontSize=11, leading=15,
+        "WBody", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
         textColor=colors.HexColor("#37474F"), leftIndent=14, spaceAfter=6,
     )
     NUM_STYLE = ParagraphStyle(
-        "NumStyle", fontName=font_name_bold, fontSize=9,
+        "NumStyle", fontName=font_name_bold, fontSize=9 * FSCALE,
         textColor=colors.HexColor("#90A4AE"), spaceAfter=2,
     )
     IMG_CAPTION = ParagraphStyle(
-        "ImgCaption", fontName=font_name, fontSize=9, leading=12,
+        "ImgCaption", fontName=font_name, fontSize=9 * FSCALE, leading=12 * FSCALE,
         textColor=colors.HexColor("#78909C"), spaceAfter=6, spaceBefore=4,
     )
 
@@ -1333,6 +1371,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             font_name=font_name, font_name_bold=font_name_bold,
             ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
             ak_right_margin=_DOC_MARGINS["rightMargin"], ak_top_margin=_DOC_MARGINS["topMargin"],
+            ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
             **kwargs,
         )
 
@@ -1787,19 +1826,54 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── AWAITING ANSWER-KEY NUDGE AMOUNT ─────────────────────────────
-    if AWAITING_AK_NUDGE.get(user_id):
-        raw = text.strip().replace(",", ".")
-        try:
-            nudge = float(raw)
-        except ValueError:
+    # ── AWAITING COMBINED LAYOUT NUMBERS ─────────────────────────────
+    if AWAITING_LAYOUT.get(user_id):
+        stripped = text.strip()
+        # A lone "-" (or empty message) means "everything default".
+        if stripped in ("", "-", "،", "د"):
+            tokens = []
+        else:
+            tokens = [t for t in re.split(r"[\s,،]+", stripped) if t]
+
+        if len(tokens) > 5:
             await update.message.reply_text(
-                "⚠️ ابعت رقم بس (مثلاً 0 أو 1.5)، بيمثل السنتيمترات.",
+                "⚠️ أقصى حاجة 5 أرقام بس. ابعتهم تاني زي المثال فوق.",
             )
             return
-        nudge = max(0.0, min(nudge, 15.0))  # sane clamp so the box can't fly off the page
-        PDF_AK_NUDGE_CM[user_id] = nudge
-        del AWAITING_AK_NUDGE[user_id]
+
+        # Pad with "-" (→ default) for any trailing values left out.
+        tokens += ["-"] * (5 - len(tokens))
+
+        DEFAULTS = [
+            DEFAULT_FONT_SIZE, DEFAULT_TOP_MARGIN_CM,
+            DEFAULT_AK_NUDGE_CM, DEFAULT_AK_WALL_GAP_CM, DEFAULT_AK_UP_NUDGE_CM,
+        ]
+        # (min, max) sane clamps so a typo can't blow up the layout or send
+        # the answer-key box flying off the page.
+        CLAMPS = [(4.0, 40.0), (0.5, 10.0), (0.0, 15.0), (0.0, 5.0), (0.0, 20.0)]
+
+        parsed = []
+        for i, tok in enumerate(tokens):
+            if tok in ("-", "د", "x", "X"):
+                parsed.append(DEFAULTS[i])
+                continue
+            try:
+                val = float(tok.replace(",", "."))
+            except ValueError:
+                await update.message.reply_text(
+                    f"⚠️ '{tok}' مش رقم. ابعت 5 أرقام (أو - للافتراضي) زي المثال فوق.",
+                )
+                return
+            lo, hi = CLAMPS[i]
+            parsed.append(max(lo, min(val, hi)))
+
+        font_size, top_margin_cm, ak_nudge_cm, ak_wall_gap_cm, ak_up_nudge_cm = parsed
+        PDF_FONT_SIZE[user_id]      = font_size
+        PDF_TOP_MARGIN_CM[user_id] = top_margin_cm
+        PDF_AK_NUDGE_CM[user_id]    = ak_nudge_cm
+        PDF_AK_WALL_GAP_CM[user_id] = ak_wall_gap_cm
+        PDF_AK_UP_NUDGE_CM[user_id] = ak_up_nudge_cm
+        del AWAITING_LAYOUT[user_id]
         await _finish_pdf_setup(context, user_id, update.message)
         return
 
@@ -2081,11 +2155,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         PDF_AK_STYLE[user_id] = style
         del AWAITING_AK_STYLE[user_id]
-        AWAITING_AK_NUDGE[user_id] = True
-        await query.edit_message_text(
-            "📐 اكتب رقم بالسنتيمتر تزحزح بيه صندوق الإجابات لليسار (مثلاً 1 أو 2.5)، "
-            "أو ابعت 0 لو عايزه في مكانه الافتراضي.",
-        )
+        AWAITING_LAYOUT[user_id] = True
+        await query.edit_message_text(LAYOUT_PROMPT_TEXT, parse_mode=ParseMode.HTML)
         return
 
     # ── EXPORT BUTTONS ──────────────────────────────────────────
@@ -2157,9 +2228,13 @@ def _reset_pdf_session(user_id: int) -> None:
     AWAITING_FONT.pop(user_id, None)
     AWAITING_BG.pop(user_id, None)
     AWAITING_AK_STYLE.pop(user_id, None)
-    AWAITING_AK_NUDGE.pop(user_id, None)
+    AWAITING_LAYOUT.pop(user_id, None)
     PDF_AK_STYLE.pop(user_id, None)
     PDF_AK_NUDGE_CM.pop(user_id, None)
+    PDF_FONT_SIZE.pop(user_id, None)
+    PDF_TOP_MARGIN_CM.pop(user_id, None)
+    PDF_AK_WALL_GAP_CM.pop(user_id, None)
+    PDF_AK_UP_NUDGE_CM.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     font_path = PDF_FONT_PATH.pop(user_id, None)
     # Only delete it if it's a per-user upload (under FONT_BASE_DIR) — never
@@ -2190,7 +2265,11 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
     bg_path        = PDF_BG_IMAGE_PATH.get(session_id)
     ak_style       = PDF_AK_STYLE.get(session_id, "grouped")
-    ak_nudge_cm    = PDF_AK_NUDGE_CM.get(session_id, 0.0)
+    ak_nudge_cm    = PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM)
+    font_size      = PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE)
+    top_margin_cm  = PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM)
+    ak_wall_gap_cm = PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM)
+    ak_up_nudge_cm = PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM)
 
     import asyncio
     try:
@@ -2198,11 +2277,15 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             build_pdf, items, name, font_path=font_path,
             font_bold_path=font_bold_path, bg_image_path=bg_path,
             show_answers=True, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
+            font_size=font_size, top_margin_cm=top_margin_cm,
+            ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
         )
         blank_bytes = await asyncio.to_thread(
             build_pdf, items, name, font_path=font_path,
             font_bold_path=font_bold_path, bg_image_path=bg_path,
             show_answers=False, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
+            font_size=font_size, top_margin_cm=top_margin_cm,
+            ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
         )
     except Exception as e:
         print("PDF ERROR:", e)
@@ -2259,7 +2342,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
         or AWAITING_FONT.get(user_id) or AWAITING_BG.get(user_id)
-        or AWAITING_AK_STYLE.get(user_id) or AWAITING_AK_NUDGE.get(user_id)
+        or AWAITING_AK_STYLE.get(user_id) or AWAITING_LAYOUT.get(user_id)
         or PENDING_IMAGE.get(user_id)
     )
     _reset_pdf_session(user_id)
