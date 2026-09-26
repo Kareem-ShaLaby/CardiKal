@@ -56,7 +56,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Image as RLImage, KeepTogether, Flowable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether, Flowable
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -304,9 +304,9 @@ LAYOUT_PROMPT_TEXT = (
     "📐 <b>ظبط الشكل</b> — ابعت <u>5 أرقام</u> في رسالة واحدة، مفصولين بمسافة أو فاصلة، بالترتيب ده:\n\n"
     "1️⃣ حجم خط السؤال (الافتراضي 12)\n"
     "2️⃣ المسافة من فوق للسؤال الأول، بالسنتيمتر (الافتراضي 2.5)\n"
-    "3️⃣ إزاحة صندوق الإجابات لليسار، بالسنتيمتر (الافتراضي 0)\n"
+    "3️⃣ إزاحة صندوق الإجابات، بالسنتيمتر — رقم موجب يزحزحه لليسار، وسالب يزحزحه لليمين (الافتراضي 0)\n"
     "4️⃣ مسافة صندوق الإجابات من الحافة اليمين، بالسنتيمتر (الافتراضي 0.5)\n"
-    "5️⃣ رفع صندوق الإجابات لفوق، بالسنتيمتر (الافتراضي 4)\n\n"
+    "5️⃣ رفع صندوق الإجابات، بالسنتيمتر — رقم موجب يرفعه لفوق، وسالب ينزله لتحت (الافتراضي 4)\n\n"
     "مثال: <code>12 2.5 0 0.5 4</code>\n"
     "لو عايز رقم معين يفضل زي ما هو، اكتب مكانه <code>-</code>.\n"
     "أو ابعت <code>-</code> لوحدها عشان تاخد كل الإعدادات الافتراضية."
@@ -1074,11 +1074,11 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             # as a sidebar column rather than floating — its left edge
             # touches the content frame's right boundary, sitting in the
             # bottom-right corner. No title — the numbered list speaks for
-            # itself. Normal (body-text-sized) font, not a tiny caption.
-            font_size = 11
-            line_h    = 0.55 * cm
+            # itself.
+            font_size = 13
+            line_h    = 0.65 * cm
             lines     = [f"{n}. {letter}" for n, letter in pairs]
-            box_w     = 3.6 * cm   # wide enough for double-digit numbers at normal size
+            box_w     = 4.2 * cm   # wide enough for double-digit numbers at this size
             box_h     = pad * 2 + line_h * len(lines)
 
             x_right  = A4[0] - AK_WALL_GAP - self._ak_nudge_cm * cm
@@ -1088,16 +1088,15 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             fill_color   = colors.HexColor("#EDE4F8")
             stroke_color = colors.HexColor("#B39DDB")
         else:
-            font_size = 7.5
-            line_h    = 0.36 * cm
-            title_h   = 0.42 * cm
-            per_row   = 5
+            font_size = 10
+            line_h    = 0.48 * cm
+            per_row   = 4
             lines     = [
                 "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
                 for i in range(0, len(pairs), per_row)
             ]
-            box_w = 5.8 * cm
-            box_h = pad * 2 + title_h + line_h * len(lines)
+            box_w = 6.6 * cm
+            box_h = pad * 2 + line_h * len(lines)
 
             x_right  = A4[0] - AK_WALL_GAP - self._ak_nudge_cm * cm
             x_left   = x_right - box_w
@@ -1114,10 +1113,6 @@ class _AnswerKeyCanvas(_canvas.Canvas):
 
         self.setFillColor(colors.HexColor("#1A1A2E"))
         y = y_bottom + box_h - pad - 0.3 * cm
-        if self._ak_style != "column":
-            self._draw_safe_string(x_left + pad, y, "Answer Key", self._ak_font_bold, 8.5, bold=True)
-            y -= line_h
-
         for line in lines:
             self._draw_safe_string(x_left + pad, y, line, self._ak_font, font_size, bold=False)
             y -= line_h
@@ -1241,19 +1236,10 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         textColor=colors.HexColor("#78909C"), spaceAfter=6, spaceBefore=4,
     )
 
-    HR_COLOR = colors.HexColor("#CFD8DC")
-
-    def _build_story(skip_sep_indices, page_of_idx):
-        """Builds one fresh set of flowables. `skip_sep_indices` is the set
-        of question numbers whose LEADING separator (the line glued to the
-        top of their KeepTogether block) should be omitted — used to strip
-        the separator that would otherwise land at the very top of a page
-        AND the one that would land as the last line before a page break.
-        `page_of_idx` is a fresh dict that _PageRecorder fills in with
-        question_number -> 1-indexed page as doc.build() actually draws
-        each block; a recorder is attached to EVERY item (not just scored
-        MCQs) so every question's page is known, which is what lets us
-        compute skip_sep_indices for the real pass below."""
+    def _build_story(page_of_idx):
+        """Builds the flowables for the document. `page_of_idx` is a dict
+        that _PageRecorder fills in with question_number -> 1-indexed page
+        as doc.build() actually draws each block."""
         story        = []
         answer_pairs = []  # (question_number, letter) for the per-page answer key
 
@@ -1262,19 +1248,9 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
 
             # Every question gets a little breathing room before it starts —
             # whether it's Q1 sitting right below the header, a question
-            # opening a later page (whose separator was stripped as a
-            # top-of-page one), or one flowing normally after another on the
-            # same page.
+            # opening a later page, or one flowing normally after another on
+            # the same page.
             block.append(Spacer(1, 18))
-
-            # The separator before this question is glued into THIS question's
-            # KeepTogether block (instead of tacked onto the end of the previous
-            # one) so it always travels to whichever page the question lands on
-            # — it can never end up orphaned as a lone line at the bottom of a
-            # page with nothing under it. Skipped entirely for any idx in
-            # skip_sep_indices (top-of-page or bottom-of-page separators).
-            if idx > 1 and idx not in skip_sep_indices:
-                block.append(HRFlowable(width="100%", thickness=0.5, color=HR_COLOR, spaceAfter=4))
 
             q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
             block.append(Paragraph(q_num_label, NUM_STYLE))
@@ -1328,40 +1304,8 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
 
         return story, answer_pairs
 
-    # ── PASS 1 (dry run, iterated to a fixed point): lay the document out
-    # to learn which question starts/ends each page. Removing a separator
-    # frees up a little space, which can occasionally let one more question
-    # fit on a page than a single dry run assumed — so re-run the layout
-    # with the newly-computed skip set until the page grouping it produces
-    # stops changing (converges in a couple of iterations in practice; capped
-    # so a pathological document can't loop forever). Every iteration is
-    # discarded afterwards — never shown to the user. ──────────────────
-    skip_sep_indices = frozenset()
-    for _ in range(6):
-        dry_page_of_idx = {}
-        dry_story, _    = _build_story(skip_sep_indices=skip_sep_indices, page_of_idx=dry_page_of_idx)
-        dry_buffer      = BytesIO()
-        SimpleDocTemplate(dry_buffer, pagesize=A4, **_DOC_MARGINS).build(dry_story)
-
-        pages = {}
-        for idx, pg in dry_page_of_idx.items():
-            pages.setdefault(pg, []).append(idx)
-        new_skip = set()
-        for idxs in pages.values():
-            idxs.sort()
-            new_skip.add(idxs[0])    # top-of-page separator
-            new_skip.add(idxs[-1])   # bottom-of-page separator
-
-        if new_skip == skip_sep_indices:
-            break
-        skip_sep_indices = new_skip
-    # (idx==1 has no separator to begin with either way, so including it is
-    # harmless.)
-
-    # ── PASS 2 (real): rebuild with those separators omitted, and this
-    # time actually render to `buffer` with the answer-key overlay. ────
     page_of_idx  = {}
-    story, answer_pairs = _build_story(skip_sep_indices=skip_sep_indices, page_of_idx=page_of_idx)
+    story, answer_pairs = _build_story(page_of_idx=page_of_idx)
 
     doc = SimpleDocTemplate(buffer, pagesize=A4, **_DOC_MARGINS)
 
@@ -1849,8 +1793,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             DEFAULT_AK_NUDGE_CM, DEFAULT_AK_WALL_GAP_CM, DEFAULT_AK_UP_NUDGE_CM,
         ]
         # (min, max) sane clamps so a typo can't blow up the layout or send
-        # the answer-key box flying off the page.
-        CLAMPS = [(4.0, 40.0), (0.5, 10.0), (0.0, 15.0), (0.0, 5.0), (0.0, 20.0)]
+        # the answer-key box flying off the page. Font size / top margin /
+        # wall gap have no sensible negative meaning, so those stay
+        # positive-only; the shift and lift allow negative values (negative
+        # shift = push right instead of left, negative lift = push down
+        # below the default corner spot instead of up).
+        CLAMPS = [(4.0, 40.0), (0.5, 10.0), (-15.0, 15.0), (0.0, 5.0), (-2.0, 20.0)]
 
         parsed = []
         for i, tok in enumerate(tokens):
