@@ -43,7 +43,7 @@ from io import BytesIO
 # 1570   MAIN
 # ═══════════════════════════════════════════════════════════════
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MessageEntity
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -56,7 +56,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether, Flowable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether, Flowable, PageBreak
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -209,6 +209,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]  # set this in your host's env vars — use 
 # hardcoded "/tmp" fails on Android, which has no writable /tmp.
 IMG_BASE_DIR  = os.path.join(tempfile.gettempdir(), "quizician_pdf_imgs")
 FONT_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_pdf_fonts")
+# Cover + frame images live here, separately from IMG_BASE_DIR (which gets
+# wiped wholesale on every session reset/export) — this directory is never
+# touched by _cleanup_images/_reset_pdf_session, so whatever's saved here
+# stays remembered across sessions until the bot process restarts.
+BRANDING_BASE_DIR = os.path.join(tempfile.gettempdir(), "quizician_pdf_branding")
 
 # Preset fonts bundled with the bot itself (not user-uploaded) — put the
 # actual font files in a `fonts/` folder next to this script. Either .ttf
@@ -322,9 +327,15 @@ AWAITING_NAME          = {}    # user_id -> True
 PDF_FONT_PATH          = {}    # user_id -> path to a regular-weight .ttf/.otf, or absent for the default font
 PDF_FONT_BOLD_PATH     = {}    # user_id -> path to that font's bold weight, if one's available (presets only —
                                 # a single user upload has no bold companion, so bold text just reuses it)
-PDF_BG_IMAGE_PATH      = {}    # user_id -> path to an uploaded per-page background image, or absent for none
+PDF_FRAME_PATH         = {}    # user_id -> path to a per-page frame/background image. Persists ACROSS
+                                # sessions (set with /set_frame, cleared with /clear_frame or a bot
+                                # restart) — unlike everything else here, _reset_pdf_session never touches it.
+AWAITING_FRAME         = {}    # user_id -> True, waiting on the next photo to save as the frame image
+PDF_COVER_PATH         = {}    # user_id -> path to a cover-page image, inserted as page 1 of every PDF.
+                                # Same persistence as PDF_FRAME_PATH — set with /set_cover, cleared with
+                                # /clear_cover or a bot restart.
+AWAITING_COVER         = {}    # user_id -> True, waiting on the next photo to save as the cover image
 AWAITING_FONT          = {}    # user_id -> True, while the /pdf_start setup flow is waiting on a font file/skip
-AWAITING_BG            = {}    # user_id -> True, while the /pdf_start setup flow is waiting on a background image/skip
 PDF_AK_STYLE           = {}    # user_id -> "grouped" (default, rows of "1-A  2-D") or "column" (one "1. A" per line)
 PDF_AK_NUDGE_CM        = {}    # user_id -> float, how many cm to shift the answer-key box left of its default spot
 AWAITING_AK_STYLE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the answer-key style choice
@@ -393,8 +404,49 @@ def normalize_mcq_block(block: str):
     parts = re.split(r"(?=\b[A-Ea-e1-5][).])", options_part)
     return [question] + [p.strip() for p in parts if p.strip()]
 
-def strip_spoiler_markers(text: str) -> str:
-    return re.sub(r"\|\|(.+?)\|\|", r"\1", text, flags=re.DOTALL)
+def extract_written_qa(block: str, spoiler_texts: list):
+    """
+    A block is a written question ONLY when part of it is hidden behind a
+    spoiler: either a real Telegram spoiler (select the answer text in the
+    Telegram app and choose "Spoiler" formatting — preferred) or the
+    legacy typed "||text||" marker, kept for backward compatibility. The
+    spoiler-covered part becomes the (hidden) answer; everything else in
+    the block is the (always-visible) question.
+
+    A block with NO spoiler anywhere is NOT a written question — this
+    returns None so the block falls through to MCQ / other detection
+    instead, which is what actually fixes misclassifying plain MCQ blocks
+    as "written" questions.
+
+    `spoiler_texts` is the list of real-spoiler substrings already pulled
+    out of the ORIGINAL message by the caller (via
+    message.parse_entities/parse_caption_entities, which handles the
+    UTF-16 offset math correctly) — matched here by substring since blocks
+    are slices of that same original text.
+    """
+    question = block
+    answers  = []
+
+    for sp in spoiler_texts:
+        sp = sp.strip()
+        if sp and sp in question:
+            answers.append(sp)
+            question = question.replace(sp, " ", 1)
+
+    def _grab(m):
+        answers.append(m.group(1).strip())
+        return " "
+    question = re.sub(r"\|\|(.+?)\|\|", _grab, question, flags=re.DOTALL)
+
+    if not answers:
+        return None  # no spoiler at all → not a written question
+
+    question = re.sub(r"[ \t]+", " ", question)
+    question = re.sub(r"\n\s*\n+", "\n", question).strip(" \n\t.:،-")
+    answer   = " / ".join(a for a in answers if a)
+    if not question or not answer:
+        return None
+    return question, answer
 
 def parse_mcq_lines(lines: list):
     """
@@ -442,23 +494,6 @@ def parse_mcq_block(block: str):
     if correct_index is None or correct_index >= len(options):
         return None
     return question, options, correct_index, explanation
-
-def parse_written_question(block: str):
-    block = strip_spoiler_markers(block)
-    lines = [l.rstrip() for l in block.split("\n") if l.strip()]
-    if len(lines) < 2:
-        return None
-    title = re.sub(r'[\""\']+$', "", lines[0]).strip()
-    content_lines = lines[1:]
-    content = "\n".join(content_lines).strip()
-    if not content:
-        return None
-    if content.startswith(".") and content.endswith("."):
-        content = content[1:-1].strip()
-        return title, content
-    if content:
-        return title, content
-    return None
 
 # ═══════════════════════════════════════════════════════════════
 # GLYPH SAFETY — makes sure no character ever renders as a blank box
@@ -1140,7 +1175,8 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               ak_nudge_cm: float = 0.0, font_size: float = DEFAULT_FONT_SIZE,
               top_margin_cm: float = DEFAULT_TOP_MARGIN_CM,
               ak_wall_gap_cm: float = DEFAULT_AK_WALL_GAP_CM,
-              ak_up_nudge_cm: float = DEFAULT_AK_UP_NUDGE_CM) -> BytesIO:
+              ak_up_nudge_cm: float = DEFAULT_AK_UP_NUDGE_CM,
+              cover_image_path: str = None) -> BytesIO:
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
@@ -1174,6 +1210,22 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 )
             except Exception as e:
                 print(f"PDF background image draw error: {e}")
+        canvas.restoreState()
+
+    def draw_cover(canvas, doc):
+        """Drawn on page 1 ONLY (via onFirstPage), instead of draw_header —
+        a full-bleed cover image, deliberately with no frame/background and
+        no question content on it (the leading PageBreak() in `story` moves
+        straight to page 2 for that)."""
+        canvas.saveState()
+        if cover_image_path and os.path.exists(cover_image_path):
+            try:
+                canvas.drawImage(
+                    cover_image_path, 0, 0, width=A4[0], height=A4[1],
+                    preserveAspectRatio=False, mask="auto",
+                )
+            except Exception as e:
+                print(f"PDF cover image draw error: {e}")
         canvas.restoreState()
 
     AK_SIDEBAR_W  = 3.0 * cm   # matches the box_w the "column" style draws in _draw_answer_key
@@ -1227,6 +1279,13 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         "WBody", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
         textColor=colors.HexColor("#37474F"), leftIndent=14, spaceAfter=6,
     )
+    # The (spoiler-hidden) answer to a written question — shown only in the
+    # "answered" PDF, in the same green as a correct MCQ option; the blank
+    # PDF gets writing space instead (see the "written" branch below).
+    WRITTEN_ANSWER = ParagraphStyle(
+        "WAnswer", fontName=font_name_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
+        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=6,
+    )
     NUM_STYLE = ParagraphStyle(
         "NumStyle", fontName=font_name_bold, fontSize=9 * FSCALE,
         textColor=colors.HexColor("#90A4AE"), spaceAfter=2,
@@ -1277,10 +1336,15 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
 
             elif item["type"] == "written":
                 block.append(Paragraph(pdf_safe_markup(item["title"], font_name_bold, bold=True), WRITTEN_TITLE))
-                for line in item["content"].split("\n"):
-                    line = line.strip()
-                    if line:
-                        block.append(Paragraph(f"{_pdf_marker('•', font_name)} {pdf_safe_markup(_strip_leading_bullet(line), font_name, bold=False)}", WRITTEN_BODY))
+                if show_answers:
+                    block.append(Paragraph(
+                        f"{_pdf_marker('✓', font_name_bold, bold=True)}  {pdf_safe_markup(item['content'], font_name_bold, bold=True)}",
+                        WRITTEN_ANSWER,
+                    ))
+                else:
+                    # Answer stays hidden (that's the whole point of the
+                    # spoiler) — leave writing space instead.
+                    block.append(Spacer(1, 1.0 * cm))
 
             elif item["type"] == "image":
                 img_path = item["path"]
@@ -1307,6 +1371,14 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     page_of_idx  = {}
     story, answer_pairs = _build_story(page_of_idx=page_of_idx)
 
+    have_cover = bool(cover_image_path and os.path.exists(cover_image_path))
+    if have_cover:
+        # Page 1 is drawn entirely by draw_cover() below (a full-bleed
+        # image, via onFirstPage) — this PageBreak means no flowable
+        # content/frame/header ever lands on it, and the first real
+        # question starts fresh on page 2.
+        story.insert(0, PageBreak())
+
     doc = SimpleDocTemplate(buffer, pagesize=A4, **_DOC_MARGINS)
 
     def _make_canvas(*args, **kwargs):
@@ -1319,7 +1391,12 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             **kwargs,
         )
 
-    doc.build(story, onFirstPage=draw_header, onLaterPages=draw_header, canvasmaker=_make_canvas)
+    doc.build(
+        story,
+        onFirstPage=draw_cover if have_cover else draw_header,
+        onLaterPages=draw_header,
+        canvasmaker=_make_canvas,
+    )
     buffer.seek(0)
     return buffer
 
@@ -1483,7 +1560,7 @@ async def _ask_next_clarification(context, user_id: int, chat_id: int):
 # ═══════════════════════════════════════════════════════════════
 def _review_text(item: dict) -> str:
     if item["type"] == "written":
-        return f"📝 <b>{html.escape(item['title'])}</b>\n{html.escape(item['content'])}"
+        return f"📝 <b>{html.escape(item['title'])}</b>\n✅ {html.escape(item['content'])}"
     lines = [f"❓ {html.escape(item['q'])}"]
     for i, opt in enumerate(item["options"]):
         mark = "  ✅" if i == item.get("correct") else ""
@@ -1493,8 +1570,8 @@ def _review_text(item: dict) -> str:
 def _review_buttons(item_index: int, item: dict) -> InlineKeyboardMarkup:
     if item["type"] == "written":
         rows = [
-            [InlineKeyboardButton("✏️ عدّل العنوان", callback_data=f"revedit:{item_index}:title")],
-            [InlineKeyboardButton("✏️ عدّل المحتوى", callback_data=f"revedit:{item_index}:content")],
+            [InlineKeyboardButton("✏️ عدّل السؤال", callback_data=f"revedit:{item_index}:title")],
+            [InlineKeyboardButton("✏️ عدّل الإجابة", callback_data=f"revedit:{item_index}:content")],
             [InlineKeyboardButton("✅ تمام، مفيش تعديل", callback_data=f"revedit:{item_index}:done")],
         ]
         return InlineKeyboardMarkup(rows)
@@ -1513,24 +1590,43 @@ def _review_buttons(item_index: int, item: dict) -> InlineKeyboardMarkup:
 # ═══════════════════════════════════════════════════════════════
 # IMAGE HANDLER
 # ═══════════════════════════════════════════════════════════════
-async def _save_bg_photo(context: ContextTypes.DEFAULT_TYPE, user_id: int, file_id: str) -> str:
+async def _save_frame_photo(context: ContextTypes.DEFAULT_TYPE, user_id: int, file_id: str) -> str:
     """Downloads a Telegram photo (by file_id) and registers it as this
-    user's per-page PDF background. Shared by the manual upload path and
-    the pinned-image auto-detect path so both save to the same place."""
-    bg_dir  = os.path.join(IMG_BASE_DIR, str(user_id))
-    os.makedirs(bg_dir, exist_ok=True)
-    bg_path = os.path.join(bg_dir, "page_background.jpg")
-    tg_file = await context.bot.get_file(file_id)
-    await tg_file.download_to_drive(bg_path)
-    PDF_BG_IMAGE_PATH[user_id] = bg_path
-    return bg_path
+    user's per-page PDF frame/background — saved under BRANDING_BASE_DIR
+    (not IMG_BASE_DIR), so it survives session resets and stays remembered
+    across every future /pdf_start until /clear_frame or a bot restart."""
+    frame_dir  = os.path.join(BRANDING_BASE_DIR, str(user_id))
+    os.makedirs(frame_dir, exist_ok=True)
+    frame_path = os.path.join(frame_dir, "frame.jpg")
+    tg_file    = await context.bot.get_file(file_id)
+    await tg_file.download_to_drive(frame_path)
+    PDF_FRAME_PATH[user_id] = frame_path
+    return frame_path
+
+async def _save_cover_photo(context: ContextTypes.DEFAULT_TYPE, user_id: int, file_id: str) -> str:
+    """Downloads a Telegram photo (by file_id) and registers it as this
+    user's PDF cover page — same persistence as the frame (see above)."""
+    cover_dir  = os.path.join(BRANDING_BASE_DIR, str(user_id))
+    os.makedirs(cover_dir, exist_ok=True)
+    cover_path = os.path.join(cover_dir, "cover.jpg")
+    tg_file    = await context.bot.get_file(file_id)
+    await tg_file.download_to_drive(cover_path)
+    PDF_COVER_PATH[user_id] = cover_path
+    return cover_path
 
 async def _start_bg_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
-    """Step after font selection (font → background → answer-key style →
-    nudge → finish). If the user has a photo pinned in their private chat
-    with the bot, that's grabbed and used as the background automatically
-    — no prompt, straight on to the next step. Otherwise falls back to
-    asking for one like normal."""
+    """Step after font selection (font → frame → answer-key style →
+    layout → finish). If a frame is already remembered for this user
+    (set earlier via this flow or /set_frame), it's reused automatically
+    — no re-prompt. Otherwise: a pinned chat photo is grabbed and used
+    automatically, or failing that, the user is asked for one."""
+    if user_id in PDF_FRAME_PATH:
+        await reply_target.reply_text(
+            "🖼 هستخدم الفريم المسجل قبل كده. لو عايز تغيّره ابعت /set_frame، أو /clear_frame تشيله.",
+        )
+        await _ask_ak_style(context, user_id, reply_target)
+        return
+
     pinned_photo = None
     try:
         chat   = await context.bot.get_chat(user_id)
@@ -1542,18 +1638,19 @@ async def _start_bg_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
 
     if pinned_photo:
         try:
-            await _save_bg_photo(context, user_id, pinned_photo.file_id)
+            await _save_frame_photo(context, user_id, pinned_photo.file_id)
             await reply_target.reply_text(
-                "📌 لقيت صورة مثبتة في الشات وحطيتها كخلفية للـ PDF أوتوماتيك.",
+                "📌 لقيت صورة مثبتة في الشات وحطيتها كفريم للـ PDF أوتوماتيك — هتفضل متسجلة للمرات الجاية.",
             )
             await _ask_ak_style(context, user_id, reply_target)
             return
         except Exception:
             pass  # download failed for some reason — fall back to asking normally
 
-    AWAITING_BG[user_id] = True
+    AWAITING_FRAME[user_id] = True
     await reply_target.reply_text(
-        "دلوقتي ابعت صورة تتحط كخلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز خلفية.\n"
+        "دلوقتي ابعت صورة تتحط كفريم/خلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز فريم.\n"
+        "هتفضل متسجلة وهتتستخدم تلقائي في كل PDF جاي، لحد ما تغيّرها بـ /set_frame أو تشيلها بـ /clear_frame.\n"
         "(أو ثبّت صورة في الشات ده والبوت هياخدها تلقائي المرة الجاية.)",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⏭ Skip", callback_data="bg_skip"),
@@ -1572,11 +1669,22 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not photo:
         return
 
-    # ── AWAITING BACKGROUND IMAGE (part of the /pdf_start setup flow) ──
-    if AWAITING_BG.get(user_id):
-        await _save_bg_photo(context, user_id, photo.file_id)
-        del AWAITING_BG[user_id]
-        await _ask_ak_style(context, user_id, update.message)
+    # ── AWAITING COVER IMAGE (standalone /set_cover, or part of setup) ──
+    if AWAITING_COVER.get(user_id):
+        await _save_cover_photo(context, user_id, photo.file_id)
+        del AWAITING_COVER[user_id]
+        await update.message.reply_text("✅ اتسجل الغلاف! هيتحط كأول صفحة في كل PDF جاي لحد ما تغيّره أو تشيله.")
+        return
+
+    # ── AWAITING FRAME IMAGE (part of the /pdf_start setup flow, or
+    # standalone /set_frame) ─────────────────────────────────────────
+    if AWAITING_FRAME.get(user_id):
+        await _save_frame_photo(context, user_id, photo.file_id)
+        del AWAITING_FRAME[user_id]
+        if user_id in PDF_BUFFER:
+            await _ask_ak_style(context, user_id, update.message)
+        else:
+            await update.message.reply_text("✅ اتسجل الفريم! هيتحط في كل صفحة في كل PDF جاي لحد ما تغيّره أو تشيله.")
         return
 
     if user_id not in PDF_BUFFER:
@@ -1706,6 +1814,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    # Real Telegram spoiler formatting (select text → "Spoiler") applied
+    # anywhere in this message — used below to tell a written question's
+    # hidden answer apart from its always-visible question text. PTB's
+    # parse_entities() does the UTF-16 offset math correctly (important
+    # for Arabic + emoji mixed in), so these substrings are exact.
+    spoiler_texts = list(update.message.parse_entities([MessageEntity.SPOILER]).values())
+
     # ── AWAITING A QUESTION EDIT (from the review/edit prompt) ───
     pending_edit = PENDING_EDIT.pop(user_id, None)
     if pending_edit:
@@ -1755,10 +1870,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── AWAITING BACKGROUND IMAGE (same — reminder only) ────────────
-    if AWAITING_BG.get(user_id):
+    # ── AWAITING COVER / FRAME IMAGE (same — reminder only) ─────────
+    if AWAITING_COVER.get(user_id):
+        await update.message.reply_text("⚠️ محتاج تبعت صورة عشان تتسجل كغلاف.")
+        return
+    if AWAITING_FRAME.get(user_id):
         await update.message.reply_text(
-            "⚠️ محتاج تبعت صورة كخلفية، أو دوس Skip فوق.",
+            "⚠️ محتاج تبعت صورة كفريم، أو دوس Skip فوق.",
         )
         return
 
@@ -1840,7 +1958,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             # ── WRITTEN ─────────────────────────────────────────
-            written = parse_written_question(block)
+            written = extract_written_qa(block, spoiler_texts)
             if written:
                 title, content = written
                 item = {
@@ -2007,8 +2125,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PENDING_EDIT[user_id] = {"index": item_index, "field": action}
             prompt = {
                 "q":       "✏️ اكتب نص السؤال الجديد:",
-                "title":   "✏️ اكتب العنوان الجديد:",
-                "content": "✏️ اكتب المحتوى الجديد:",
+                "title":   "✏️ اكتب نص السؤال الجديد:",
+                "content": "✏️ اكتب الإجابة الجديدة:",
             }[action]
             await query.edit_message_text(prompt)
             return
@@ -2088,9 +2206,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "bg_skip":
-        if not AWAITING_BG.get(user_id):
+        if not AWAITING_FRAME.get(user_id):
             return
-        del AWAITING_BG[user_id]
+        del AWAITING_FRAME[user_id]
         await _ask_ak_style(context, user_id, query.message, edit=True)
         return
 
@@ -2174,7 +2292,8 @@ def _reset_pdf_session(user_id: int) -> None:
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
     AWAITING_FONT.pop(user_id, None)
-    AWAITING_BG.pop(user_id, None)
+    AWAITING_FRAME.pop(user_id, None)
+    AWAITING_COVER.pop(user_id, None)
     AWAITING_AK_STYLE.pop(user_id, None)
     AWAITING_LAYOUT.pop(user_id, None)
     PDF_AK_STYLE.pop(user_id, None)
@@ -2194,12 +2313,9 @@ def _reset_pdf_session(user_id: int) -> None:
         except Exception:
             pass
     PDF_FONT_BOLD_PATH.pop(user_id, None)   # always a bundled preset path (or absent) — never a per-user file, nothing to delete
-    bg_path = PDF_BG_IMAGE_PATH.pop(user_id, None)
-    if bg_path and os.path.exists(bg_path):
-        try:
-            os.remove(bg_path)
-        except Exception:
-            pass
+    # NOTE: PDF_COVER_PATH / PDF_FRAME_PATH are deliberately NOT touched
+    # here — unlike everything above, they're meant to stay remembered
+    # across sessions (until /clear_cover, /clear_frame, or a bot restart).
 
 async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
                                items: list, name: str) -> bool:
@@ -2211,13 +2327,14 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
     font_path      = PDF_FONT_PATH.get(session_id)
     font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
-    bg_path        = PDF_BG_IMAGE_PATH.get(session_id)
+    bg_path        = PDF_FRAME_PATH.get(session_id)
     ak_style       = PDF_AK_STYLE.get(session_id, "grouped")
     ak_nudge_cm    = PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM)
     font_size      = PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE)
     top_margin_cm  = PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM)
     ak_wall_gap_cm = PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM)
     ak_up_nudge_cm = PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM)
+    cover_path     = PDF_COVER_PATH.get(session_id)
 
     import asyncio
     try:
@@ -2227,6 +2344,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             show_answers=True, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
             font_size=font_size, top_margin_cm=top_margin_cm,
             ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
+            cover_image_path=cover_path,
         )
         blank_bytes = await asyncio.to_thread(
             build_pdf, items, name, font_path=font_path,
@@ -2234,6 +2352,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             show_answers=False, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
             font_size=font_size, top_margin_cm=top_margin_cm,
             ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
+            cover_image_path=cover_path,
         )
     except Exception as e:
         print("PDF ERROR:", e)
@@ -2283,13 +2402,59 @@ async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _reset_pdf_session(user_id)
     await update.message.reply_text(MSG_PDF_CLEARED)
 
+async def set_cover_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Standalone command (works outside a /pdf_start session too) — the
+    next photo sent becomes the PDF cover page, remembered across every
+    future PDF until /clear_cover or a bot restart."""
+    user_id = update.effective_chat.id
+    AWAITING_COVER[user_id] = True
+    await update.message.reply_text(
+        "🖼 ابعت الصورة اللي هتتحط <b>كغلاف</b> (أول صفحة) في كل PDF تعمله بعد كده.\n"
+        "هتفضل متسجلة لحد ما تغيّرها تاني أو تشيلها بـ /clear_cover.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def clear_cover_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    AWAITING_COVER.pop(user_id, None)
+    path = PDF_COVER_PATH.pop(user_id, None)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    await update.message.reply_text("🗑 شيلت الغلاف." if path else "مفيش غلاف متسجل أصلاً.")
+
+async def set_frame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Standalone command (works outside a /pdf_start session too) — the
+    next photo sent becomes the per-page PDF frame/background, remembered
+    across every future PDF until /clear_frame or a bot restart."""
+    user_id = update.effective_chat.id
+    AWAITING_FRAME[user_id] = True
+    await update.message.reply_text(
+        "🖼 ابعت الصورة اللي هتتحط <b>كفريم</b> في كل صفحة في كل PDF تعمله بعد كده.\n"
+        "هتفضل متسجلة لحد ما تغيّرها تاني أو تشيلها بـ /clear_frame.",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def clear_frame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    AWAITING_FRAME.pop(user_id, None)
+    path = PDF_FRAME_PATH.pop(user_id, None)
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    await update.message.reply_text("🗑 شيلت الفريم." if path else "مفيش فريم متسجل أصلاً.")
+
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bails out of whatever's in progress: PDF collection session (or its
     font/background setup step) or a pending image waiting for its question."""
     user_id = update.effective_chat.id
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
-        or AWAITING_FONT.get(user_id) or AWAITING_BG.get(user_id)
+        or AWAITING_FONT.get(user_id) or AWAITING_FRAME.get(user_id) or AWAITING_COVER.get(user_id)
         or AWAITING_AK_STYLE.get(user_id) or AWAITING_LAYOUT.get(user_id)
         or PENDING_IMAGE.get(user_id)
     )
@@ -2320,6 +2485,10 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pdf_start — starts a session collecting questions for a PDF",
         "/pdf_generate — builds a PDF from what you've collected so far",
         "/pdf_clear — clears the current session",
+        "/set_cover — set a cover page image (remembered until you change it or the bot restarts)",
+        "/clear_cover — remove the saved cover image",
+        "/set_frame — set a per-page frame/background image (remembered until you change it or the bot restarts)",
+        "/clear_frame — remove the saved frame image",
         "/cancel — cancels whatever's currently in progress",
         "😴 /sleep — pauses the bot temporarily in this chat",
         "/c — this list",
@@ -2358,6 +2527,10 @@ app.add_handler(CommandHandler("sleep",        sleep_cmd))
 app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
+app.add_handler(CommandHandler("set_cover",    set_cover_cmd))
+app.add_handler(CommandHandler("clear_cover",  clear_cover_cmd))
+app.add_handler(CommandHandler("set_frame",    set_frame_cmd))
+app.add_handler(CommandHandler("clear_frame",  clear_frame_cmd))
 
 # Poll handler before text handler (forwarded OR own quiz polls)
 app.add_handler(MessageHandler(filters.POLL, handle_poll))
