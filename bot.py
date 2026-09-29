@@ -248,6 +248,42 @@ BUNDLED_FONTS = {
 }
 
 
+# ─── TITLE FONT ("The Bomb Sound") ──────────────────────────────
+# Drop the font file in the `fonts/` folder next to this script. Any .ttf/.otf
+# whose filename contains "bomb" is picked up (TheBombSound.ttf, The Bomb
+# Sound.otf, TheBombSound-Regular.ttf ...). NOTE: reportlab can only embed
+# TrueType-outline fonts — a CFF/PostScript .otf raises TTFError below; if that
+# happens, convert it to .ttf. Until a usable file is found the title falls
+# back to the bold body font (still black with a purple outline).
+TITLE_FONT    = FONT_NAME_BOLD
+TITLE_FONT_OK = False
+
+def _register_title_font():
+    global TITLE_FONT, TITLE_FONT_OK
+    candidates = []
+    try:
+        if os.path.isdir(FONTS_DIR):
+            candidates = sorted(
+                os.path.join(FONTS_DIR, f) for f in os.listdir(FONTS_DIR)
+                if "bomb" in f.lower() and f.lower().endswith((".ttf", ".otf"))
+            )
+    except Exception as e:
+        print(f"Title font scan error: {e}")
+    for path in candidates:
+        try:
+            pdfmetrics.registerFont(TTFont("TitleBombSound", path))
+            TITLE_FONT, TITLE_FONT_OK = "TitleBombSound", True
+            print(f"Title font loaded: {os.path.basename(path)}")
+            return
+        except Exception as e:
+            print(f"Title font {os.path.basename(path)} can't be embedded ({e}) — "
+                  f"convert it to a TrueType .ttf. Using the bold body font for now.")
+    if not candidates:
+        print("Title font not found — put The Bomb Sound (.ttf) in ./fonts/. Using the bold body font for now.")
+
+_register_title_font()
+
+
 # ═══════════════════════════════════════════════════════════════
 # QUIZZY — flavor text (kept purely cosmetic, no dependency on anything else)
 # ═══════════════════════════════════════════════════════════════
@@ -1163,6 +1199,126 @@ class _AnswerKeyCanvas(_canvas.Canvas):
 
         self.restoreState()
 
+TITLE_FILL_COLOR    = colors.black
+TITLE_OUTLINE_COLOR = colors.HexColor("#7B2CBF")   # purple
+
+class _OutlinedTitle(Flowable):
+    """Centered display title: black letters with a purple outline (drawn as a
+    thick purple stroke first, then the black fill on top, so the outline sits
+    OUTSIDE the letters like a sticker border). Wraps on spaces, shrinks to
+    fit, picks a fallback font per character so nothing renders as a box."""
+    MIN_SIZE  = 8
+    MAX_LINES = 3
+
+    def __init__(self, text, base_size=30.0):
+        super().__init__()
+        try:
+            self.text = normalize_text(text, shape_rtl=True).strip()
+        except Exception:
+            self.text = str(text).strip()
+        self.base_size = base_size
+        self.size, self.lines, self.ow, self.leading = base_size, [self.text], 2.0, base_size * 1.2
+        self._w = self._h = 0
+
+    def _font_for(self, ch):
+        if _font_has_glyph(TITLE_FONT, ch):
+            return TITLE_FONT
+        f = _chain_font_for(ch, True, TITLE_FONT)
+        return f if f else TITLE_FONT
+
+    def _runs(self, s):
+        """Split into (font, text) runs so each character is drawn by a font that has it."""
+        runs = []
+        for ch in s:
+            f = self._font_for(ch)
+            if runs and runs[-1][0] == f:
+                runs[-1][1] += ch
+            else:
+                runs.append([f, ch])
+        return runs
+
+    def _width(self, s, size):
+        total = 0.0
+        for f, t in self._runs(s):
+            try:
+                total += pdfmetrics.stringWidth(t, f, size)
+            except Exception:
+                total += len(t) * size * 0.6
+        return total
+
+    def _layout(self, size, avail):
+        # Arabic/Hebrew is already in visual order after shaping — wrapping it
+        # by words would scramble the reading order, so keep it on one line.
+        if re.search(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]", self.text):
+            return [self.text]
+        lines, cur = [], ""
+        for word in self.text.split():
+            trial = f"{cur} {word}".strip()
+            if cur and self._width(trial, size) > avail:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = trial
+        if cur:
+            lines.append(cur)
+        return lines or [""]
+
+    def wrap(self, availWidth, availHeight):
+        size = self.base_size
+        while True:
+            ow    = size * 0.07
+            inner = max(availWidth - 2 * ow, 10)
+            lines = self._layout(size, inner)
+            fits  = len(lines) <= self.MAX_LINES and all(self._width(l, size) <= inner for l in lines)
+            if fits or size <= self.MIN_SIZE:
+                break
+            size -= 1
+        self.size, self.lines, self.ow = size, lines, size * 0.07
+        self.leading = size * 1.2
+        self._w = availWidth
+        self._h = self.leading * len(lines) + 2 * self.ow
+        return self._w, self._h
+
+    def _draw_line(self, c, x, y, line, mode):
+        for f, t in self._runs(line):
+            to = c.beginText(x, y)
+            to.setFont(f, self.size)
+            to.setTextRenderMode(mode)      # 1 = stroke only, 0 = fill only
+            to.textOut(t)
+            c.drawText(to)
+            try:
+                x += pdfmetrics.stringWidth(t, f, self.size)
+            except Exception:
+                x += len(t) * self.size * 0.6
+
+    def draw(self):
+        c = self.canv
+        try:
+            asc = min(pdfmetrics.getAscentDescent(TITLE_FONT, self.size)[0], self.size)
+        except Exception:
+            asc = self.size * 0.85
+        y = self._h - self.ow - asc
+        c.saveState()
+        c.setLineJoin(1)                    # rounded joins/caps = smooth sticker-style border
+        c.setLineCap(1)
+        c.setStrokeColor(TITLE_OUTLINE_COLOR)
+        c.setLineWidth(self.ow * 2)         # half of it is hidden under the fill → visible outline = ow
+        c.setFillColor(TITLE_FILL_COLOR)
+        for line in self.lines:
+            x = (self._w - self._width(line, self.size)) / 2
+            # Each pass gets its own save/restore: the text render mode is part
+            # of the PDF graphics state and reportlab won't emit "0 Tr" for the
+            # fill pass, so without this the stroke mode would leak into it and
+            # the black letters would never be drawn.
+            c.saveState()
+            self._draw_line(c, x, y, line, 1)   # purple outline first
+            c.restoreState()
+            c.saveState()
+            self._draw_line(c, x, y, line, 0)   # black letters on top
+            c.restoreState()
+            y -= self.leading
+        c.restoreState()
+
 def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT):
     """Loads an image as an RLImage, scaled DOWN (never up) to fit within
     max_w x max_h while keeping its aspect ratio — so a wide screenshot or
@@ -1385,6 +1541,12 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     page_of_idx  = {}
     story, answer_pairs = _build_story(page_of_idx=page_of_idx)
 
+    # Title (= the file name) at the top of the first content page. With a
+    # cover, the PageBreak inserted below goes in front of this, so the title
+    # lands on page 2 — the first page that actually carries content.
+    if doc_title and str(doc_title).strip():
+        story[0:0] = [_OutlinedTitle(doc_title, base_size=30 * FSCALE), Spacer(1, 4)]
+
     have_cover = bool(cover_image_path and os.path.exists(cover_image_path))
     if have_cover:
         # Page 1 is drawn entirely by draw_cover() below (a full-bleed
@@ -1553,6 +1715,7 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
             f"📐 خط <code>{font_size:g}</code> · فوق <code>{top_margin_cm:g}</code> · "
             f"إزاحة <code>{ak_nudge_cm:g}</code> · حافة <code>{ak_wall_gap_cm:g}</code> · "
             f"رفع <code>{ak_up_nudge_cm:g}</code>"
+            + ("" if TITLE_FONT_OK else "\n⚠️ خط The Bomb Sound مش موجود — حط ملفه (.ttf) في فولدر fonts/")
         ),
         parse_mode=ParseMode.HTML,
     )
