@@ -398,6 +398,8 @@ PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/
                                 # awaiting free-text replacement for one field of a just-added question
 
 # ─── PAGE-MARGIN TUNING ─────────────────────────────────────────
+OPT_SPACING         = 6     # points of space after each MCQ option (was 3)
+Q_NUM_COLOR         = "#90A4AE"   # colour of the inline "Q1" label
 LEFT_MARGIN_CM      = 1.2   # where questions start from the page's left edge (was 2.0)
 AK_COLUMN_BOX_W     = 4.2 * cm   # width of the "column"-style answer-key box (single source of truth)
 TEXT_TO_BOX_GAP_CM  = 0.4   # breathing room between the end of the text lines and the answer-key box
@@ -1199,14 +1201,19 @@ class _AnswerKeyCanvas(_canvas.Canvas):
 
         self.restoreState()
 
-TITLE_FILL_COLOR    = colors.black
-TITLE_OUTLINE_COLOR = colors.HexColor("#7B2CBF")   # purple
+TITLE_FILL_COLOR       = colors.HexColor("#8A2BE2")   # violet letters
+TITLE_INNER_LINE_COLOR = colors.white                 # first line around the letters
+TITLE_OUTER_LINE_COLOR = colors.black                 # outer line, around the white one
+TITLE_WHITE_LINE_EM    = 0.065   # visible thickness of the white line, as a fraction of the font size
+TITLE_BLACK_LINE_EM    = 0.045   # visible thickness of the black line
 
 class _OutlinedTitle(Flowable):
-    """Centered display title: black letters with a purple outline (drawn as a
-    thick purple stroke first, then the black fill on top, so the outline sits
-    OUTSIDE the letters like a sticker border). Wraps on spaces, shrinks to
-    fit, picks a fallback font per character so nothing renders as a box."""
+    """Centered display title: violet letters with a double outline — a white
+    line right around the letters and a black line around that. Drawn as three
+    passes (thick black stroke, thinner white stroke, violet fill on top) so
+    both lines sit OUTSIDE the letters like a sticker border. Wraps on spaces,
+    shrinks to fit, picks a fallback font per character so nothing renders as
+    a box."""
     MIN_SIZE  = 8
     MAX_LINES = 3
 
@@ -1218,6 +1225,7 @@ class _OutlinedTitle(Flowable):
             self.text = str(text).strip()
         self.base_size = base_size
         self.size, self.lines, self.ow, self.leading = base_size, [self.text], 2.0, base_size * 1.2
+        self.ow_white = self.ow_black = 1.0
         self._w = self._h = 0
 
     def _font_for(self, ch):
@@ -1266,14 +1274,17 @@ class _OutlinedTitle(Flowable):
     def wrap(self, availWidth, availHeight):
         size = self.base_size
         while True:
-            ow    = size * 0.07
+            ow    = size * (TITLE_WHITE_LINE_EM + TITLE_BLACK_LINE_EM)
             inner = max(availWidth - 2 * ow, 10)
             lines = self._layout(size, inner)
             fits  = len(lines) <= self.MAX_LINES and all(self._width(l, size) <= inner for l in lines)
             if fits or size <= self.MIN_SIZE:
                 break
             size -= 1
-        self.size, self.lines, self.ow = size, lines, size * 0.07
+        self.size, self.lines = size, lines
+        self.ow_white = size * TITLE_WHITE_LINE_EM
+        self.ow_black = size * TITLE_BLACK_LINE_EM
+        self.ow       = self.ow_white + self.ow_black   # total border thickness outside the letters
         self.leading = size * 1.2
         self._w = availWidth
         self._h = self.leading * len(lines) + 2 * self.ow
@@ -1301,20 +1312,27 @@ class _OutlinedTitle(Flowable):
         c.saveState()
         c.setLineJoin(1)                    # rounded joins/caps = smooth sticker-style border
         c.setLineCap(1)
-        c.setStrokeColor(TITLE_OUTLINE_COLOR)
-        c.setLineWidth(self.ow * 2)         # half of it is hidden under the fill → visible outline = ow
-        c.setFillColor(TITLE_FILL_COLOR)
         for line in self.lines:
             x = (self._w - self._width(line, self.size)) / 2
             # Each pass gets its own save/restore: the text render mode is part
             # of the PDF graphics state and reportlab won't emit "0 Tr" for the
             # fill pass, so without this the stroke mode would leak into it and
             # the black letters would never be drawn.
-            c.saveState()
-            self._draw_line(c, x, y, line, 1)   # purple outline first
+            # A stroke is centred on the glyph edge, so half its width is covered
+            # by the passes drawn after it → visible thickness = half the width.
+            c.saveState()                        # 1) black — outermost line
+            c.setStrokeColor(TITLE_OUTER_LINE_COLOR)
+            c.setLineWidth(2 * (self.ow_black + self.ow_white))
+            self._draw_line(c, x, y, line, 1)
             c.restoreState()
-            c.saveState()
-            self._draw_line(c, x, y, line, 0)   # black letters on top
+            c.saveState()                        # 2) white — line right around the letters
+            c.setStrokeColor(TITLE_INNER_LINE_COLOR)
+            c.setLineWidth(2 * self.ow_white)
+            self._draw_line(c, x, y, line, 1)
+            c.restoreState()
+            c.saveState()                        # 3) violet letters on top
+            c.setFillColor(TITLE_FILL_COLOR)
+            self._draw_line(c, x, y, line, 0)
             c.restoreState()
             y -= self.leading
         c.restoreState()
@@ -1435,11 +1453,11 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     )
     OPT_STYLE = ParagraphStyle(
         "OptStyle", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
-        textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=3,
+        textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=OPT_SPACING,
     )
     OPT_CORRECT = ParagraphStyle(
         "OptCorrect", fontName=font_name_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
-        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=3,
+        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=OPT_SPACING,
     )
     WRITTEN_TITLE = ParagraphStyle(
         "WTitle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
@@ -1482,10 +1500,16 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             block.append(Spacer(1, 18))
 
             q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
-            block.append(Paragraph(q_num_label, NUM_STYLE))
+            # The number sits INLINE, in front of the question text (same line),
+            # instead of on a separate line above it. Image-only items have no
+            # question text to sit next to, so they keep the standalone label.
+            q_num_inline = (
+                f'<font color="{Q_NUM_COLOR}">{pdf_safe_markup(q_num_label, font_name_bold, bold=True)}</font>'
+                f'&nbsp;&nbsp;&nbsp;'
+            )
 
             if item["type"] == "mcq":
-                block.append(Paragraph(pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
+                block.append(Paragraph(q_num_inline + pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
                 if item.get("image"):
                     try:
                         img = _fit_image(item["image"])
@@ -1505,7 +1529,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
 
             elif item["type"] == "written":
-                block.append(Paragraph(pdf_safe_markup(item["title"], font_name_bold, bold=True), WRITTEN_TITLE))
+                block.append(Paragraph(q_num_inline + pdf_safe_markup(item["title"], font_name_bold, bold=True), WRITTEN_TITLE))
                 if show_answers:
                     block.append(Paragraph(
                         f"{_pdf_marker('✓', font_name_bold, bold=True)}  {pdf_safe_markup(item['content'], font_name_bold, bold=True)}",
@@ -1517,6 +1541,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     block.append(Spacer(1, 1.0 * cm))
 
             elif item["type"] == "image":
+                block.append(Paragraph(q_num_label, NUM_STYLE))
                 img_path = item["path"]
                 try:
                     img = _fit_image(img_path)
