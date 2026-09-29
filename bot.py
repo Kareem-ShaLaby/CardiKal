@@ -361,6 +361,13 @@ POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive au
 PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
                                 # awaiting free-text replacement for one field of a just-added question
 
+# ─── PAGE-MARGIN TUNING ─────────────────────────────────────────
+LEFT_MARGIN_CM      = 1.2   # where questions start from the page's left edge (was 2.0)
+AK_COLUMN_BOX_W     = 4.2 * cm   # width of the "column"-style answer-key box (single source of truth)
+TEXT_TO_BOX_GAP_CM  = 0.4   # breathing room between the end of the text lines and the answer-key box
+MIN_RIGHT_MARGIN_CM = 1.0   # text never runs closer than this to the right edge of the page
+MIN_TEXT_WIDTH_CM   = 8.0   # safety floor so a huge left-shift of the box can't squeeze the text column shut
+
 PDF_MAX_IMG_WIDTH  = 13 * cm
 PDF_MAX_IMG_HEIGHT = 9 * cm    # caps height too, so a tall/portrait photo
                                # can't balloon into taking up the whole page
@@ -916,6 +923,7 @@ def export_keyboard():
     row = [InlineKeyboardButton("📄 Export as PDF", callback_data="gen_pdf")]
     return InlineKeyboardMarkup([
         row,
+        [InlineKeyboardButton("👁 Preview", callback_data="preview_pdf")],
         [InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
         [InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
@@ -959,7 +967,8 @@ def font_prompt_keyboard() -> InlineKeyboardMarkup:
 HOW_TO_USE_TEXT = (
     "📄 <b>How To Use — Quizician PDF Bot</b>\n\n"
     "<b>1) Start a session</b>\n"
-    "/pdf_start — pick a name, a font, and a page background, then start sending content.\n\n"
+    "/pdf_start — pick a name, a font, a cover page (first page of every PDF) and a page frame, then start sending content.\n"
+     "The cover and frame are remembered for every future PDF until the bot restarts (/set_cover, /clear_cover, /set_frame, /clear_frame to change them).\n\n"
     "<b>2) Normal MCQ</b>\n"
     "<code>Question?\n"
     "a) Option A\n"
@@ -1113,7 +1122,7 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             font_size = 13
             line_h    = 0.65 * cm
             lines     = [f"{n}. {letter}" for n, letter in pairs]
-            box_w     = 4.2 * cm   # wide enough for double-digit numbers at this size
+            box_w     = AK_COLUMN_BOX_W   # wide enough for double-digit numbers at this size
             box_h     = pad * 2 + line_h * len(lines)
 
             x_right  = A4[0] - AK_WALL_GAP - self._ak_nudge_cm * cm
@@ -1228,8 +1237,8 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 print(f"PDF cover image draw error: {e}")
         canvas.restoreState()
 
-    AK_SIDEBAR_W  = 3.0 * cm   # matches the box_w the "column" style draws in _draw_answer_key
     TOP_MARGIN    = top_margin_cm * cm
+    LEFT_MARGIN   = LEFT_MARGIN_CM * cm
 
     # Every text size below is defined relative to DEFAULT_FONT_SIZE and
     # scaled by this ratio, so a single "font size" number moves the whole
@@ -1238,19 +1247,24 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     FSCALE = font_size / DEFAULT_FONT_SIZE
 
     if ak_style == "column":
+        # The text column ends just before the answer-key box's ACTUAL left
+        # edge — computed from the same wall-gap / shift numbers the canvas
+        # uses to place the box — so lines run right up to it instead of
+        # stopping at a fixed reserve. If the box is pushed mostly off the
+        # page (negative shift), the text simply extends further right.
+        box_left_x   = A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm - AK_COLUMN_BOX_W
+        right_margin = A4[0] - box_left_x + TEXT_TO_BOX_GAP_CM * cm
+        right_margin = max(MIN_RIGHT_MARGIN_CM * cm, right_margin)
+        right_margin = min(right_margin, A4[0] - LEFT_MARGIN - MIN_TEXT_WIDTH_CM * cm)
         _DOC_MARGINS = dict(
-            leftMargin=2*cm,
-            # Extra right margin reserves room for the answer-key sidebar,
-            # which attaches to this margin's inner edge and is vertically
-            # centered on the page — normal flowing text never gets laid
-            # out underneath it.
-            rightMargin=2*cm + AK_SIDEBAR_W + 0.5*cm,
+            leftMargin=LEFT_MARGIN,
+            rightMargin=right_margin,
             topMargin=TOP_MARGIN,
             bottomMargin=2*cm,
         )
     else:
         _DOC_MARGINS = dict(
-            leftMargin=2*cm, rightMargin=2*cm,
+            leftMargin=LEFT_MARGIN, rightMargin=2*cm,
             topMargin=TOP_MARGIN,
             # Extra bottom margin (vs. the plain 2cm content uses elsewhere)
             # reserves room for the per-page answer-key box so normal flowing
@@ -1399,6 +1413,154 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     )
     buffer.seek(0)
     return buffer
+
+# ═══════════════════════════════════════════════════════════════
+# PREVIEW — sample PDF with random short + long questions, built with the
+# user's CURRENT layout numbers / font / frame / cover / answer-key style.
+# Never touches PDF_BUFFER or the session, so it's safe to press any time.
+# ═══════════════════════════════════════════════════════════════
+PREVIEW_SHORT_COUNT = 5
+PREVIEW_LONG_COUNT  = 4
+
+# (question, [options], correct_index)
+_PREVIEW_SHORT_MCQ = [
+    ("Which bone is the longest in the human body?", ["Femur", "Tibia", "Humerus", "Fibula"], 0),
+    ("The heart has how many chambers?", ["Two", "Three", "Four", "Six"], 2),
+    ("Which vitamin is produced in the skin?", ["Vitamin A", "Vitamin C", "Vitamin D", "Vitamin K"], 2),
+    ("The largest organ of the body is the:", ["Liver", "Skin", "Lung", "Brain"], 1),
+    ("Which blood cells carry oxygen?", ["Platelets", "Erythrocytes", "Lymphocytes", "Neutrophils"], 1),
+    ("Which nerve is compressed in carpal tunnel syndrome?", ["Ulnar", "Radial", "Median", "Axillary"], 2),
+    ("Insulin is secreted by which cells?", ["Alpha cells", "Beta cells", "Delta cells", "Acinar cells"], 1),
+]
+_PREVIEW_LONG_MCQ = [
+    ("A 45-year-old man presents to the emergency department with sudden-onset crushing chest pain "
+     "radiating to his left arm and jaw, associated with sweating and shortness of breath that started "
+     "about 40 minutes ago while he was climbing stairs. His ECG shows ST-segment elevation in leads II, "
+     "III and aVF. Which coronary artery is most likely occluded?",
+     ["Right coronary artery, which supplies the inferior wall of the left ventricle and the AV node",
+      "Left anterior descending artery, which supplies the anterior wall and most of the interventricular septum",
+      "Left circumflex artery, which supplies the lateral wall of the left ventricle",
+      "Left main coronary artery, which supplies both the anterior and the lateral walls"], 0),
+    ("A 28-year-old woman complains of fatigue, weight gain, constipation and cold intolerance over the past "
+     "six months. On examination she has a diffusely enlarged, non-tender thyroid gland and delayed relaxation "
+     "of the ankle reflex. Laboratory tests show a high TSH and low free T4. What is the most likely underlying "
+     "cause of her condition in an iodine-sufficient area?",
+     ["Autoimmune destruction of thyroid tissue with anti-thyroid peroxidase antibodies (Hashimoto thyroiditis)",
+      "Stimulating antibodies directed against the TSH receptor on thyroid follicular cells",
+      "Viral infection of the thyroid gland causing painful granulomatous inflammation",
+      "A functioning adenoma producing excess thyroid hormone independently of TSH"], 0),
+    ("During a surgical procedure in the anterior triangle of the neck, the surgeon must identify the structure "
+     "that runs within the carotid sheath together with the common carotid artery and the internal jugular vein. "
+     "Damage to this structure would lead to hoarseness, loss of the gag reflex and difficulty swallowing. "
+     "Which structure is it?",
+     ["The vagus nerve (cranial nerve X), lying posteriorly between the artery and the vein",
+      "The hypoglossal nerve (cranial nerve XII), crossing superficially over the carotid bifurcation",
+      "The accessory nerve (cranial nerve XI), running toward the trapezius muscle",
+      "The phrenic nerve, descending on the anterior surface of scalenus anterior"], 0),
+    ("A 60-year-old alcoholic patient is brought in with confusion, ataxia and ophthalmoplegia. He has been "
+     "malnourished for several months and is given intravenous glucose by the paramedics before arrival. "
+     "Which vitamin should have been administered first to prevent worsening of his neurological state, "
+     "and which structures are characteristically damaged in this disease?",
+     ["Thiamine (vitamin B1); mammillary bodies and the medial dorsal nucleus of the thalamus",
+      "Cobalamin (vitamin B12); dorsal columns and lateral corticospinal tracts of the spinal cord",
+      "Niacin (vitamin B3); cerebral cortex, causing dermatitis, diarrhea and dementia",
+      "Pyridoxine (vitamin B6); peripheral nerves, causing sideroblastic anemia"], 0),
+]
+# (title/question, answer)
+_PREVIEW_SHORT_WRITTEN = [
+    ("Define homeostasis.", "The maintenance of a stable internal environment despite external changes."),
+    ("What is the function of the pancreas?", "Digestive enzyme secretion and hormone production (insulin and glucagon)."),
+    ("Name the layers of the skin.", "Epidermis, dermis and hypodermis (subcutaneous tissue)."),
+]
+_PREVIEW_LONG_WRITTEN = [
+    ("Describe the sequence of events in the cardiac cycle, including the pressure and volume changes "
+     "that occur in the left ventricle during each phase, and explain how the heart sounds are produced.",
+     "The cardiac cycle starts with atrial contraction, which tops up ventricular filling. Isovolumetric "
+     "contraction follows: ventricular pressure rises with all valves closed, and the closing of the AV valves "
+     "produces the first heart sound (S1). When ventricular pressure exceeds aortic pressure the aortic valve "
+     "opens and rapid ejection begins, then reduced ejection. Isovolumetric relaxation follows closure of the "
+     "aortic valve (second heart sound, S2), and finally rapid ventricular filling as the AV valves open."),
+    ("Explain in detail how the kidney regulates blood pressure through the renin-angiotensin-aldosterone "
+     "system, starting from the stimulus for renin release and ending with the effect on the vasculature.",
+     "Low renal perfusion, low sodium at the macula densa or sympathetic stimulation triggers renin release "
+     "from the juxtaglomerular cells. Renin converts angiotensinogen to angiotensin I, which ACE (mainly in the "
+     "lung) converts to angiotensin II. Angiotensin II causes vasoconstriction, stimulates aldosterone release "
+     "from the adrenal cortex (sodium and water retention), stimulates ADH release and thirst, all of which "
+     "raise blood pressure."),
+]
+
+def make_preview_items(n_short: int = PREVIEW_SHORT_COUNT, n_long: int = PREVIEW_LONG_COUNT) -> list:
+    """Random mix of short and long questions (MCQ + written), shuffled.
+    MCQ options are shuffled too so the answer key shows varied letters."""
+    def _mcq(q, opts, correct):
+        pairs = list(enumerate(opts))
+        random.shuffle(pairs)
+        labeled = [f"{string.ascii_uppercase[i]}) {text}" for i, (_, text) in enumerate(pairs)]
+        new_correct = next(i for i, (orig, _) in enumerate(pairs) if orig == correct)
+        return {"type": "mcq", "q": q, "options": labeled, "correct": new_correct}
+
+    def _written(t, c):
+        return {"type": "written", "title": t, "content": c}
+
+    short_pool = [("mcq", x) for x in _PREVIEW_SHORT_MCQ] + [("w", x) for x in _PREVIEW_SHORT_WRITTEN]
+    long_pool  = [("mcq", x) for x in _PREVIEW_LONG_MCQ]  + [("w", x) for x in _PREVIEW_LONG_WRITTEN]
+    picked = (random.sample(short_pool, min(n_short, len(short_pool)))
+              + random.sample(long_pool, min(n_long, len(long_pool))))
+    random.shuffle(picked)
+    return [_mcq(*d) if kind == "mcq" else _written(*d) for kind, d in picked]
+
+def preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👁 Preview", callback_data="preview_pdf")]])
+
+async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: int) -> None:
+    """Builds ONE answered-style sample PDF (so the answer-key box and green
+    markers are visible) with the user's current settings and sends it.
+    Leaves the session and PDF_BUFFER completely untouched."""
+    import asyncio
+    font_size      = PDF_FONT_SIZE.get(user_id, DEFAULT_FONT_SIZE)
+    top_margin_cm  = PDF_TOP_MARGIN_CM.get(user_id, DEFAULT_TOP_MARGIN_CM)
+    ak_nudge_cm    = PDF_AK_NUDGE_CM.get(user_id, DEFAULT_AK_NUDGE_CM)
+    ak_wall_gap_cm = PDF_AK_WALL_GAP_CM.get(user_id, DEFAULT_AK_WALL_GAP_CM)
+    ak_up_nudge_cm = PDF_AK_UP_NUDGE_CM.get(user_id, DEFAULT_AK_UP_NUDGE_CM)
+    items = make_preview_items()
+    try:
+        pdf_bytes = await asyncio.to_thread(
+            build_pdf, items, "Preview",
+            font_path=PDF_FONT_PATH.get(user_id),
+            font_bold_path=PDF_FONT_BOLD_PATH.get(user_id),
+            bg_image_path=PDF_FRAME_PATH.get(user_id),
+            show_answers=True,
+            ak_style=PDF_AK_STYLE.get(user_id, "grouped"),
+            ak_nudge_cm=ak_nudge_cm, font_size=font_size,
+            top_margin_cm=top_margin_cm, ak_wall_gap_cm=ak_wall_gap_cm,
+            ak_up_nudge_cm=ak_up_nudge_cm,
+            cover_image_path=PDF_COVER_PATH.get(user_id),
+        )
+    except Exception as e:
+        print("PREVIEW ERROR:", e)
+        traceback.print_exc()
+        await message.reply_text(
+            f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{html.escape(str(e))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    n_long = sum(1 for it in items if (it["type"] == "mcq" and len(it["q"]) > 120)
+                 or (it["type"] == "written" and len(it["title"]) > 100))
+    await message.reply_document(
+        document=pdf_bytes, filename="preview.pdf",
+        caption=(
+            f"👁 <b>معاينة</b> — {len(items)} سؤال عشوائي ({len(items) - n_long} قصير · {n_long} طويل)\n"
+            f"📐 خط <code>{font_size:g}</code> · فوق <code>{top_margin_cm:g}</code> · "
+            f"إزاحة <code>{ak_nudge_cm:g}</code> · حافة <code>{ak_wall_gap_cm:g}</code> · "
+            f"رفع <code>{ak_up_nudge_cm:g}</code>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+async def pdf_preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    await update.message.reply_text("⏳ جاري توليد المعاينة...")
+    await _send_preview(context, update.message, user_id)
 
 # ═══════════════════════════════════════════════════════════════
 # SLEEP / WAKE
@@ -1614,8 +1776,34 @@ async def _save_cover_photo(context: ContextTypes.DEFAULT_TYPE, user_id: int, fi
     PDF_COVER_PATH[user_id] = cover_path
     return cover_path
 
+async def _start_cover_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
+    """Step after font selection (font → COVER → frame → answer-key style →
+    layout → finish). The cover becomes page 1 of every PDF. If one is
+    already remembered (set earlier via this flow or /set_cover) it's reused
+    automatically; otherwise the user is asked for a photo or can Skip.
+    Either way the flow then moves on to the frame step."""
+    path = PDF_COVER_PATH.get(user_id)
+    if path and os.path.exists(path):
+        await reply_target.reply_text(
+            "📕 هستخدم الغلاف المسجل قبل كده (أول صفحة). لو عايز تغيّره ابعت /set_cover، أو /clear_cover تشيله.",
+        )
+        await _start_bg_step(context, user_id, reply_target)
+        return
+    PDF_COVER_PATH.pop(user_id, None)   # stale entry (file gone) — forget it
+
+    AWAITING_COVER[user_id] = "setup"   # "setup" (vs plain True from /set_cover) = continue the flow after saving
+    await reply_target.reply_text(
+        "📕 ابعت صورة <b>الغلاف</b> — هتتحط كأول صفحة في كل PDF، أو دوس Skip لو مش عايز غلاف.\n"
+        "هتفضل متسجلة وهتتستخدم تلقائي في كل PDF جاي لحد ما البوت يعمل restart، "
+        "أو تغيّرها بـ /set_cover أو تشيلها بـ /clear_cover.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏭ Skip", callback_data="cover_skip"),
+        ]]),
+    )
+
 async def _start_bg_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
-    """Step after font selection (font → frame → answer-key style →
+    """Step after the cover (font → cover → frame → answer-key style →
     layout → finish). If a frame is already remembered for this user
     (set earlier via this flow or /set_frame), it's reused automatically
     — no re-prompt. Otherwise: a pinned chat photo is grabbed and used
@@ -1647,9 +1835,9 @@ async def _start_bg_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
         except Exception:
             pass  # download failed for some reason — fall back to asking normally
 
-    AWAITING_FRAME[user_id] = True
+    AWAITING_FRAME[user_id] = "setup"   # "setup" (vs plain True from /set_frame) = continue the flow after saving
     await reply_target.reply_text(
-        "دلوقتي ابعت صورة تتحط كفريم/خلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز فريم.\n"
+        "🖼 دلوقتي ابعت صورة تتحط كفريم/خلفية لكل صفحة في الـ PDF، أو دوس Skip لو مش عايز فريم.\n"
         "هتفضل متسجلة وهتتستخدم تلقائي في كل PDF جاي، لحد ما تغيّرها بـ /set_frame أو تشيلها بـ /clear_frame.\n"
         "(أو ثبّت صورة في الشات ده والبوت هياخدها تلقائي المرة الجاية.)",
         reply_markup=InlineKeyboardMarkup([[
@@ -1671,20 +1859,23 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── AWAITING COVER IMAGE (standalone /set_cover, or part of setup) ──
     if AWAITING_COVER.get(user_id):
+        in_setup = AWAITING_COVER[user_id] == "setup"
         await _save_cover_photo(context, user_id, photo.file_id)
         del AWAITING_COVER[user_id]
         await update.message.reply_text("✅ اتسجل الغلاف! هيتحط كأول صفحة في كل PDF جاي لحد ما تغيّره أو تشيله.")
+        if in_setup:
+            await _start_bg_step(context, user_id, update.message)
         return
 
     # ── AWAITING FRAME IMAGE (part of the /pdf_start setup flow, or
     # standalone /set_frame) ─────────────────────────────────────────
     if AWAITING_FRAME.get(user_id):
+        in_setup = AWAITING_FRAME[user_id] == "setup"
         await _save_frame_photo(context, user_id, photo.file_id)
         del AWAITING_FRAME[user_id]
-        if user_id in PDF_BUFFER:
+        await update.message.reply_text("✅ اتسجل الفريم! هيتحط في كل صفحة في كل PDF جاي لحد ما تغيّره أو تشيله.")
+        if in_setup:
             await _ask_ak_style(context, user_id, update.message)
-        else:
-            await update.message.reply_text("✅ اتسجل الفريم! هيتحط في كل صفحة في كل PDF جاي لحد ما تغيّره أو تشيله.")
         return
 
     if user_id not in PDF_BUFFER:
@@ -1764,7 +1955,7 @@ async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     PDF_FONT_BOLD_PATH.pop(user_id, None)   # single upload has no bold companion — clear any stale preset one
     del AWAITING_FONT[user_id]
     await update.message.reply_text("✅ الخط اتسجل!")
-    await _start_bg_step(context, user_id, update.message)
+    await _start_cover_step(context, user_id, update.message)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """PDFs sent in a private DM: captioned = treated as a manual question
@@ -1872,7 +2063,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── AWAITING COVER / FRAME IMAGE (same — reminder only) ─────────
     if AWAITING_COVER.get(user_id):
-        await update.message.reply_text("⚠️ محتاج تبعت صورة عشان تتسجل كغلاف.")
+        await update.message.reply_text(
+            "⚠️ محتاج تبعت صورة عشان تتسجل كغلاف"
+            + ("، أو دوس Skip فوق." if AWAITING_COVER[user_id] == "setup" else ".")
+        )
         return
     if AWAITING_FRAME.get(user_id):
         await update.message.reply_text(
@@ -2192,7 +2386,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PDF_FONT_BOLD_PATH.pop(user_id, None)
         del AWAITING_FONT[user_id]
         await query.edit_message_text(f"✅ خط <b>{name}</b> اتحدد!", parse_mode=ParseMode.HTML)
-        await _start_bg_step(context, user_id, query.message)
+        await _start_cover_step(context, user_id, query.message)
         return
 
     if query.data == "font_skip":
@@ -2202,6 +2396,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_FONT_BOLD_PATH.pop(user_id, None)
         del AWAITING_FONT[user_id]
         await query.edit_message_text("⏭ اتخطيت اختيار الخط.")
+        await _start_cover_step(context, user_id, query.message)
+        return
+
+    if query.data == "cover_skip":
+        if AWAITING_COVER.get(user_id) != "setup":
+            return
+        del AWAITING_COVER[user_id]
+        await query.edit_message_text("⏭ اتخطيت الغلاف.")
         await _start_bg_step(context, user_id, query.message)
         return
 
@@ -2223,6 +2425,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del AWAITING_AK_STYLE[user_id]
         AWAITING_LAYOUT[user_id] = True
         await query.edit_message_text(LAYOUT_PROMPT_TEXT, parse_mode=ParseMode.HTML)
+        return
+
+    # ── PREVIEW BUTTON ──────────────────────────────────────────
+    if query.data == "preview_pdf":
+        await query.message.reply_text("⏳ جاري توليد المعاينة...")
+        await _send_preview(context, query.message, user_id)
         return
 
     # ── EXPORT BUTTONS ──────────────────────────────────────────
@@ -2279,7 +2487,7 @@ async def _finish_pdf_setup(context: ContextTypes.DEFAULT_TYPE, user_id: int, re
         "اضغط <b>Export as PDF</b> لما تخلص 👇"
     )
     send = reply_target.edit_text if edit else reply_target.reply_text
-    await send(text, parse_mode=ParseMode.HTML)
+    await send(text, parse_mode=ParseMode.HTML, reply_markup=preview_keyboard())
 
 def _reset_pdf_session(user_id: int) -> None:
     """Clears everything tied to an in-progress PDF-collection session —
@@ -2485,6 +2693,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pdf_start — starts a session collecting questions for a PDF",
         "/pdf_generate — builds a PDF from what you've collected so far",
         "/pdf_clear — clears the current session",
+        "/pdf_preview — sends a sample PDF (random short + long questions) using your current layout numbers",
         "/set_cover — set a cover page image (remembered until you change it or the bot restarts)",
         "/clear_cover — remove the saved cover image",
         "/set_frame — set a per-page frame/background image (remembered until you change it or the bot restarts)",
@@ -2527,6 +2736,7 @@ app.add_handler(CommandHandler("sleep",        sleep_cmd))
 app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
+app.add_handler(CommandHandler("pdf_preview",  pdf_preview_cmd))
 app.add_handler(CommandHandler("set_cover",    set_cover_cmd))
 app.add_handler(CommandHandler("clear_cover",  clear_cover_cmd))
 app.add_handler(CommandHandler("set_frame",    set_frame_cmd))
