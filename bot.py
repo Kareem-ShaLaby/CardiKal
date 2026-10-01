@@ -1075,7 +1075,7 @@ _PROGRESS_DIRTY: dict = {}   # user_id -> chat_id that needs a refresh
 _PROGRESS_TASKS: dict = {}   # user_id -> the running worker task
 
 async def _render_progress(context, user_id: int, chat_id: int):
-    """Edit the existing progress message, or send a new one and store its id."""
+    """Replace the progress message so it stays at the end of the chat."""
     items    = PDF_BUFFER.get(user_id, [])
     text     = build_progress_text(items, pending=_pending_summary(user_id))
     keyboard = export_keyboard()
@@ -1083,18 +1083,10 @@ async def _render_progress(context, user_id: int, chat_id: int):
 
     if msg_id:
         try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-            )
-            return
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
-            if "not modified" in str(e).lower():
-                return   # it's already showing exactly this — don't spawn a duplicate message
-            # otherwise: message too old / deleted — fall through to send a new one
+            print(f"PROGRESS DELETE ERROR: {e}")
+        PROGRESS_MSG_ID.pop(user_id, None)
 
     sent = await context.bot.send_message(
         chat_id=chat_id,
@@ -2043,9 +2035,6 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PDF_BUFFER[user_id].append(item)
     item_index = len(PDF_BUFFER[user_id]) - 1
 
-    # Progress bar first, before anything else, so it moves the instant the poll lands.
-    await update_progress(context, user_id, update.effective_chat.id)
-
     if correct_index is None:
         # Telegram hid the answer (quiz still open, not ours) — queue it
         # for a quick button tap instead of silently guessing.
@@ -2054,6 +2043,8 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         queue.append(item_index)
         if len(queue) == 1:  # nothing else currently being asked
             await _ask_next_clarification(context, user_id, update.effective_chat.id)
+
+    await update_progress(context, user_id, update.effective_chat.id)
 
 # ═══════════════════════════════════════════════════════════════
 # POLL UPDATE HANDLER — passive correct-answer backfill. Telegram pushes a
@@ -2561,6 +2552,19 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PDF_BUFFER[user_id].append({"type": "written", "title": title, "content": content})
             await update_progress(context, user_id, update.effective_chat.id)
             return
+
+        # Blank-line-separated paragraphs in a case study should stay together.
+        # Keep the normal per-block path whenever any paragraph looks structured.
+        if len(blocks) > 1 and len(raw.strip()) >= CASE_MIN_CHARS and not any(mask):
+            has_structured_block = any(
+                extract_written_qa(block, spoiler_texts, mask=block_mask)
+                or _block_looks_like_mcq(block, normalize_mcq_block(block))
+                for block, block_mask in blocks
+            )
+            if not has_structured_block:
+                _add_pending_case(user_id, raw)
+                await update_progress(context, user_id, update.effective_chat.id)
+                return
 
         any_saved  = False
         case_added = False
