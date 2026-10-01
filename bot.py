@@ -5,6 +5,7 @@ import os
 import html
 import tempfile
 import traceback
+import asyncio
 from io import BytesIO
 
 # ═══════════════════════════════════════════════════════════════
@@ -391,13 +392,17 @@ DEFAULT_AK_WALL_GAP_CM = 0.5
 DEFAULT_AK_UP_NUDGE_CM = 4.0
 SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
-PENDING_IMAGE          = {}    # user_id -> local path of an image awaiting its question
+PENDING_IMAGE          = {}    # user_id -> local path of an image waiting to attach to the NEXT poll/question
+PENDING_IMG_CAPTION    = {}    # user_id -> caption that came with that pending image (printed under it)
+PENDING_CASE           = {}    # user_id -> long text (case study) waiting to attach to the NEXT poll/question
 CLARIFY_QUEUE          = {}    # user_id -> list of PDF_BUFFER indices awaiting a correct-answer tap
 POLL_WATCH             = {}    # poll_id -> (user_id, item_index) for passive auto-detection
 PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/"content"/"option", "opt_index": int?}
                                 # awaiting free-text replacement for one field of a just-added question
 
 # ─── PAGE-MARGIN TUNING ─────────────────────────────────────────
+CASE_MIN_CHARS      = 40    # plain text at least this long (and not a question) is treated as a case study
+IMG_MAX_LINES       = 5     # an image may be at most this many lines of text tall (width follows the aspect ratio)
 OPT_SPACING         = 6     # points of space after each MCQ option (was 3)
 Q_NUM_COLOR         = "#90A4AE"   # colour of the inline "Q1" label
 LEFT_MARGIN_CM      = 1.2   # where questions start from the page's left edge (was 2.0)
@@ -449,13 +454,13 @@ def normalize_mcq_block(block: str):
     parts = re.split(r"(?=\b[A-Ea-e1-5][).])", options_part)
     return [question] + [p.strip() for p in parts if p.strip()]
 
-def extract_written_qa(block: str, spoiler_texts: list):
+def extract_written_qa(block: str, spoiler_texts: list = None, mask: list = None, literal: bool = False):
     """
     A block is a written question ONLY when part of it is hidden behind a
     spoiler: either a real Telegram spoiler (select the answer text in the
     Telegram app and choose "Spoiler" formatting — preferred) or the
     legacy typed "||text||" marker, kept for backward compatibility. The
-    spoiler-covered part becomes the (hidden) answer; everything else in
+    spoiler-covered part becomes the (hidden) answer; EVERYTHING ELSE in
     the block is the (always-visible) question.
 
     A block with NO spoiler anywhere is NOT a written question — this
@@ -463,35 +468,116 @@ def extract_written_qa(block: str, spoiler_texts: list):
     instead, which is what actually fixes misclassifying plain MCQ blocks
     as "written" questions.
 
-    `spoiler_texts` is the list of real-spoiler substrings already pulled
-    out of the ORIGINAL message by the caller (via
-    message.parse_entities/parse_caption_entities, which handles the
-    UTF-16 offset math correctly) — matched here by substring since blocks
-    are slices of that same original text.
+    `mask` (preferred) is a per-character list of booleans, True where that
+    character of `block` is covered by a real spoiler entity. It's computed
+    from the message's entity offsets (see _spoiler_mask), so the split is
+    exact — a spoiler whose text also appears elsewhere in the question
+    (e.g. the answer "T4" and a "T4" in the question) can't be mixed up.
+    Without a mask it falls back to matching `spoiler_texts` by substring.
+
+    literal=True keeps the question text exactly as written (whitespace tidied
+    only); the default also trims dangling punctuation like a trailing ":" or
+    "-" left behind where an "Answer:" label used to sit before the spoiler.
     """
     question = block
     answers  = []
 
-    for sp in spoiler_texts:
-        sp = sp.strip()
-        if sp and sp in question:
-            answers.append(sp)
-            question = question.replace(sp, " ", 1)
+    if mask is not None and len(mask) == len(block):
+        q_chars, cur = [], []
+        for ch, hidden in zip(block, mask):
+            if hidden:
+                cur.append(ch)
+            else:
+                if cur:
+                    answers.append("".join(cur))
+                    cur = []
+                    q_chars.append(" ")        # keep words on either side of the gap apart
+                q_chars.append(ch)
+        if cur:
+            answers.append("".join(cur))
+            q_chars.append(" ")
+        question = "".join(q_chars)
+    else:
+        for sp in (spoiler_texts or []):
+            sp = sp.strip()
+            if sp and sp in question:
+                answers.append(sp)
+                question = question.replace(sp, " ", 1)
 
     def _grab(m):
         answers.append(m.group(1).strip())
         return " "
     question = re.sub(r"\|\|(.+?)\|\|", _grab, question, flags=re.DOTALL)
 
+    answers = [a.strip() for a in answers if a and a.strip()]
     if not answers:
         return None  # no spoiler at all → not a written question
 
     question = re.sub(r"[ \t]+", " ", question)
-    question = re.sub(r"\n\s*\n+", "\n", question).strip(" \n\t.:،-")
-    answer   = " / ".join(a for a in answers if a)
+    question = re.sub(r" *\n\s*\n+ *", "\n", question)
+    question = re.sub(r" *\n *", "\n", question)
+    question = question.strip() if literal else question.strip(" \n\t.:،-")
+    answer   = " / ".join(answers)
     if not question or not answer:
         return None
     return question, answer
+
+def _spoiler_mask(raw: str, entities) -> list:
+    """Per-character mask of a message's text: True where the character is
+    inside a real Telegram spoiler. Entity offsets/lengths are in UTF-16 code
+    units, so characters outside the BMP (emoji…) count as two."""
+    spans = [(e.offset, e.offset + e.length)
+             for e in (entities or []) if getattr(e, "type", None) == MessageEntity.SPOILER]
+    if not spans:
+        return [False] * len(raw)
+    mask, pos = [], 0
+    for ch in raw:
+        mask.append(any(st <= pos < en for st, en in spans))
+        pos += 2 if ord(ch) > 0xFFFF else 1
+    return mask
+
+def _split_blocks_with_mask(raw: str, mask: list) -> list:
+    """Blank-line-separated blocks of the raw message text as
+    [(block_text, block_mask), ...], whitespace-trimmed, empties dropped."""
+    out, last = [], 0
+    for m in list(re.finditer(r"\n\s*\n", raw)) + [None]:
+        end = m.start() if m else len(raw)
+        seg, seg_mask = raw[last:end], mask[last:end]
+        lead  = len(seg) - len(seg.lstrip())
+        trail = len(seg.rstrip())
+        seg, seg_mask = seg[lead:trail], seg_mask[lead:trail]
+        if seg:
+            out.append((seg, seg_mask))
+        if m:
+            last = m.end()
+    return out
+
+def _is_forwarded(msg) -> bool:
+    """True for a forwarded message (works across python-telegram-bot versions)."""
+    return any(getattr(msg, attr, None) for attr in
+               ("forward_origin", "forward_date", "forward_from", "forward_from_chat", "forward_sender_name"))
+
+def _whole_message_written_qa(raw: str, mask: list, blocks: list, forwarded: bool):
+    """The rule for a written question that arrives as ONE message (typically
+    forwarded): everything NOT under a spoiler is the question, everything
+    under a spoiler is the answer — blank lines and all. Returns (question,
+    answer), or None to leave the message to the normal block-by-block path.
+
+    It applies when the message has a spoiler and either it was forwarded, or
+    some block has no spoiler (a question sitting apart from its hidden answer).
+    A message that also holds ordinary, complete MCQ blocks is a mixed batch,
+    so it's left to the per-block path."""
+    if not any(mask):
+        return None
+    for text, m in blocks:
+        if not any(m) and parse_mcq_block(text):
+            return None
+    has_unspoilered_block = any(not any(m) for _, m in blocks)
+    if not (forwarded or has_unspoilered_block):
+        return None
+    lead  = len(raw) - len(raw.lstrip())
+    trail = len(raw.rstrip())
+    return extract_written_qa(raw[lead:trail], mask=mask[lead:trail], literal=True)
 
 def parse_mcq_lines(lines: list):
     """
@@ -873,11 +959,53 @@ def _cleanup_images(user_id: int):
 def _clear_pending_image(user_id: int):
     """Drop any image that's still waiting for a question, deleting its file."""
     path = PENDING_IMAGE.pop(user_id, None)
+    PENDING_IMG_CAPTION.pop(user_id, None)
     if path and os.path.exists(path):
         try:
             os.remove(path)
         except Exception:
             pass
+
+def _clear_pending_attachments(user_id: int):
+    """Drop BOTH kinds of parked attachment (image + case-study text)."""
+    _clear_pending_image(user_id)
+    PENDING_CASE.pop(user_id, None)
+
+def _take_pending(user_id: int) -> dict:
+    """Pops whatever is parked for this user and returns it as item fields
+    ({"image", "image_caption", "case"} — only the ones that exist), ready for
+    item.update(...). Called when the next poll / typed question arrives."""
+    out = {}
+    img = PENDING_IMAGE.pop(user_id, None)
+    cap = PENDING_IMG_CAPTION.pop(user_id, None)
+    if img:
+        out["image"] = img
+        if cap:
+            out["image_caption"] = cap
+    case = PENDING_CASE.pop(user_id, None)
+    if case:
+        out["case"] = case
+    return out
+
+def _add_pending_case(user_id: int, text: str):
+    """Park case-study text for the next question. Several messages sent before
+    the poll are joined (blank line between) into one case."""
+    text = text.strip()
+    if not text:
+        return
+    prev = PENDING_CASE.get(user_id)
+    PENDING_CASE[user_id] = f"{prev}\n\n{text}" if prev else text
+
+def _block_looks_like_mcq(block: str, lines: list) -> bool:
+    """True when the block looks like someone TRYING to write an MCQ (so the
+    'wrong format' warnings are the right reply) rather than plain prose such
+    as a case study. Multi-line: some line after the first starts with an
+    option marker (a) / b. / 1)). One-liner: it has a first AND second inline
+    option marker (a) … b) …) — a stray 'type 2.' or 'e.g.' doesn't count."""
+    if "\n" in block:
+        return any(_MCQ_OPTION_PREFIX_RE.match(l) for l in lines[1:])
+    marks = re.findall(r"(?:^|\s)([A-Ea-e1-5])[).]\s", block)
+    return len(marks) >= 2 and marks[0].lower() in "a1" and marks[1].lower() in "b2"
 
 def _clear_pending_edit(user_id: int):
     """Drop any pending 'send new text for this field' state for this user."""
@@ -893,7 +1021,7 @@ def _clear_clarify_queue(user_id: int):
 # ═══════════════════════════════════════════════════════════════
 # PROGRESS MESSAGE BUILDER
 # ═══════════════════════════════════════════════════════════════
-def build_progress_text(items: list, latest_label: str = "") -> str:
+def build_progress_text(items: list, latest_label: str = "", pending: list = None) -> str:
     count   = len(items)
     bar_len = 4   # smaller block = the bar fills up faster (2 items = 50% full)
 
@@ -924,12 +1052,32 @@ def build_progress_text(items: list, latest_label: str = "") -> str:
     )
     if breakdown:
         text += f"\n{' · '.join(breakdown)}"
+    if pending:
+        text += f"\n📎 Attached to the next poll: {' · '.join(pending)}"
     return text
 
-async def update_progress(context, user_id: int, chat_id: int, latest_label: str = ""):
+def _pending_summary(user_id: int) -> list:
+    """What's parked and waiting for the next poll — shown on the progress
+    message in place of a separate 'received' reply."""
+    out = []
+    if PENDING_CASE.get(user_id):
+        out.append("📋 case text")
+    if PENDING_IMAGE.get(user_id):
+        out.append("🖼 image")
+    return out
+
+# Progress refreshes are COALESCED per user and run in the background, so the
+# handler never waits on Telegram: it just marks the progress message "dirty"
+# and returns, and one worker task redraws it with the LATEST state. A burst of
+# forwarded polls therefore jumps the bar straight to the current count instead
+# of crawling through every intermediate number behind a queue of edits.
+_PROGRESS_DIRTY: dict = {}   # user_id -> chat_id that needs a refresh
+_PROGRESS_TASKS: dict = {}   # user_id -> the running worker task
+
+async def _render_progress(context, user_id: int, chat_id: int):
     """Edit the existing progress message, or send a new one and store its id."""
     items    = PDF_BUFFER.get(user_id, [])
-    text     = build_progress_text(items, latest_label)
+    text     = build_progress_text(items, pending=_pending_summary(user_id))
     keyboard = export_keyboard()
     msg_id   = PROGRESS_MSG_ID.get(user_id)
 
@@ -943,8 +1091,10 @@ async def update_progress(context, user_id: int, chat_id: int, latest_label: str
                 reply_markup=keyboard,
             )
             return
-        except Exception:
-            pass  # message too old / deleted — fall through to send new
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return   # it's already showing exactly this — don't spawn a duplicate message
+            # otherwise: message too old / deleted — fall through to send a new one
 
     sent = await context.bot.send_message(
         chat_id=chat_id,
@@ -953,6 +1103,28 @@ async def update_progress(context, user_id: int, chat_id: int, latest_label: str
         reply_markup=keyboard,
     )
     PROGRESS_MSG_ID[user_id] = sent.message_id
+
+async def _progress_worker(context, user_id: int):
+    try:
+        while user_id in _PROGRESS_DIRTY:
+            chat_id = _PROGRESS_DIRTY.pop(user_id)
+            if user_id not in PDF_BUFFER:      # session ended meanwhile — nothing to show
+                continue
+            try:
+                await _render_progress(context, user_id, chat_id)
+            except Exception as e:
+                print("PROGRESS ERROR:", e)
+    finally:
+        _PROGRESS_TASKS.pop(user_id, None)
+
+async def update_progress(context, user_id: int, chat_id: int, latest_label: str = ""):
+    """Refresh the live progress message right away without blocking the
+    caller. (latest_label is kept only for the old call sites.)"""
+    _PROGRESS_DIRTY[user_id] = chat_id
+    task = _PROGRESS_TASKS.get(user_id)
+    if task is not None and not task.done():
+        return   # the running worker will pick up the newest state on its next pass
+    _PROGRESS_TASKS[user_id] = asyncio.get_running_loop().create_task(_progress_worker(context, user_id))
 
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARD HELPERS
@@ -1016,13 +1188,15 @@ HOW_TO_USE_TEXT = (
     "<b>3) Single-line MCQ</b>\n"
     "<code>Question? a) A b) B z c) C</code>\n\n"
     "<b>4) Written / Flashcard</b>\n"
-    "<code>Title\n"
-    "answer line 1\n"
-    "answer line 2</code>\n\n"
-    "<b>5) Images</b>\n"
-    "Send a photo — with a full question as its caption to pair them, with a "
-    "plain caption to add it as a standalone image, or with no caption to be "
-    "asked for the question next.\n\n"
+    "Write (or forward) the question and hide the answer behind a "
+    "<b>spoiler</b> (select the text → Spoiler). Everything NOT under a spoiler "
+    "is the question; everything under a spoiler is the answer — a forwarded "
+    "message is read as one question, blank lines included.\n\n"
+    "<b>5) Images & case studies</b>\n"
+    "Send a photo (a caption is fine) or a long text — a case study — and it's "
+    "held and attached to the NEXT poll or question you send, with no reply. "
+    "The progress message shows a 📎 line while something is waiting. "
+    "(A photo whose caption is a full question is added as that question.)\n\n"
     "<b>6) Forwarded Quiz Polls</b>\n"
     "Forward any Telegram quiz — it's added straight to the buffer, using "
     "Telegram's revealed correct answer where available or asking you to tap "
@@ -1447,6 +1621,10 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             bottomMargin=3.6*cm,
         )
 
+    # Images are capped at IMG_MAX_LINES lines of option text (same line height
+    # the options use), so they follow the font-size setting and stay small.
+    IMG_MAX_H = IMG_MAX_LINES * 15 * FSCALE
+
     Q_STYLE = ParagraphStyle(
         "QStyle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
         textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=14,
@@ -1482,6 +1660,16 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         "ImgCaption", fontName=font_name, fontSize=9 * FSCALE, leading=12 * FSCALE,
         textColor=colors.HexColor("#78909C"), spaceAfter=6, spaceBefore=4,
     )
+    # Case study text printed above the question it belongs to: a softly
+    # shaded, bordered box. Paragraph backgrounds split cleanly across pages,
+    # so even a very long case can't overflow a page.
+    CASE_STYLE = ParagraphStyle(
+        "CaseStyle", fontName=font_name, fontSize=10.5 * FSCALE, leading=15 * FSCALE,
+        textColor=colors.HexColor("#2D2A3E"),
+        backColor=colors.HexColor("#F5F1FB"), borderColor=colors.HexColor("#C9B8E8"),
+        borderWidth=0.8, borderPadding=7, borderRadius=4,
+        spaceBefore=8, spaceAfter=6,
+    )
 
     def _build_story(page_of_idx):
         """Builds the flowables for the document. `page_of_idx` is a dict
@@ -1509,13 +1697,23 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             )
 
             if item["type"] == "mcq":
+                if item.get("case"):
+                    # Per-line markup so the case keeps its line breaks and each
+                    # character still gets a font that can draw it.
+                    case_markup = "<br/>".join(
+                        pdf_safe_markup(ln, font_name, bold=False) for ln in item["case"].split("\n")
+                    )
+                    block.append(Paragraph(case_markup, CASE_STYLE))
                 block.append(Paragraph(q_num_inline + pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
                 if item.get("image"):
                     try:
-                        img = _fit_image(item["image"])
+                        img = _fit_image(item["image"], max_h=IMG_MAX_H)
                         block.append(Spacer(1, 6))
                         block.append(img)
-                        block.append(Spacer(1, 6))
+                        if item.get("image_caption"):
+                            block.append(Paragraph(pdf_safe_markup(item["image_caption"], font_name, bold=False), IMG_CAPTION))
+                        else:
+                            block.append(Spacer(1, 6))
                     except Exception as e:
                         block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
                 for i, opt in enumerate(item["options"]):
@@ -1544,7 +1742,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 block.append(Paragraph(q_num_label, NUM_STYLE))
                 img_path = item["path"]
                 try:
-                    img = _fit_image(img_path)
+                    img = _fit_image(img_path, max_h=IMG_MAX_H)
                     block.append(Spacer(1, 8))
                     block.append(img)
                     if item.get("caption"):
@@ -1676,6 +1874,35 @@ _PREVIEW_LONG_WRITTEN = [
      "raise blood pressure."),
 ]
 
+# (case text, question, [options], correct_index) — shows the shaded case box in the preview
+_PREVIEW_CASES = [
+    ("A 52-year-old woman is brought to the clinic with progressive fatigue, weight gain and constipation over "
+     "eight months. She complains of feeling cold all the time and her skin has become dry.\n\n"
+     "Examination: pulse 54/min, delayed relaxation of the ankle reflex, and a firm, diffusely enlarged, "
+     "non-tender thyroid gland. Laboratory results: TSH 18 mIU/L (high), free T4 low.",
+     "Which antibody is most likely to be found in this patient?",
+     ["Anti-thyroid peroxidase (anti-TPO)", "Anti-TSH receptor (stimulating)", "Anti-nuclear (ANA)", "Anti-centromere"], 0),
+]
+
+def _preview_sample_image():
+    """A generated wide placeholder picture for the preview (None if Pillow's
+    drawing isn't available) — lets you see how tall images print."""
+    path = os.path.join(tempfile.gettempdir(), "quizician_preview_sample.png")
+    try:
+        if not os.path.exists(path):
+            from PIL import Image, ImageDraw
+            w, h = 900, 420
+            img = Image.new("RGB", (w, h), (138, 43, 226))
+            d = ImageDraw.Draw(img)
+            for x in range(0, w, 60):
+                d.line([(x, 0), (x - 120, h)], fill=(160, 90, 235), width=18)
+            d.rectangle([6, 6, w - 7, h - 7], outline=(255, 255, 255), width=6)
+            d.text((w // 2 - 40, h // 2 - 6), "SAMPLE IMAGE", fill=(255, 255, 255))
+            img.save(path)
+        return path
+    except Exception:
+        return None
+
 def make_preview_items(n_short: int = PREVIEW_SHORT_COUNT, n_long: int = PREVIEW_LONG_COUNT) -> list:
     """Random mix of short and long questions (MCQ + written), shuffled.
     MCQ options are shuffled too so the answer key shows varied letters."""
@@ -1694,7 +1921,20 @@ def make_preview_items(n_short: int = PREVIEW_SHORT_COUNT, n_long: int = PREVIEW
     picked = (random.sample(short_pool, min(n_short, len(short_pool)))
               + random.sample(long_pool, min(n_long, len(long_pool))))
     random.shuffle(picked)
-    return [_mcq(*d) if kind == "mcq" else _written(*d) for kind, d in picked]
+    out = [_mcq(*d) if kind == "mcq" else _written(*d) for kind, d in picked]
+    # One question that carries a case-study box, so the preview shows how it prints.
+    case_text, cq, copts, ccorrect = random.choice(_PREVIEW_CASES)
+    case_item = _mcq(cq, copts, ccorrect)
+    case_item["case"] = case_text
+    out.insert(random.randint(0, len(out)), case_item)
+    # One question with a picture, so the image-height cap shows up too.
+    sample = _preview_sample_image()
+    if sample:
+        pic = _mcq("Which structure is highlighted in the picture?",
+                   ["Liver", "Spleen", "Pancreas", "Kidney"], 3)
+        pic["image"] = sample
+        out.insert(random.randint(0, len(out)), pic)
+    return out
 
 def preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("👁 Preview", callback_data="preview_pdf")]])
@@ -1785,8 +2025,6 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # someone else comes back empty. We must NOT guess in that case.
     correct_index = poll.correct_option_ids[0] if poll.correct_option_ids else None
 
-    pending_img = PENDING_IMAGE.pop(user_id, None)
-
     if user_id not in PDF_BUFFER:
         await update.message.reply_text(MSG_NOT_IN_SESSION)
         return
@@ -1799,15 +2037,14 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "options": labeled_options, "correct": correct_index,  # None = unknown
         "poll_id": poll.id,
     }
-    if pending_img:
-        item["image"] = pending_img
+    # A photo and/or case-study text sent before this poll belongs to it.
+    item.update(_take_pending(user_id))
 
     PDF_BUFFER[user_id].append(item)
     item_index = len(PDF_BUFFER[user_id]) - 1
 
-    label = ("🖼 " if pending_img else "") + ("~" if correct_index is None else "") \
-            + question[:50] + ("…" if len(question) > 50 else "")
-    await update_progress(context, user_id, update.effective_chat.id, latest_label=label)
+    # Progress bar first, before anything else, so it moves the instant the poll lands.
+    await update_progress(context, user_id, update.effective_chat.id)
 
     if correct_index is None:
         # Telegram hid the answer (quiz still open, not ours) — queue it
@@ -1817,13 +2054,6 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         queue.append(item_index)
         if len(queue) == 1:  # nothing else currently being asked
             await _ask_next_clarification(context, user_id, update.effective_chat.id)
-    else:
-        short = question[:50] + ("…" if len(question) > 50 else "")
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"✅ اتسجل: {html.escape(short)}",
-            parse_mode=ParseMode.HTML,
-        )
 
 # ═══════════════════════════════════════════════════════════════
 # POLL UPDATE HANDLER — passive correct-answer backfill. Telegram pushes a
@@ -2085,38 +2315,27 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         labeled_options = [
             f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
         ]
-        PDF_BUFFER[user_id].append({
+        item = {
             "type": "mcq", "q": question,
             "options": labeled_options, "correct": correct_index,
             "image": img_path,
-        })
-        await update_progress(
-            context, user_id, update.effective_chat.id,
-            latest_label=f"🖼 {question[:50]}" + ("…" if len(question) > 50 else ""),
-        )
+        }
+        case = PENDING_CASE.pop(user_id, None)   # case text sent just before still belongs to it
+        if case:
+            item["case"] = case
+        PDF_BUFFER[user_id].append(item)
+        await update_progress(context, user_id, update.effective_chat.id)
         return
 
-    # ── Case 2: non-empty caption that ISN'T a full question — save as a
-    # standalone image item (e.g. comparison charts / tables) ──────────
-    if caption:
-        PDF_BUFFER[user_id].append({
-            "type": "image", "path": img_path, "caption": caption,
-        })
-        await update_progress(
-            context, user_id, update.effective_chat.id,
-            latest_label=f"Image — {caption}",
-        )
-        return
-
-    # ── Case 3: no caption — park the image and ask for the question ──
-    _clear_pending_image(user_id)
+    # ── Case 2: any other photo (with or without a caption) — park it. It
+    # attaches to the NEXT poll / question that arrives, with no reply; the
+    # progress message shows a 📎 line while it's waiting. A caption that
+    # isn't a question is printed under the image. ─────────────────────
+    _clear_pending_image(user_id)          # a newer photo replaces an unused older one
     PENDING_IMAGE[user_id] = img_path
-    await update.message.reply_text(
-        "🖼 <b>استلمت الصورة!</b>\n"
-        "دلوقتي ابعت السؤال والاختيارات (بنفس صيغة الأسئلة المعتادة) "
-        "وهيتضاف الصورة تلقائي للسؤال ده.",
-        parse_mode=ParseMode.HTML,
-    )
+    if caption:
+        PENDING_IMG_CAPTION[user_id] = caption
+    await update_progress(context, user_id, update.effective_chat.id)
 
 async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Font file (.ttf/.otf) uploaded during the /pdf_start setup flow.
@@ -2330,17 +2549,26 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        blocks     = re.split(r"\n\s*\n", text)
+        raw    = update.message.text
+        mask   = _spoiler_mask(raw, update.message.entities)
+        blocks = _split_blocks_with_mask(raw, mask)
+
+        # ── WRITTEN, whole message: a (forwarded) written question — anything
+        # NOT under a spoiler is the question, anything under one is the answer.
+        whole = _whole_message_written_qa(raw, mask, blocks, _is_forwarded(update.message))
+        if whole:
+            title, content = whole
+            PDF_BUFFER[user_id].append({"type": "written", "title": title, "content": content})
+            await update_progress(context, user_id, update.effective_chat.id)
+            return
+
         any_saved  = False
+        case_added = False
         last_label = ""
 
-        for block in blocks:
-            block = block.strip()
-            if not block:
-                continue
-
-            # ── WRITTEN ─────────────────────────────────────────
-            written = extract_written_qa(block, spoiler_texts)
+        for block, block_mask in blocks:
+            # ── WRITTEN (per block) ─────────────────────────────
+            written = extract_written_qa(block, spoiler_texts, mask=block_mask)
             if written:
                 title, content = written
                 item = {
@@ -2349,21 +2577,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "content": content,
                 }
                 PDF_BUFFER[user_id].append(item)
-                item_index = len(PDF_BUFFER[user_id]) - 1
                 any_saved  = True
                 last_label = title[:50] + ("…" if len(title) > 50 else "")
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="✅ <b>اتسجل:</b>\n\n" + _review_text(item) + "\n\nعايز تعدل حاجة؟",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_review_buttons(item_index, item),
-                )
                 continue
 
             # ── MCQ ─────────────────────────────────────────────
             lines = normalize_mcq_block(block)
+            is_attempt = _block_looks_like_mcq(block, lines)
             if len(lines) < 3:
-                if _looks_like_mcq_attempt(lines):
+                if is_attempt:
                     await update.message.reply_text(
                         "⚠️ <b>الصياغة غلط!</b>\n\n"
                         "الشكل الصح هو:\n"
@@ -2374,11 +2596,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "ex: الشرح (اختياري)</code>",
                         parse_mode=ParseMode.HTML,
                     )
+                elif len(block) >= CASE_MIN_CHARS:
+                    # Plain prose, not a question → a case study for the next poll.
+                    _add_pending_case(user_id, block)
+                    case_added = True
                 continue
 
             question, raw_options, correct_index, explanation = parse_mcq_lines(lines)
 
             if correct_index is None or correct_index >= len(raw_options):
+                if not is_attempt:
+                    if len(block) >= CASE_MIN_CHARS:
+                        _add_pending_case(user_id, block)
+                        case_added = True
+                    continue
                 await update.message.reply_text(
                     "⚠️ <b>ما فيش إجابة صح!</b>\n\n"
                     "علّم الإجابة الصحيحة بـ <code>z</code> في نهايتها:\n"
@@ -2389,8 +2620,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # An image sent (with no caption / unparseable caption) just
             # before this message is paired with this question.
-            pending_img = PENDING_IMAGE.pop(user_id, None)
-
             labeled_options = [
                 f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
             ]
@@ -2398,18 +2627,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "type": "mcq", "q": question,
                 "options": labeled_options, "correct": correct_index,
             }
-            if pending_img:
-                item["image"] = pending_img
+            item.update(_take_pending(user_id))   # photo / case text sent before this question
             PDF_BUFFER[user_id].append(item)
             any_saved  = True
-            last_label = ("🖼 " if pending_img else "") + question[:50] + ("…" if len(question) > 50 else "")
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"✅ اتسجل: {html.escape(last_label)}",
-                parse_mode=ParseMode.HTML,
-            )
+            last_label = question[:50] + ("…" if len(question) > 50 else "")
 
-        if any_saved:
+        if any_saved or case_added:
             await update_progress(context, user_id, update.effective_chat.id, last_label)
 
     except Exception as e:
@@ -2473,7 +2696,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "edit_pick_back":
         items = PDF_BUFFER.get(user_id, [])
         await query.edit_message_text(
-            build_progress_text(items), parse_mode=ParseMode.HTML,
+            build_progress_text(items, pending=_pending_summary(user_id)), parse_mode=ParseMode.HTML,
             reply_markup=export_keyboard(),
         )
         return
@@ -2664,14 +2887,15 @@ async def _finish_pdf_setup(context: ContextTypes.DEFAULT_TYPE, user_id: int, re
     when this follows an uploaded background photo instead)."""
     PDF_BUFFER[user_id] = []
     PROGRESS_MSG_ID.pop(user_id, None)
-    _clear_pending_image(user_id)
+    _clear_pending_attachments(user_id)
     _clear_clarify_queue(user_id)
     _clear_pending_edit(user_id)
     name = PDF_NAMES.get(user_id, "questions")
     text = (
         f"📥 <b>PDF mode activated</b> — File name: <i>{name}</i>\n\n"
         "• ابعت أسئلة نصية (MCQ أو مكتوبة)\n"
-        "• أو <b>فوروارد</b> كويزات أو صور/جداول مقارنة\n\n"
+        "• أو <b>فوروارد</b> كويزات\n"
+        "• ابعت <b>نص طويل (حالة)</b> أو <b>صورة</b> قبل الكويز وهتتعلق عليه تلقائي\n\n"
         "اضغط <b>Export as PDF</b> لما تخلص 👇"
     )
     send = reply_target.edit_text if edit else reply_target.reply_text
@@ -2681,10 +2905,11 @@ def _reset_pdf_session(user_id: int) -> None:
     """Clears everything tied to an in-progress PDF-collection session —
     used after a successful export and by explicit clear/cancel alike."""
     _cleanup_images(user_id)
-    _clear_pending_image(user_id)
+    _clear_pending_attachments(user_id)
     _clear_clarify_queue(user_id)
     _clear_pending_edit(user_id)
     PDF_BUFFER.pop(user_id, None)
+    _PROGRESS_DIRTY.pop(user_id, None)
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
     AWAITING_FONT.pop(user_id, None)
@@ -2852,7 +3077,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
         or AWAITING_FONT.get(user_id) or AWAITING_FRAME.get(user_id) or AWAITING_COVER.get(user_id)
         or AWAITING_AK_STYLE.get(user_id) or AWAITING_LAYOUT.get(user_id)
-        or PENDING_IMAGE.get(user_id)
+        or PENDING_IMAGE.get(user_id) or PENDING_CASE.get(user_id)
     )
     _reset_pdf_session(user_id)
     if was_doing_something:
