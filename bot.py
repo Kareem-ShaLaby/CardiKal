@@ -1697,12 +1697,14 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     )
                     block.append(Paragraph(case_markup, CASE_STYLE))
                 block.append(Paragraph(q_num_inline + pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
-                if item.get("image"):
+                image_paths = ([item["image"]] if item.get("image") else [])
+                image_paths.extend(item.get("additional_images", []))
+                for image_index, image_path in enumerate(image_paths):
                     try:
-                        img = _fit_image(item["image"], max_h=IMG_MAX_H)
+                        img = _fit_image(image_path, max_h=IMG_MAX_H)
                         block.append(Spacer(1, 6))
                         block.append(img)
-                        if item.get("image_caption"):
+                        if image_index == 0 and item.get("image_caption"):
                             block.append(Paragraph(pdf_safe_markup(item["image_caption"], font_name, bold=False), IMG_CAPTION))
                         else:
                             block.append(Spacer(1, 6))
@@ -2029,8 +2031,32 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "options": labeled_options, "correct": correct_index,  # None = unknown
         "poll_id": poll.id,
     }
-    # A photo and/or case-study text sent before this poll belongs to it.
+    # Separately sent attachments still pair with the next poll as before.
     item.update(_take_pending(user_id))
+
+    description = (getattr(poll, "description", None) or "").strip()
+    if description:
+        item["case"] = "\n\n".join(filter(None, (item.get("case", ""), description)))
+
+    poll_media = getattr(poll, "media", None)
+    poll_photos = getattr(poll_media, "photo", None) if poll_media else None
+    if not poll_photos and poll_media:
+        live_photo = getattr(poll_media, "live_photo", None)
+        poll_photos = getattr(live_photo, "photo", None) if live_photo else None
+    if poll_photos:
+        photo = poll_photos[-1]
+        img_dir = os.path.join(IMG_BASE_DIR, str(user_id))
+        os.makedirs(img_dir, exist_ok=True)
+        img_path = os.path.join(img_dir, f"img_{photo.file_unique_id}.jpg")
+        try:
+            tg_file = await context.bot.get_file(photo.file_id)
+            await tg_file.download_to_drive(img_path)
+            if item.get("image"):
+                item.setdefault("additional_images", []).append(img_path)
+            else:
+                item["image"] = img_path
+        except Exception as e:
+            print(f"POLL IMAGE DOWNLOAD ERROR: {e}")
 
     PDF_BUFFER[user_id].append(item)
     item_index = len(PDF_BUFFER[user_id]) - 1
@@ -2607,6 +2633,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             question, raw_options, correct_index, explanation = parse_mcq_lines(lines)
+
+            if correct_index is None and len(block) >= CASE_MIN_CHARS:
+                _add_pending_case(user_id, block)
+                case_added = True
+                continue
 
             if correct_index is None or correct_index >= len(raw_options):
                 if not is_attempt:
