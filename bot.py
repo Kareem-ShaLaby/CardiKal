@@ -6,6 +6,8 @@ import html
 import tempfile
 import traceback
 import asyncio
+import itertools
+import zlib
 from io import BytesIO
 
 # ═══════════════════════════════════════════════════════════════
@@ -41,6 +43,7 @@ from io import BytesIO
 # 1440   EXPORT (build+send PDF, session reset)
 # 1500   PDF COMMANDS (/pdf_start, /pdf_generate, /pdf_clear, /cancel)
 # 1540   START / HELP
+#  ...   CARDIKAL (/start_Cardikal → image flashcards → .apkg) — see the CARDIKAL section near the bottom
 # 1570   MAIN
 # ═══════════════════════════════════════════════════════════════
 
@@ -2313,6 +2316,11 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _ask_ak_style(context, user_id, update.message)
         return
 
+    # ── CARDIKAL session: every photo starts a new image flashcard ──
+    if user_id in CARDIKAL:
+        await _ck_add_image(update, context, photo.file_id, photo.file_unique_id, ".jpg")
+        return
+
     if user_id not in PDF_BUFFER:
         await update.message.reply_text(MSG_NOT_IN_SESSION)
         return
@@ -2428,6 +2436,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+
+    # ── CARDIKAL session: text is a card's question / answer (or the deck name) ──
+    if user_id in CARDIKAL:
+        await _cardikal_text(update, context)
+        return
 
     # Real Telegram spoiler formatting (select text → "Spoiler") applied
     # anywhere in this message — used below to tell a written question's
@@ -2680,6 +2693,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
     await query.answer()
+
+    if query.data.startswith("ck_"):
+        await _cardikal_button(update, context)
+        return
 
     if query.data.startswith("clarify:"):
         _, item_index_str, choice_str = query.data.split(":")
@@ -3039,6 +3056,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
 # ═══════════════════════════════════════════════════════════════
 async def pdf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
+    _reset_cardikal(user_id)         # the two collection modes never run together
     _reset_pdf_session(user_id)
     AWAITING_NAME[user_id] = True
     await update.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
@@ -3113,7 +3131,9 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or AWAITING_FONT.get(user_id) or AWAITING_FRAME.get(user_id) or AWAITING_COVER.get(user_id)
         or AWAITING_AK_STYLE.get(user_id) or AWAITING_LAYOUT.get(user_id)
         or PENDING_IMAGE.get(user_id) or PENDING_CASE.get(user_id)
+        or CARDIKAL.get(user_id)
     )
+    _reset_cardikal(user_id)
     _reset_pdf_session(user_id)
     if was_doing_something:
         await update.message.reply_text(MSG_CANCEL_DONE)
@@ -3130,6 +3150,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{quizzy_block(QUIZZY_WELCOME_ART, random.choice(QUIZZY_WELCOME_LINES))}\n\n"
         "📄 <b>أنا كارديكال، بس تقدر تناديني كاردي 😉 </b>\n\n"
         "استخدم /pdf_start عشان تبدأ تجمع أسئلة وتصدرها PDF.\n"
+        "أو /start_Cardikal عشان تجمع كروت بالصور وتصدرها ملف Anki (APKG).\n"
         "/c لعرض كل الأوامر.",
         parse_mode=ParseMode.HTML,
     )
@@ -3138,6 +3159,8 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         "📖 <b>Available commands:</b>\n",
         "/start — greeting",
+        "/start_Cardikal — collects image flashcards (image + question + spoiler answer, formatting kept, optional logo hiding the answer) for an Anki .apkg",
+        "/cardikal_generate — exports the collected cards as an .apkg file",
         "/pdf_start — starts a session collecting questions for a PDF",
         "/pdf_generate — builds a PDF from what you've collected so far",
         "/pdf_clear — clears the current session",
@@ -3154,6 +3177,454 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def how_to_use_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HOW_TO_USE_TEXT, parse_mode=ParseMode.HTML)
+
+# ═══════════════════════════════════════════════════════════════
+# CARDIKAL — image flashcards → Anki .apkg
+#   /start_Cardikal  → ask for a deck name → collect cards → export .apkg
+#   A card = one image + a QUESTION (plain text) + an ANSWER (Telegram spoiler).
+#   Question/answer can be the image's caption, or sent as message(s) after it.
+#   Needs:  pip install genanki   (imported lazily, only on export)
+# ═══════════════════════════════════════════════════════════════
+CARDIKAL        = {}   # user_id -> {"name", "awaiting_name", "cards": [...], "cur": {...}|None, "n": int, "msg_id"}
+CK_IMG_BASE_DIR = os.path.join(tempfile.gettempdir(), "cardikal_imgs")
+CK_MODEL_ID     = 1607392320   # fixed forever, so re-importing decks keeps using the same Anki note type
+_CK_DIRTY: dict = {}   # user_id -> chat_id needing a progress refresh (coalesced, like the PDF progress)
+_CK_TASKS: dict = {}
+
+MSG_CK_ASK_NAME = (
+    "🃏 <b>اكتب اسم الديك (الباقة) اللي عايزه:</b>\n"
+    "<i>Anatomy Lecture 1</i>"
+)
+MSG_CK_ASK_LOGO = (
+    "🖼 ابعت <b>اللوجو</b> (صورة صغيرة) — هيغطي الإجابة في ضهر الكارت، "
+    "وتدوس عليه عشان الإجابة تظهر.\n"
+    "أو دوس Skip لو مش عايز لوجو."
+)
+MSG_CK_READY = (
+    "✅ <b>جاهزين!</b> الديك: <i>{name}</i>\n"
+    "{logo_line}\n\n"
+    "ابعت الصورة، وبعدها <b>السؤال</b> (كلام عادي) و<b>الإجابة</b> (سبويلر) — "
+    "سواء في الكابشن بتاع الصورة أو في رسائل بعدها. التنسيق (Bold/Italic…) بيتحفظ.\n"
+    "لما تخلص دوس Export أو ابعت /cardikal_generate"
+)
+MSG_CK_NOT_IN_SESSION = "🃏 ابدأ الأول بـ /start_Cardikal عشان تبدأ تجمع الكروت."
+MSG_CK_NEED_NAME      = "✏️ الأول اكتب اسم الديك."
+MSG_CK_NEED_IMAGE     = "📎 ابعت الصورة الأول، وبعدها السؤال والإجابة."
+MSG_CK_EMPTY          = "❌ لا يوجد كروت محفوظة بعد"
+MSG_CK_CLEARED        = "🗑 تم قرار إزالة يا دولي"
+MSG_CK_CAPTION        = "🃏 {count} كارت — {name} ❤️\n\n<i>{quizzy_line}</i>"
+
+def _ck_ready_text(sess: dict, has_logo: bool) -> str:
+    return MSG_CK_READY.format(
+        name=html.escape(sess.get("name") or ""),
+        logo_line="🖼 اللوجو: اتسجل ✅" if has_logo else "🖼 اللوجو: من غير",
+    )
+
+def _ck_dir(user_id: int) -> str:
+    return os.path.join(CK_IMG_BASE_DIR, str(user_id))
+
+def _ck_remove(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+def _reset_cardikal(user_id: int) -> None:
+    """Ends a Cardikal session and deletes its downloaded images."""
+    import shutil
+    shutil.rmtree(_ck_dir(user_id), ignore_errors=True)
+    CARDIKAL.pop(user_id, None)
+    _CK_DIRTY.pop(user_id, None)
+
+_CK_TAGS = {
+    "bold": "b", "italic": "i", "underline": "u", "strikethrough": "s",
+    "code": "code", "pre": "pre",
+    "blockquote": "blockquote", "expandable_blockquote": "blockquote",
+}
+
+def _ck_chars(raw: str, entities):
+    """[(char, hidden_by_spoiler, active_format_entity_indices)] for a
+    message/caption, plus the sorted list of formatting entities the indices
+    point into (outermost first). Offsets are UTF-16 units, so emoji count 2."""
+    fmt = [e for e in (entities or [])
+           if getattr(e, "type", None) in _CK_TAGS or getattr(e, "type", None) == "text_link"]
+    fmt.sort(key=lambda e: (e.offset, -e.length))
+    mask = _spoiler_mask(raw, entities)
+    out, pos = [], 0
+    for ch, hid in zip(raw, mask):
+        act = tuple(i for i, e in enumerate(fmt) if e.offset <= pos < e.offset + e.length)
+        out.append((ch, hid, act))
+        pos += 2 if ord(ch) > 0xFFFF else 1
+    return out, fmt
+
+def _ck_tidy(chars: list, strip_label_punct: bool) -> list:
+    """Collapses runs of spaces / blank lines and trims the ends. For the
+    question it also trims dangling ':' / '-' left where an 'Answer:' label
+    used to sit before the spoiler."""
+    out = []
+    for ch, act in chars:
+        if ch in " \t\u00a0":
+            if out and out[-1][0] in " \n":
+                continue
+            out.append((" ", act))
+        elif ch in "\r\n":
+            while out and out[-1][0] == " ":
+                out.pop()
+            if out and out[-1][0] == "\n":
+                continue
+            out.append(("\n", act))
+        else:
+            out.append((ch, act))
+    junk = " \n" + (":-–—،" if strip_label_punct else "")
+    while out and out[0][0] in junk:
+        out.pop(0)
+    while out and out[-1][0] in junk:
+        out.pop()
+    return out
+
+def _ck_emit(chars: list, fmt: list) -> str:
+    """(char, active_entities) list → HTML with properly nested tags."""
+    parts, stack = [], []          # stack: [(entity_index, closing_tag_name)]
+    for ch, act in chars:
+        k = 0
+        while k < len(stack) and k < len(act) and stack[k][0] == act[k]:
+            k += 1
+        while len(stack) > k:
+            parts.append(f"</{stack.pop()[1]}>")
+        for i in act[k:]:
+            e = fmt[i]
+            if e.type == "text_link":
+                parts.append(f'<a href="{html.escape(e.url or "", quote=True)}">')
+                stack.append((i, "a"))
+            else:
+                name = _CK_TAGS[e.type]
+                parts.append(f"<{name}>")
+                stack.append((i, name))
+        parts.append("<br>" if ch == "\n" else html.escape(ch, quote=False))
+    while stack:
+        parts.append(f"</{stack.pop()[1]}>")
+    return "".join(parts)
+
+def _ck_split_qa(raw: str, entities):
+    """Splits a message/caption into (question_html, answer_html): everything
+    under a real Telegram spoiler is the answer, everything else is the
+    question. Bold / italic / underline / strike / code / links / quotes are
+    kept as HTML. Either part can come back empty."""
+    chars, fmt = _ck_chars(raw, entities)
+    q_runs, a_runs = [], []
+    for hidden, grp in itertools.groupby(chars, key=lambda c: c[1]):
+        run = [(ch, act) for ch, _, act in grp]
+        (a_runs if hidden else q_runs).append(run)
+
+    def _join(runs, sep):
+        out = []
+        for n, r in enumerate(runs):
+            if n:
+                out += [(c, ()) for c in sep]
+            out += r
+        return out
+
+    q = _ck_emit(_ck_tidy(_join(q_runs, " "), True), fmt)
+    a = _ck_emit(_ck_tidy(_join(a_runs, " / "), False), fmt)
+    return q, a
+
+def _ck_feed(cur: dict, raw: str, entities) -> None:
+    """Fills the current card from one message/caption (values are HTML).
+    Spoiler text → answer; plain text → question. A plain message that
+    arrives when the question is already filled (and the answer isn't) is
+    taken as the answer, so a forgotten spoiler doesn't stall the card."""
+    q, a = _ck_split_qa(raw, entities)
+    if a:
+        if q:
+            cur["q"] = f'{cur["q"]}<br>{q}' if cur.get("q") else q
+        cur["a"] = f'{cur["a"]} / {a}' if cur.get("a") else a
+    elif q:
+        if not cur.get("q"):
+            cur["q"] = q
+        elif not cur.get("a"):
+            cur["a"] = q
+
+def _ck_try_finish(sess: dict) -> bool:
+    cur = sess.get("cur")
+    if cur and cur.get("q") and cur.get("a"):
+        sess["cards"].append(cur)
+        sess["cur"] = None
+        return True
+    return False
+
+def _ck_progress_text(sess: dict) -> str:
+    n = len(sess["cards"])
+    text = (
+        f"🃏 <b>Cardikal</b> — <i>{html.escape(sess.get('name') or '')}</i>\n"
+        f"Saved: <b>{n}</b> card{'s' if n != 1 else ''}"
+    )
+    cur = sess.get("cur")
+    if cur:
+        need = []
+        if not cur.get("q"):
+            need.append("❓ السؤال")
+        if not cur.get("a"):
+            need.append("💬 الإجابة (سبويلر)")
+        text += "\n⏳ الصورة الحالية مستنية: " + " · ".join(need)
+    return text
+
+def _ck_logo_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="ck_skip_logo")]])
+
+def _ck_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📦 Export APKG", callback_data="ck_export"),
+        InlineKeyboardButton("🗑 Clear", callback_data="ck_clear"),
+    ]])
+
+async def _ck_render_progress(context, user_id: int, chat_id: int):
+    sess = CARDIKAL.get(user_id)
+    if not sess:
+        return
+    old = sess.pop("msg_id", None)
+    if old:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=old)
+        except Exception as e:
+            print(f"CARDIKAL PROGRESS DELETE ERROR: {e}")
+    sent = await context.bot.send_message(
+        chat_id=chat_id, text=_ck_progress_text(sess),
+        parse_mode=ParseMode.HTML, reply_markup=_ck_keyboard(),
+    )
+    sess["msg_id"] = sent.message_id
+
+async def _ck_progress_worker(context, user_id: int):
+    try:
+        while user_id in _CK_DIRTY:
+            chat_id = _CK_DIRTY.pop(user_id)
+            if user_id not in CARDIKAL:
+                continue
+            try:
+                await _ck_render_progress(context, user_id, chat_id)
+            except Exception as e:
+                print("CARDIKAL PROGRESS ERROR:", e)
+    finally:
+        _CK_TASKS.pop(user_id, None)
+
+async def _ck_progress(context, user_id: int, chat_id: int):
+    _CK_DIRTY[user_id] = chat_id
+    task = _CK_TASKS.get(user_id)
+    if task is not None and not task.done():
+        return
+    _CK_TASKS[user_id] = asyncio.get_running_loop().create_task(_ck_progress_worker(context, user_id))
+
+async def _ck_add_image(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        file_id: str, unique_id: str, ext: str) -> None:
+    """A new image starts a new card. Its caption (if any) is the first
+    question/answer text; the rest can follow as normal messages."""
+    user_id = update.effective_chat.id
+    sess = CARDIKAL[user_id]
+    if sess.get("awaiting_name"):
+        await update.message.reply_text(MSG_CK_NEED_NAME)
+        return
+
+    # ── the logo step: this image is the logo, not a card ──
+    if sess.get("awaiting_logo"):
+        os.makedirs(_ck_dir(user_id), exist_ok=True)
+        logo_path = os.path.join(_ck_dir(user_id), f"ck_logo_{unique_id}{ext}")
+        tg_file = await context.bot.get_file(file_id)
+        await tg_file.download_to_drive(logo_path)
+        sess["logo"] = logo_path
+        sess["awaiting_logo"] = False
+        await update.message.reply_text(_ck_ready_text(sess, True), parse_mode=ParseMode.HTML)
+        return
+
+    warn = ""
+    prev = sess.get("cur")
+    if prev:   # the previous image never got its text — drop it, but say so
+        if not prev.get("q") and not prev.get("a"):
+            missing = "سؤال ولا إجابة"
+        elif not prev.get("q"):
+            missing = "سؤال"
+        else:
+            missing = "إجابة (سبويلر)"
+        _ck_remove(prev.get("image"))
+        sess["cur"] = None
+        warn = f"⚠️ الصورة اللي قبلها مكانش ليها {missing} فاتشالت."
+
+    os.makedirs(_ck_dir(user_id), exist_ok=True)
+    sess["n"] = sess.get("n", 0) + 1
+    path = os.path.join(_ck_dir(user_id), f"ck_{sess['n']}_{unique_id}{ext}")
+    tg_file = await context.bot.get_file(file_id)
+    await tg_file.download_to_drive(path)
+
+    cur = {"image": path, "q": None, "a": None}
+    sess["cur"] = cur
+    caption = update.message.caption or ""
+    if caption:
+        _ck_feed(cur, caption, update.message.caption_entities)
+    _ck_try_finish(sess)
+
+    if warn:
+        await update.message.reply_text(warn)
+    await _ck_progress(context, user_id, update.effective_chat.id)
+
+async def _cardikal_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Text message while a Cardikal session is open (called from handle())."""
+    user_id = update.effective_chat.id
+    sess = CARDIKAL[user_id]
+    raw = update.message.text or ""
+
+    if sess.get("awaiting_name"):
+        name = raw.strip()
+        if not name:
+            return
+        sess["name"] = name
+        sess["awaiting_name"] = False
+        sess["awaiting_logo"] = True
+        await update.message.reply_text(MSG_CK_ASK_LOGO, parse_mode=ParseMode.HTML, reply_markup=_ck_logo_keyboard())
+        return
+
+    if sess.get("awaiting_logo"):
+        await update.message.reply_text("🖼 ابعت صورة اللوجو، أو دوس Skip.", reply_markup=_ck_logo_keyboard())
+        return
+
+    cur = sess.get("cur")
+    if not cur:
+        await update.message.reply_text(MSG_CK_NEED_IMAGE)
+        return
+    _ck_feed(cur, raw, update.message.entities)
+    _ck_try_finish(sess)
+    await _ck_progress(context, user_id, update.effective_chat.id)
+
+def build_apkg(cards: list, deck_name: str, logo_path: str = None) -> bytes:
+    """Builds an Anki package (.apkg). Front = image + question. Back = the
+    front again + a divider + the answer. With a logo, the answer sits behind
+    it: tap the logo to reveal (a plain <details> element — no JavaScript)."""
+    import genanki
+
+    model = genanki.Model(
+        CK_MODEL_ID,
+        "Cardikal Image Card",
+        fields=[{"name": "Image"}, {"name": "Question"}, {"name": "Answer"}, {"name": "Logo"}],
+        templates=[{
+            "name": "Card 1",
+            "qfmt": '{{Image}}<div dir="auto">{{Question}}</div>',
+            "afmt": (
+                '{{FrontSide}}<hr id="answer">'
+                '{{#Logo}}<details><summary>{{Logo}}</summary>'
+                '<div dir="auto">{{Answer}}</div></details>{{/Logo}}'
+                '{{^Logo}}<div dir="auto">{{Answer}}</div>{{/Logo}}'
+            ),
+        }],
+        css=(
+            ".card { font-family: arial; font-size: 20px; text-align: center; "
+            "color: black; background-color: white; }\n"
+            "img { max-width: 100%; height: auto; }\n"
+            ".cklogo { max-width: 120px; max-height: 120px; }\n"
+            "summary { list-style: none; cursor: pointer; outline: none; }\n"
+            "summary::-webkit-details-marker { display: none; }\n"
+            "details[open] > summary { display: none; }\n"
+            "blockquote { text-align: left; margin: 8px 0; padding-left: 10px; border-left: 3px solid #999; }\n"
+            "pre { text-align: left; white-space: pre-wrap; }"
+        ),
+    )
+    deck_id = (1 << 30) + zlib.crc32(deck_name.encode("utf-8")) % (1 << 30)
+    deck = genanki.Deck(deck_id, deck_name)
+
+    media = []
+    logo_html = ""
+    if logo_path and os.path.exists(logo_path):
+        media.append(logo_path)
+        logo_html = f'<img class="cklogo" src="{html.escape(os.path.basename(logo_path))}">'
+
+    for c in cards:
+        media.append(c["image"])
+        img_html = f'<img src="{html.escape(os.path.basename(c["image"]))}">'
+        # q / a are already HTML (formatting kept), see _ck_split_qa
+        deck.add_note(genanki.Note(model=model, fields=[img_html, c["q"], c["a"], logo_html]))
+
+    package = genanki.Package(deck)
+    package.media_files = media
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "deck.apkg")
+        package.write_to_file(out)
+        with open(out, "rb") as f:
+            return f.read()
+
+async def _cardikal_export(context: ContextTypes.DEFAULT_TYPE, message, user_id: int) -> None:
+    sess = CARDIKAL.get(user_id)
+    if not sess:
+        await message.reply_text(MSG_CK_NOT_IN_SESSION)
+        return
+    cards = sess["cards"]
+    if not cards:
+        await message.reply_text(MSG_CK_EMPTY)
+        return
+
+    name = sess.get("name") or "Cardikal"
+    if sess.get("cur"):
+        await message.reply_text("⚠️ الصورة الأخيرة ناقصها سؤال أو إجابة فمش هتتحط في الملف.")
+    await message.reply_text(f"⏳ جاري توليد APKG لـ {len(cards)} كارت...")
+
+    try:
+        data = await asyncio.to_thread(build_apkg, cards, name, sess.get("logo"))
+    except ImportError:
+        await message.reply_text("❌ مكتبة genanki مش متسطّبة على السيرفر. نزّلها بـ: pip install genanki")
+        return
+    except Exception as e:
+        print("APKG ERROR:", e)
+        traceback.print_exc()
+        await message.reply_text(
+            f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{html.escape(str(e))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "cardikal"
+    await message.reply_document(
+        document=data, filename=f"{safe}.apkg",
+        caption=MSG_CK_CAPTION.format(count=len(cards), name=html.escape(name),
+                                       quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+        parse_mode=ParseMode.HTML,
+    )
+    _reset_cardikal(user_id)
+
+async def _cardikal_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    user_id = query.from_user.id
+    if query.data == "ck_export":
+        await _cardikal_export(context, query.message, user_id)
+    elif query.data == "ck_skip_logo":
+        sess = CARDIKAL.get(user_id)
+        if sess and sess.get("awaiting_logo"):
+            sess["awaiting_logo"] = False
+            await query.message.reply_text(_ck_ready_text(sess, False), parse_mode=ParseMode.HTML)
+    elif query.data == "ck_clear":
+        _reset_cardikal(user_id)
+        await query.message.reply_text(MSG_CK_CLEARED)
+
+async def cardikal_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    _reset_pdf_session(user_id)      # the two collection modes never run together
+    _reset_cardikal(user_id)
+    CARDIKAL[user_id] = {"awaiting_name": True, "awaiting_logo": False, "name": None, "logo": None,
+                         "cards": [], "cur": None, "n": 0}
+    await update.message.reply_text(MSG_CK_ASK_NAME, parse_mode=ParseMode.HTML)
+
+async def cardikal_generate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cardikal_export(context, update.message, update.effective_chat.id)
+
+async def handle_image_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Images sent as a FILE (uncompressed) count as images too — but only
+    inside a Cardikal session; otherwise they're ignored like before."""
+    msg = update.message
+    if not msg or not msg.document:
+        return
+    user_id = update.effective_chat.id
+    if user_id in SLEEPING or user_id not in CARDIKAL:
+        return
+    doc = msg.document
+    ext = os.path.splitext(doc.file_name or "")[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        ext = ".jpg"
+    await _ck_add_image(update, context, doc.file_id, doc.file_unique_id, ext)
 
 # ═══════════════════════════════════════════════════════════════
 # GLOBAL ERROR HANDLER — no ERROR_LOG_GROUP_ID channel here (that whole
@@ -3181,6 +3652,8 @@ app.add_handler(CommandHandler("c",            commands_cmd))
 app.add_handler(CommandHandler("how_to_use",   how_to_use_cmd))
 app.add_handler(CommandHandler("cancel",       cancel_cmd))
 app.add_handler(CommandHandler("sleep",        sleep_cmd))
+app.add_handler(CommandHandler("start_cardikal",      cardikal_start))     # typed as /start_Cardikal — matching is case-insensitive
+app.add_handler(CommandHandler("cardikal_generate",   cardikal_generate_cmd))
 app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
@@ -3203,6 +3676,9 @@ app.add_handler(MessageHandler(
     filters.Document.FileExtension("ttf") | filters.Document.FileExtension("otf"),
     handle_font_upload,
 ))
+
+# Images sent as files (only used inside a /start_Cardikal session)
+app.add_handler(MessageHandler(filters.Document.IMAGE, handle_image_document))
 
 # PDF handler — captioned PDFs in a private DM are parsed as manual MCQs.
 app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
