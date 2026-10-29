@@ -2214,6 +2214,119 @@ async def _save_cover_photo(context: ContextTypes.DEFAULT_TYPE, user_id: int, fi
     PDF_COVER_PATH[user_id] = cover_path
     return cover_path
 
+# ═══════════════════════════════════════════════════════════════
+# PDF TEMPLATE — send a PDF (no caption): page 1 → cover, page 2 → frame
+# ═══════════════════════════════════════════════════════════════
+TEMPLATE_RENDER_DPI = 200   # A4 @ 200 dpi ≈ 1654×2339 px — sharp, and still light enough to embed
+
+def _render_pdf_pages(pdf_path: str, page_numbers: list, out_paths: list, dpi: int = TEMPLATE_RENDER_DPI):
+    """BLOCKING — run it with asyncio.to_thread. Rasterises the requested
+    0-based pages of `pdf_path` into the matching PNG paths. Returns
+    (page_count, [(width_pt, height_pt), ...]) for the pages that exist.
+    Uses pypdfium2 (pure wheel, nothing to apt-install); falls back to
+    PyMuPDF if that's what the host has."""
+    sizes = []
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_path)
+        try:
+            count = len(pdf)
+            for pg, out in zip(page_numbers, out_paths):
+                if pg >= count:
+                    continue
+                page = pdf[pg]
+                w, h = page.get_size()
+                bitmap = page.render(scale=dpi / 72.0)
+                bitmap.to_pil().convert("RGB").save(out, "PNG", optimize=True)
+                sizes.append((w, h))
+        finally:
+            pdf.close()
+        return count, sizes
+    except ImportError:
+        import fitz   # PyMuPDF
+        doc = fitz.open(pdf_path)
+        try:
+            count = doc.page_count
+            for pg, out in zip(page_numbers, out_paths):
+                if pg >= count:
+                    continue
+                page = doc[pg]
+                page.get_pixmap(matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0), alpha=False).save(out)
+                sizes.append((page.rect.width, page.rect.height))
+        finally:
+            doc.close()
+        return count, sizes
+
+async def _apply_pdf_template(context: ContextTypes.DEFAULT_TYPE, update: Update, user_id: int) -> None:
+    """An uncaptioned PDF is a TEMPLATE: page 1 becomes the cover, page 2
+    becomes the per-page frame (both remembered exactly like /set_cover and
+    /set_frame). A 1-page PDF sets the cover only and leaves the frame alone."""
+    doc = update.message.document
+    work_dir = os.path.join(BRANDING_BASE_DIR, str(user_id))
+    os.makedirs(work_dir, exist_ok=True)
+    src_path   = os.path.join(work_dir, "template_src.pdf")
+    cover_path = os.path.join(work_dir, "cover_tpl.png")
+    frame_path = os.path.join(work_dir, "frame_tpl.png")
+
+    wait = await update.message.reply_text("⏳ بقرا التمبلت...")
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(src_path)
+        count, sizes = await asyncio.to_thread(
+            _render_pdf_pages, src_path, [0, 1], [cover_path, frame_path],
+        )
+    except Exception as e:
+        traceback.print_exc()
+        await wait.edit_text(f"❌ معرفتش أقرا الـ PDF ده: {str(e)[:120]}")
+        return
+    finally:
+        try:
+            os.remove(src_path)
+        except Exception:
+            pass
+
+    if count < 1:
+        await wait.edit_text("❌ الـ PDF فاضي — مفيهوش صفحات.")
+        return
+
+    # Replace whatever was saved before (photo-based .jpg or an older template)
+    old = PDF_COVER_PATH.get(user_id)
+    if old and old != cover_path and os.path.exists(old):
+        try: os.remove(old)
+        except Exception: pass
+    PDF_COVER_PATH[user_id] = cover_path
+    got_frame = count >= 2
+    if got_frame:
+        old = PDF_FRAME_PATH.get(user_id)
+        if old and old != frame_path and os.path.exists(old):
+            try: os.remove(old)
+            except Exception: pass
+        PDF_FRAME_PATH[user_id] = frame_path
+
+    # Resolve any pending setup-flow wait for these two images
+    cover_setup = AWAITING_COVER.pop(user_id, None) == "setup"
+    frame_setup = got_frame and AWAITING_FRAME.pop(user_id, None) == "setup"
+
+    msg = "✅ التمبلت اتسجل!\n📕 صفحة 1 ← <b>الغلاف</b>"
+    msg += "\n🖼 صفحة 2 ← <b>الفريم</b> (بيتكرر في كل صفحة)" if got_frame else \
+           "\n⚠️ الـ PDF صفحة واحدة بس، فاتسجل الغلاف بس — الفريم زي ما هو."
+    if count > 2:
+        msg += f"\nℹ️ الصفحات من 3 لـ {count} اتجاهلت."
+    # Warn when the template isn't A4-shaped (build_pdf stretches to A4)
+    a4_ratio = A4[0] / A4[1]
+    if any(abs((w / h) - a4_ratio) > 0.02 for w, h in sizes):
+        msg += "\n⚠️ حجم الصفحة مش A4 — هيتمط ليناسب A4."
+    msg += "\nهيفضلوا متسجلين لحد ما تغيّرهم أو تشيلهم بـ /clear_cover و /clear_frame أو البوت يعمل restart."
+    await wait.edit_text(msg, parse_mode=ParseMode.HTML)
+
+    # Continue the /pdf_start flow if it was sitting on the cover/frame step
+    if cover_setup and got_frame:
+        await _ask_ak_style(context, user_id, update.message)
+    elif cover_setup:
+        await _start_bg_step(context, user_id, update.message)
+    elif frame_setup:
+        await _ask_ak_style(context, user_id, update.message)
+
 async def _start_cover_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
     """Step after font selection (font → COVER → frame → answer-key style →
     layout → finish). The cover becomes page 1 of every PDF. If one is
@@ -2392,7 +2505,8 @@ async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """PDFs sent in a private DM: captioned = treated as a manual question
     (caption parsed as the MCQ text — no attachment, since Telegram polls
-    can only carry a photo, not a PDF). Uncaptioned PDFs are silently ignored."""
+    can only carry a photo, not a PDF). UNcaptioned PDFs are templates: page 1
+    becomes the cover and page 2 the per-page frame (see _apply_pdf_template)."""
     if not update.message or not update.message.document:
         return
     user_id = update.effective_chat.id
@@ -2404,6 +2518,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = (update.message.caption or "").strip()
     if not caption:
+        # No caption = a TEMPLATE PDF: page 1 → cover, page 2 → frame.
+        await _apply_pdf_template(context, update, user_id)
         return
 
     if user_id not in PDF_BUFFER:
@@ -3167,6 +3283,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pdf_preview — sends a sample PDF (random short + long questions) using your current layout numbers",
         "/set_cover — set a cover page image (remembered until you change it or the bot restarts)",
         "/clear_cover — remove the saved cover image",
+        "📎 Send a PDF with no caption — page 1 becomes the cover, page 2 the page frame (template)",
         "/set_frame — set a per-page frame/background image (remembered until you change it or the bot restarts)",
         "/clear_frame — remove the saved frame image",
         "/cancel — cancels whatever's currently in progress",
