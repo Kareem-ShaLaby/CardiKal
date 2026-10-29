@@ -2243,7 +2243,13 @@ def _render_pdf_pages(pdf_path: str, page_numbers: list, out_paths: list, dpi: i
             pdf.close()
         return count, sizes
     except ImportError:
-        import fitz   # PyMuPDF
+        try:
+            import fitz   # PyMuPDF
+        except ImportError:
+            raise RuntimeError(
+                "مكتبة قراءة الـ PDF مش متسطبة. ضيف سطر pypdfium2 في ملف requirements.txt "
+                "وأعمل redeploy على Railway."
+            )
         doc = fitz.open(pdf_path)
         try:
             count = doc.page_count
