@@ -346,13 +346,16 @@ MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
 MSG_NOT_IN_SESSION = "📄 ابدأ الأول بـ /pdf_start عشان تبدأ تجمع الأسئلة."
 
 LAYOUT_PROMPT_TEXT = (
-    "📐 <b>ظبط الشكل</b> — ابعت <u>5 أرقام</u> في رسالة واحدة، مفصولين بمسافة أو فاصلة، بالترتيب ده:\n\n"
+    "📐 <b>ظبط الشكل</b> — ابعت <u>لحد 7 أرقام</u> في رسالة واحدة، مفصولين بمسافة أو فاصلة، بالترتيب ده:\n\n"
     "1️⃣ حجم خط السؤال (الافتراضي 12)\n"
     "2️⃣ المسافة من فوق للسؤال الأول، بالسنتيمتر (الافتراضي 2.5)\n"
     "3️⃣ إزاحة صندوق الإجابات، بالسنتيمتر — رقم موجب يزحزحه لليسار، وسالب يزحزحه لليمين (الافتراضي 0)\n"
     "4️⃣ مسافة صندوق الإجابات من الحافة اليمين، بالسنتيمتر (الافتراضي 0.5)\n"
-    "5️⃣ رفع صندوق الإجابات، بالسنتيمتر — رقم موجب يرفعه لفوق، وسالب ينزله لتحت (الافتراضي 4)\n\n"
-    "مثال: <code>12 2.5 0 0.5 4</code>\n"
+    "5️⃣ رفع صندوق الإجابات، بالسنتيمتر — رقم موجب يرفعه لفوق، وسالب ينزله لتحت (الافتراضي 4)\n"
+    "6️⃣ المسافة بين كل سؤال والسؤال اللي بعده، بالسنتيمتر (الافتراضي 1.1) — قلّلها عشان الأسئلة تتقارب\n"
+    "7️⃣ المسافة بين الاختيارات (A B C D)، بالسنتيمتر (الافتراضي 0.2)\n\n"
+    "مثال: <code>12 2.5 0 0.5 4 0.7 0.1</code>\n"
+    "لو بعت 5 أرقام بس، الـ6 و7 بياخدوا الافتراضي.\n"
     "لو عايز رقم معين يفضل زي ما هو، اكتب مكانه <code>-</code>.\n"
     "أو ابعت <code>-</code> لوحدها عشان تاخد كل الإعدادات الافتراضية."
 )
@@ -385,6 +388,8 @@ PDF_FONT_SIZE          = {}    # user_id -> float, base question font size (othe
 PDF_TOP_MARGIN_CM      = {}    # user_id -> float, how far the first question starts from the top of the page
 PDF_AK_WALL_GAP_CM     = {}    # user_id -> float, how close the answer-key box sits to the page's right edge
 PDF_AK_UP_NUDGE_CM     = {}    # user_id -> float, how many cm the answer-key box is lifted above its default corner spot
+PDF_Q_GAP_CM           = {}    # user_id -> float, space between one question and the next, in cm
+PDF_OPT_GAP_CM         = {}    # user_id -> float, space between the options (A/B/C/D) of a question, in cm
 AWAITING_LAYOUT        = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the combined layout numbers
 
 # Defaults used for any layout value the user leaves blank/"-"
@@ -393,6 +398,8 @@ DEFAULT_TOP_MARGIN_CM  = 2.5
 DEFAULT_AK_NUDGE_CM    = 0.0
 DEFAULT_AK_WALL_GAP_CM = 0.5
 DEFAULT_AK_UP_NUDGE_CM = 4.0
+DEFAULT_Q_GAP_CM       = 1.1    # ≈ the old fixed spacing between questions
+DEFAULT_OPT_GAP_CM     = 0.2    # ≈ the old fixed spacing between options
 SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
 PENDING_IMAGE          = {}    # user_id -> local path of an image waiting to attach to the NEXT poll/question
@@ -1136,7 +1143,7 @@ def export_keyboard():
 def _item_preview_label(item: dict, max_len: int = 40) -> str:
     """First few words of a buffered item, for the edit-picker list."""
     if item["type"] == "written":
-        text = item.get("title", "")
+        text = item.get("title") or ("🖼 (صورة)" if item.get("image") or item.get("answer_image") else "")
     elif item["type"] == "image":
         text = item.get("caption") or "(صورة من غير نص)"
     else:
@@ -1241,13 +1248,21 @@ class _PageRecorder(Flowable):
 # by _PageRecorder flowables during the same build() pass, and is fully
 # populated by the time save() runs at the very end of it.
 # ═══════════════════════════════════════════════════════════════
+def _clipboard_box_width(max_num: int, letters: list, font_bold: str, fs: float = 13) -> float:
+    """Width of the clipboard answer box: just enough for the tick box, the
+    widest "N." and the widest answer letter (no wasted space on the right)."""
+    num_w = pdfmetrics.stringWidth("8" * len(str(max(1, int(max_num)))) + ".", font_bold, fs)
+    let_w = max((pdfmetrics.stringWidth(str(l), font_bold, fs) for l in (letters or ["A"])), default=fs * 0.7)
+    return max(60.0, 28 + num_w + 6 + let_w + 13)
+
 class _AnswerKeyCanvas(_canvas.Canvas):
     def __init__(self, *args, answer_pairs=None, page_of_idx=None,
                  font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD,
                  ak_style="grouped", ak_nudge_cm=0.0,
                  ak_right_margin=2*cm, ak_top_margin=2.5*cm,
-                 ak_wall_gap_cm=0.5, ak_up_nudge_cm=4.0, **kwargs):
+                 ak_wall_gap_cm=0.5, ak_up_nudge_cm=4.0, ak_box_w=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._ak_box_w       = ak_box_w   # fitted width of the clipboard box (same on every page)
         self._ak_pages       = []
         self._answer_pairs   = answer_pairs or []
         self._page_of_idx    = page_of_idx if page_of_idx is not None else {}
@@ -1308,7 +1323,57 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             except Exception:
                 cur_x += size * 0.5
 
+    def _draw_clipboard_key(self, pairs):
+        """Column-style answer box, drawn as a purple medical CLIPBOARD: purple
+        board, white paper, metal clip, ruled rows with a tick box in front of
+        each "N. Letter". The width is fitted to the content (see
+        _clipboard_box_width) instead of a fixed 4.2 cm."""
+        P600, P800 = colors.HexColor("#6D28D9"), colors.HexColor("#4C1D95")
+        P500, P400, P300 = colors.HexColor("#7C3AED"), colors.HexColor("#A78BFA"), colors.HexColor("#C4B5FD")
+        P200, P900 = colors.HexColor("#DDD6FE"), colors.HexColor("#2E1065")
+        LINE_H, FS = 0.65 * cm, 13
+        n   = len(pairs)
+        w   = self._ak_box_w or _clipboard_box_width(max(q for q, _ in pairs), [l for _, l in pairs], self._ak_font_bold)
+        h   = 22 + LINE_H * n + 10
+        x_right = A4[0] - self._ak_wall_gap_cm * cm - self._ak_nudge_cm * cm
+        x       = x_right - w
+        y       = 2.1 * cm + self._ak_up_nudge_cm * cm
+
+        self.saveState()
+        # board + paper
+        self.setFillColor(P600);        self.roundRect(x, y, w, h, 7, stroke=0, fill=1)
+        self.setFillColor(colors.white); self.roundRect(x + 5, y + 5, w - 10, h - 19, 3, stroke=0, fill=1)
+        # clip
+        cw = 38
+        self.setFillColor(P200); self.roundRect(x + w / 2 - cw / 2, y + h - 13, cw, 15, 4, stroke=0, fill=1)
+        self.setFillColor(P800); self.roundRect(x + w / 2 - 9, y + h - 9, 18, 5, 2.5, stroke=0, fill=1)
+        self.setFillColor(P300); self.circle(x + w / 2, y + h - 1.5, 2.2, stroke=0, fill=1)
+
+        num_w = max(pdfmetrics.stringWidth(f"{q}.", self._ak_font_bold, FS) for q, _ in pairs)
+        x_num = x + 28
+        x_let = x_num + num_w + 6
+        top   = y + h - 19
+        for i, (q, letter) in enumerate(pairs):
+            base = top - LINE_H * (i + 1) + 5
+            self.setStrokeColor(P200); self.setLineWidth(0.7)
+            self.line(x + 11, base - 4, x + w - 11, base - 4)
+            # tick box
+            self.setStrokeColor(P400); self.setLineWidth(1)
+            self.roundRect(x + 12, base - 1, 9, 9, 2, stroke=1, fill=0)
+            self.setStrokeColor(P600); self.setLineWidth(1.4); self.setLineCap(1); self.setLineJoin(1)
+            tick = self.beginPath()
+            tick.moveTo(x + 14, base + 3.4); tick.lineTo(x + 16.2, base + 1.3); tick.lineTo(x + 20.5, base + 6.6)
+            self.drawPath(tick, stroke=1, fill=0)
+            self.setFillColor(P500)
+            self._draw_safe_string(x_num, base, f"{q}.", self._ak_font_bold, FS, bold=True)
+            self.setFillColor(P900)
+            self._draw_safe_string(x_let, base, str(letter), self._ak_font_bold, FS, bold=True)
+        self.restoreState()
+
     def _draw_answer_key(self, pairs):
+        if self._ak_style == "column":
+            self._draw_clipboard_key(pairs)
+            return
         pad = 0.3 * cm
 
         # Distance kept from the true physical right edge of the page (the
@@ -1521,6 +1586,55 @@ def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT):
 # ═══════════════════════════════════════════════════════════════
 # PDF BUILDER
 # ═══════════════════════════════════════════════════════════════
+class _PageCentered(Flowable):
+    """Centres a flowable (the title, a case box) on the PAGE instead of on the
+    text column. The text column sits left of centre whenever the answer-key box
+    takes room on the right, so a plain flowable looks pushed to the left. This
+    gives the inner flowable a width that is symmetric about the page centre —
+    as wide as possible without crossing the column's left or right edge, so it
+    never runs under the answer-key box — and shifts it into place. If the
+    column is too far off-centre for that, it falls back to normal placement."""
+    MIN_HALF_W = 4 * cm
+
+    def __init__(self, inner, frame_left, frame_right, pad=0):
+        super().__init__()
+        self.inner, self.frame_left, self.frame_right, self.pad = inner, frame_left, frame_right, pad
+        self._x0 = 0
+        self._inner_w = None
+
+    def _geometry(self, availWidth):
+        centre = A4[0] / 2
+        half = min(centre - self.frame_left, self.frame_right - centre)
+        if half < self.MIN_HALF_W:                 # can't centre sensibly → keep it in the column
+            return 0, availWidth
+        return (centre - half) - self.frame_left, 2 * (half - self.pad)
+
+    def wrap(self, availWidth, availHeight):
+        x0, w = self._geometry(availWidth)
+        self._x0 = x0 + (self.pad if x0 else 0)
+        self._inner_w = w
+        _, h = self.inner.wrap(w, availHeight)
+        self.width, self.height = availWidth, h
+        return availWidth, h
+
+    def split(self, availWidth, availHeight):
+        x0, w = self._geometry(availWidth)
+        parts = self.inner.split(w, availHeight)
+        return [_PageCentered(p, self.frame_left, self.frame_right, self.pad) for p in parts]
+
+    def getSpaceBefore(self):
+        return self.inner.getSpaceBefore()
+
+    def getSpaceAfter(self):
+        return self.inner.getSpaceAfter()
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        c.translate(self._x0, 0)
+        self.inner.drawOn(c, 0, 0)
+        c.restoreState()
+
 def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               font_bold_path: str = None, bg_image_path: str = None,
               show_answers: bool = True, ak_style: str = "grouped",
@@ -1528,7 +1642,9 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               top_margin_cm: float = DEFAULT_TOP_MARGIN_CM,
               ak_wall_gap_cm: float = DEFAULT_AK_WALL_GAP_CM,
               ak_up_nudge_cm: float = DEFAULT_AK_UP_NUDGE_CM,
-              cover_image_path: str = None) -> BytesIO:
+              cover_image_path: str = None,
+              q_gap_cm: float = DEFAULT_Q_GAP_CM,
+              opt_gap_cm: float = DEFAULT_OPT_GAP_CM) -> BytesIO:
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
@@ -1589,13 +1705,21 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # question text.
     FSCALE = font_size / DEFAULT_FONT_SIZE
 
+    # Fitted clipboard width: sized once for the whole document (widest question
+    # number + widest answer letter) so every page's box is identical.
+    _answered = [(i, string.ascii_uppercase[it["correct"]]) for i, it in enumerate(items, 1)
+                 if it.get("type") == "mcq" and it.get("correct") is not None]
+    AK_BOX_W = _clipboard_box_width(
+        max([q for q, _ in _answered], default=1), [l for _, l in _answered], font_name_bold,
+    )
+
     if ak_style == "column":
         # The text column ends just before the answer-key box's ACTUAL left
         # edge — computed from the same wall-gap / shift numbers the canvas
         # uses to place the box — so lines run right up to it instead of
         # stopping at a fixed reserve. If the box is pushed mostly off the
         # page (negative shift), the text simply extends further right.
-        box_left_x   = A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm - AK_COLUMN_BOX_W
+        box_left_x   = A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm - AK_BOX_W
         right_margin = A4[0] - box_left_x + TEXT_TO_BOX_GAP_CM * cm
         right_margin = max(MIN_RIGHT_MARGIN_CM * cm, right_margin)
         right_margin = min(right_margin, A4[0] - LEFT_MARGIN - MIN_TEXT_WIDTH_CM * cm)
@@ -1616,25 +1740,35 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             bottomMargin=3.6*cm,
         )
 
+    # Left/right edges of the text column, used to centre the title and the
+    # case box on the PAGE (the card/frame is symmetric about the page centre).
+    FRAME_LEFT  = _DOC_MARGINS["leftMargin"]
+    FRAME_RIGHT = A4[0] - _DOC_MARGINS["rightMargin"]
+
     # Images are capped at IMG_MAX_LINES lines of option text (same line height
     # the options use), so they follow the font-size setting and stay small.
     IMG_MAX_H = IMG_MAX_LINES * 15 * FSCALE
 
+    Q_GAP   = q_gap_cm * cm      # space between questions (a Spacer at the top of each block)
+    OPT_GAP = opt_gap_cm * cm    # space after each option / answer line
+
+    # spaceBefore is 0 now: the gap between two questions is controlled ONLY by
+    # Q_GAP, so shrinking it really does pull the questions closer together.
     Q_STYLE = ParagraphStyle(
         "QStyle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
-        textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=14,
+        textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=0,
     )
     OPT_STYLE = ParagraphStyle(
         "OptStyle", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
-        textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=OPT_SPACING,
+        textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=OPT_GAP,
     )
     OPT_CORRECT = ParagraphStyle(
         "OptCorrect", fontName=font_name_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
-        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=OPT_SPACING,
+        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=OPT_GAP,
     )
     WRITTEN_TITLE = ParagraphStyle(
         "WTitle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
-        textColor=colors.HexColor("#1A1A2E"), spaceAfter=4, spaceBefore=14,
+        textColor=colors.HexColor("#1A1A2E"), spaceAfter=4, spaceBefore=0,
     )
     WRITTEN_BODY = ParagraphStyle(
         "WBody", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
@@ -1680,7 +1814,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # whether it's Q1 sitting right below the header, a question
             # opening a later page, or one flowing normally after another on
             # the same page.
-            block.append(Spacer(1, 18))
+            block.append(Spacer(1, Q_GAP))
 
             q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
             # The number sits INLINE, in front of the question text (same line),
@@ -1698,7 +1832,8 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     case_markup = "<br/>".join(
                         pdf_safe_markup(ln, font_name, bold=False) for ln in item["case"].split("\n")
                     )
-                    block.append(Paragraph(case_markup, CASE_STYLE))
+                    block.append(_PageCentered(Paragraph(case_markup, CASE_STYLE), FRAME_LEFT, FRAME_RIGHT, pad=8))
+                    block.append(Spacer(1, 12))
                 block.append(Paragraph(q_num_inline + pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
                 image_paths = ([item["image"]] if item.get("image") else [])
                 image_paths.extend(item.get("additional_images", []))
@@ -1724,12 +1859,27 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
 
             elif item["type"] == "written":
-                block.append(Paragraph(q_num_inline + pdf_safe_markup(item["title"], font_name_bold, bold=True), WRITTEN_TITLE))
+                block.append(Paragraph(q_num_inline + pdf_safe_markup(item.get("title") or "", font_name_bold, bold=True), WRITTEN_TITLE))
+                if item.get("image"):                      # picture that belongs to the QUESTION
+                    try:
+                        block.append(Spacer(1, 6))
+                        block.append(_fit_image(item["image"], max_h=IMG_MAX_H))
+                        block.append(Spacer(1, 6))
+                    except Exception as e:
+                        block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
                 if show_answers:
-                    block.append(Paragraph(
-                        f"{_pdf_marker('✓', font_name_bold, bold=True)}  {pdf_safe_markup(item['content'], font_name_bold, bold=True)}",
-                        WRITTEN_ANSWER,
-                    ))
+                    if item.get("content"):
+                        block.append(Paragraph(
+                            f"{_pdf_marker('✓', font_name_bold, bold=True)}  {pdf_safe_markup(item['content'], font_name_bold, bold=True)}",
+                            WRITTEN_ANSWER,
+                        ))
+                    if item.get("answer_image"):           # spoilered picture = the ANSWER (answered PDF only)
+                        try:
+                            block.append(Spacer(1, 4))
+                            block.append(_fit_image(item["answer_image"], max_h=IMG_MAX_H))
+                            block.append(Spacer(1, 4))
+                        except Exception as e:
+                            block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
                 else:
                     # Answer stays hidden (that's the whole point of the
                     # spoiler) — leave writing space instead.
@@ -1765,7 +1915,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # cover, the PageBreak inserted below goes in front of this, so the title
     # lands on page 2 — the first page that actually carries content.
     if doc_title and str(doc_title).strip():
-        story[0:0] = [_OutlinedTitle(doc_title, base_size=30 * FSCALE), Spacer(1, 4)]
+        story[0:0] = [_PageCentered(_OutlinedTitle(doc_title, base_size=30 * FSCALE), FRAME_LEFT, FRAME_RIGHT), Spacer(1, 4)]
 
     have_cover = bool(cover_image_path and os.path.exists(cover_image_path))
     if have_cover:
@@ -1784,6 +1934,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
             ak_right_margin=_DOC_MARGINS["rightMargin"], ak_top_margin=_DOC_MARGINS["topMargin"],
             ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
+            ak_box_w=AK_BOX_W,
             **kwargs,
         )
 
@@ -1936,6 +2087,52 @@ def make_preview_items(n_short: int = PREVIEW_SHORT_COUNT, n_long: int = PREVIEW
 def preview_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("👁 Preview", callback_data="preview_pdf")]])
 
+# ═══════════════════════════════════════════════════════════════
+# LAYOUT NUMBERS SENT AT ANY TIME — e.g. "14 3 0 0.5 7 0.6 0.1" in the middle
+# of collecting questions replaces the saved layout straight away.
+# ═══════════════════════════════════════════════════════════════
+LAYOUT_CLAMPS = [(4.0, 40.0), (0.5, 10.0), (-15.0, 15.0), (0.0, 5.0), (-2.0, 20.0), (0.0, 4.0), (0.0, 2.0)]
+_LAYOUT_NUM_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
+
+def _layout_numbers_from_text(text: str):
+    """If `text` is nothing but 5–7 layout numbers (a '-' means "keep this one
+    as it is"), returns a list of 7 floats/None; otherwise None so the message
+    is treated as a normal question/case. At least 4 real numbers are needed,
+    so ordinary text can never be mistaken for a layout."""
+    tokens = [t for t in re.split(r"[\s,،]+", text.strip()) if t]
+    if not (5 <= len(tokens) <= 7):
+        return None
+    vals = []
+    for t in tokens:
+        if t == "-":
+            vals.append(None)
+        elif _LAYOUT_NUM_RE.match(t):
+            vals.append(float(t.replace(",", ".")))
+        else:
+            return None
+    if sum(v is not None for v in vals) < 4:
+        return None
+    return vals + [None] * (7 - len(vals))
+
+def _apply_layout_numbers(user_id: int, vals: list) -> list:
+    """Saves the new values (None = keep the current one) and returns the final 7."""
+    current = [
+        PDF_FONT_SIZE.get(user_id, DEFAULT_FONT_SIZE),
+        PDF_TOP_MARGIN_CM.get(user_id, DEFAULT_TOP_MARGIN_CM),
+        PDF_AK_NUDGE_CM.get(user_id, DEFAULT_AK_NUDGE_CM),
+        PDF_AK_WALL_GAP_CM.get(user_id, DEFAULT_AK_WALL_GAP_CM),
+        PDF_AK_UP_NUDGE_CM.get(user_id, DEFAULT_AK_UP_NUDGE_CM),
+        PDF_Q_GAP_CM.get(user_id, DEFAULT_Q_GAP_CM),
+        PDF_OPT_GAP_CM.get(user_id, DEFAULT_OPT_GAP_CM),
+    ]
+    final = []
+    for v, cur, (lo, hi) in zip(vals, current, LAYOUT_CLAMPS):
+        final.append(cur if v is None else max(lo, min(v, hi)))
+    (PDF_FONT_SIZE[user_id], PDF_TOP_MARGIN_CM[user_id], PDF_AK_NUDGE_CM[user_id],
+     PDF_AK_WALL_GAP_CM[user_id], PDF_AK_UP_NUDGE_CM[user_id],
+     PDF_Q_GAP_CM[user_id], PDF_OPT_GAP_CM[user_id]) = final
+    return final
+
 async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: int) -> None:
     """Builds ONE answered-style sample PDF (so the answer-key box and green
     markers are visible) with the user's current settings and sends it.
@@ -1946,6 +2143,8 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
     ak_nudge_cm    = PDF_AK_NUDGE_CM.get(user_id, DEFAULT_AK_NUDGE_CM)
     ak_wall_gap_cm = PDF_AK_WALL_GAP_CM.get(user_id, DEFAULT_AK_WALL_GAP_CM)
     ak_up_nudge_cm = PDF_AK_UP_NUDGE_CM.get(user_id, DEFAULT_AK_UP_NUDGE_CM)
+    q_gap_cm       = PDF_Q_GAP_CM.get(user_id, DEFAULT_Q_GAP_CM)
+    opt_gap_cm     = PDF_OPT_GAP_CM.get(user_id, DEFAULT_OPT_GAP_CM)
     items = make_preview_items()
     try:
         pdf_bytes = await asyncio.to_thread(
@@ -1959,6 +2158,7 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
             top_margin_cm=top_margin_cm, ak_wall_gap_cm=ak_wall_gap_cm,
             ak_up_nudge_cm=ak_up_nudge_cm,
             cover_image_path=PDF_COVER_PATH.get(user_id),
+            q_gap_cm=q_gap_cm, opt_gap_cm=opt_gap_cm,
         )
     except Exception as e:
         print("PREVIEW ERROR:", e)
@@ -1976,7 +2176,8 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
             f"👁 <b>معاينة</b> — {len(items)} سؤال عشوائي ({len(items) - n_long} قصير · {n_long} طويل)\n"
             f"📐 خط <code>{font_size:g}</code> · فوق <code>{top_margin_cm:g}</code> · "
             f"إزاحة <code>{ak_nudge_cm:g}</code> · حافة <code>{ak_wall_gap_cm:g}</code> · "
-            f"رفع <code>{ak_up_nudge_cm:g}</code>"
+            f"رفع <code>{ak_up_nudge_cm:g}</code> · "
+            f"بين الأسئلة <code>{q_gap_cm:g}</code> · بين الاختيارات <code>{opt_gap_cm:g}</code>"
             + ("" if TITLE_FONT_OK else "\n⚠️ خط The Bomb Sound مش موجود — حط ملفه (.ttf) في فولدر fonts/")
         ),
         parse_mode=ParseMode.HTML,
@@ -2160,7 +2361,9 @@ async def _ask_next_clarification(context, user_id: int, chat_id: int):
 # ═══════════════════════════════════════════════════════════════
 def _review_text(item: dict) -> str:
     if item["type"] == "written":
-        return f"📝 <b>{html.escape(item['title'])}</b>\n✅ {html.escape(item['content'])}"
+        title = item.get("title") or ("🖼 (الصورة هي السؤال)" if item.get("image") else "—")
+        ans   = item.get("content") or ("🖼 (الإجابة صورة)" if item.get("answer_image") else "—")
+        return f"📝 <b>{html.escape(title)}</b>\n✅ {html.escape(ans)}"
     lines = [f"❓ {html.escape(item['q'])}"]
     for i, opt in enumerate(item["options"]):
         mark = "  ✅" if i == item.get("correct") else ""
@@ -2402,6 +2605,40 @@ async def _start_bg_step(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply
         ]]),
     )
 
+def _photo_written_item(message, caption: str, img_path: str):
+    """A photo becomes a WRITTEN question when a spoiler is involved — same rule
+    as for text: everything NOT under a spoiler is the question, everything
+    under a spoiler is the (hidden) answer.
+      • caption with spoiler text  → visible caption = question, spoiler text = answer;
+                                      the photo is part of the QUESTION (shown always).
+      • photo itself spoilered     → the photo is part of the ANSWER (printed only in the
+                                      answered PDF); the visible caption is the question.
+    Returns the item dict, or None when no spoiler is involved (or there is no
+    visible question text at all), so the normal image flow applies."""
+    media_spoiler = bool(getattr(message, "has_media_spoiler", False))
+    question, answer = "", ""
+    if caption:
+        mask = _spoiler_mask(caption, getattr(message, "caption_entities", None) or [])
+        if any(mask):
+            qa = extract_written_qa(caption, mask=mask)
+            if qa:
+                question, answer = qa
+            else:                                    # the whole caption is under the spoiler
+                question, answer = "", caption.strip()
+        elif media_spoiler:
+            question = caption.strip()               # visible caption + hidden photo
+        else:
+            return None
+    elif media_spoiler:
+        return None                                  # hidden photo with no text at all: nothing to ask
+    else:
+        return None
+    if not question and media_spoiler:
+        return None                                  # nothing visible would be left to show
+    item = {"type": "written", "title": question, "content": answer}
+    item["answer_image" if media_spoiler else "image"] = img_path
+    return item
+
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -2451,6 +2688,14 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img_path = os.path.join(img_dir, f"img_{photo.file_unique_id}.jpg")
     tg_file  = await context.bot.get_file(photo.file_id)
     await tg_file.download_to_drive(img_path)
+
+    # ── Case 0: a spoiler is involved (spoilered photo and/or spoiler caption)
+    # → a WRITTEN question with the picture. ─────────────────────────
+    written_item = _photo_written_item(update.message, caption, img_path)
+    if written_item:
+        PDF_BUFFER[user_id].append(written_item)
+        await update_progress(context, user_id, update.effective_chat.id)
+        return
 
     # ── Case 1: caption already IS a complete quiz question ─────────
     parsed = parse_mcq_block(caption) if caption else None
@@ -2650,18 +2895,19 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             tokens = [t for t in re.split(r"[\s,،]+", stripped) if t]
 
-        if len(tokens) > 5:
+        if len(tokens) > 7:
             await update.message.reply_text(
-                "⚠️ أقصى حاجة 5 أرقام بس. ابعتهم تاني زي المثال فوق.",
+                "⚠️ أقصى حاجة 7 أرقام بس. ابعتهم تاني زي المثال فوق.",
             )
             return
 
         # Pad with "-" (→ default) for any trailing values left out.
-        tokens += ["-"] * (5 - len(tokens))
+        tokens += ["-"] * (7 - len(tokens))
 
         DEFAULTS = [
             DEFAULT_FONT_SIZE, DEFAULT_TOP_MARGIN_CM,
             DEFAULT_AK_NUDGE_CM, DEFAULT_AK_WALL_GAP_CM, DEFAULT_AK_UP_NUDGE_CM,
+            DEFAULT_Q_GAP_CM, DEFAULT_OPT_GAP_CM,
         ]
         # (min, max) sane clamps so a typo can't blow up the layout or send
         # the answer-key box flying off the page. Font size / top margin /
@@ -2669,7 +2915,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # positive-only; the shift and lift allow negative values (negative
         # shift = push right instead of left, negative lift = push down
         # below the default corner spot instead of up).
-        CLAMPS = [(4.0, 40.0), (0.5, 10.0), (-15.0, 15.0), (0.0, 5.0), (-2.0, 20.0)]
+        CLAMPS = LAYOUT_CLAMPS
 
         parsed = []
         for i, tok in enumerate(tokens):
@@ -2680,21 +2926,42 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 val = float(tok.replace(",", "."))
             except ValueError:
                 await update.message.reply_text(
-                    f"⚠️ '{tok}' مش رقم. ابعت 5 أرقام (أو - للافتراضي) زي المثال فوق.",
+                    f"⚠️ '{tok}' مش رقم. ابعت الأرقام (أو - للافتراضي) زي المثال فوق.",
                 )
                 return
             lo, hi = CLAMPS[i]
             parsed.append(max(lo, min(val, hi)))
 
-        font_size, top_margin_cm, ak_nudge_cm, ak_wall_gap_cm, ak_up_nudge_cm = parsed
+        font_size, top_margin_cm, ak_nudge_cm, ak_wall_gap_cm, ak_up_nudge_cm, q_gap_cm, opt_gap_cm = parsed
         PDF_FONT_SIZE[user_id]      = font_size
         PDF_TOP_MARGIN_CM[user_id] = top_margin_cm
         PDF_AK_NUDGE_CM[user_id]    = ak_nudge_cm
         PDF_AK_WALL_GAP_CM[user_id] = ak_wall_gap_cm
         PDF_AK_UP_NUDGE_CM[user_id] = ak_up_nudge_cm
+        PDF_Q_GAP_CM[user_id]       = q_gap_cm
+        PDF_OPT_GAP_CM[user_id]     = opt_gap_cm
         del AWAITING_LAYOUT[user_id]
         await _finish_pdf_setup(context, user_id, update.message)
         return
+
+    # ── LAYOUT NUMBERS SENT MID-COLLECTION ───────────────────────────
+    # A message that is only 5–7 layout numbers (e.g. "14 3 0 0.5 7 0.6 0.1")
+    # becomes the NEW saved layout, even though questions are already
+    # being collected. "-" or a missing trailing number keeps that value
+    # as it currently is.
+    if user_id in PDF_BUFFER:
+        new_layout = _layout_numbers_from_text(text)
+        if new_layout is not None:
+            f, top, nudge, wall, up, qg, og = _apply_layout_numbers(user_id, new_layout)
+            await update.message.reply_text(
+                "📐 <b>الإعدادات الجديدة اتحفظت</b> (هتتطبق على الـ PDF ده):\n"
+                f"خط <code>{f:g}</code> · فوق <code>{top:g}</code> · إزاحة <code>{nudge:g}</code> · "
+                f"حافة <code>{wall:g}</code> · رفع <code>{up:g}</code>\n"
+                f"بين الأسئلة <code>{qg:g}</code> · بين الاختيارات <code>{og:g}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=preview_keyboard(),
+            )
+            return
 
     if user_id not in PDF_BUFFER:
         await update.message.reply_text(MSG_NOT_IN_SESSION)
@@ -3097,6 +3364,8 @@ def _reset_pdf_session(user_id: int) -> None:
     PDF_TOP_MARGIN_CM.pop(user_id, None)
     PDF_AK_WALL_GAP_CM.pop(user_id, None)
     PDF_AK_UP_NUDGE_CM.pop(user_id, None)
+    PDF_Q_GAP_CM.pop(user_id, None)
+    PDF_OPT_GAP_CM.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     font_path = PDF_FONT_PATH.pop(user_id, None)
     # Only delete it if it's a per-user upload (under FONT_BASE_DIR) — never
@@ -3130,6 +3399,8 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     ak_wall_gap_cm = PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM)
     ak_up_nudge_cm = PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM)
     cover_path     = PDF_COVER_PATH.get(session_id)
+    q_gap_cm       = PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM)
+    opt_gap_cm     = PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM)
 
     import asyncio
     try:
@@ -3140,6 +3411,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             font_size=font_size, top_margin_cm=top_margin_cm,
             ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
             cover_image_path=cover_path,
+            q_gap_cm=q_gap_cm, opt_gap_cm=opt_gap_cm,
         )
         blank_bytes = await asyncio.to_thread(
             build_pdf, items, name, font_path=font_path,
@@ -3148,6 +3420,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             font_size=font_size, top_margin_cm=top_margin_cm,
             ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
             cover_image_path=cover_path,
+            q_gap_cm=q_gap_cm, opt_gap_cm=opt_gap_cm,
         )
     except Exception as e:
         print("PDF ERROR:", e)
