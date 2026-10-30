@@ -62,6 +62,7 @@ from telegram.constants import ParseMode
 
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether, Flowable, PageBreak
 from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_RIGHT
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -232,7 +233,23 @@ def _find_font_file(base_name: str):
             return path
     return None
 
+def _find_ramis_file():
+    """Ramis_Arabic.otf/.ttf — looked up in ./fonts/ first, then next to bot.py."""
+    for d in (FONTS_DIR, BASE_DIR):
+        for base in ("Ramis_Arabic", "RamisArabic", "Ramis-Arabic", "Ramis Arabic"):
+            for ext in (".otf", ".ttf", ".OTF", ".TTF"):
+                p = os.path.join(d, base + ext)
+                if os.path.exists(p):
+                    return p
+    return None
+
 BUNDLED_FONTS = {
+    # FIRST entry = the top button in the font picker. Arabic text is drawn with
+    # this font no matter which preset is chosen (see the RAMIS ARABIC ENGINE).
+    "Ramis Arabic": {
+        "regular": _find_ramis_file(),
+        "bold":    None,          # single weight — bold text reuses the regular face
+    },
     "Comic Sans": {
         "regular": _find_font_file("ComicSans"),
         "bold":    _find_font_file("ComicSans-Bold"),
@@ -760,15 +777,525 @@ def _shape_arabic_hebrew(text: str) -> str:
     logical order with no shaping, so without this Arabic comes out as
     isolated, backwards letters. No-ops (safely) if the libs aren't
     installed or the text has no RTL characters."""
-    if not ARABIC_SHAPING_AVAILABLE:
-        return text
     if not any(("\u0590" <= c <= "\u08FF") or ("\uFB1D" <= c <= "\uFDFF") or ("\uFE70" <= c <= "\uFEFF") for c in text):
+        return text
+    if RAMIS_READY:
+        # Ramis engine (see RAMIS ARABIC ENGINE): joins with the font's own forms.
+        return "\n".join(_rtl_visual_line(line) for line in text.split("\n"))
+    if not ARABIC_SHAPING_AVAILABLE:
         return text
     try:
         # Shape line-by-line so newlines/paragraph structure survive bidi.
         return "\n".join(_bidi_get_display(_arabic_reshaper.reshape(line)) for line in text.split("\n"))
     except Exception:
         return text
+
+# ═══════════════════════════════════════════════════════════════
+# RAMIS ARABIC ENGINE
+# Arabic is ALWAYS drawn with the Ramis Arabic font, whichever font the user
+# picked for the rest of the PDF (Latin text, numbers and symbols keep using
+# the chosen font).
+#
+# Why this block exists: Ramis joins its letters with OpenType GSUB features
+# (init / medi / fina + lam-alef ligatures) and has NO glyphs at the classic
+# "Arabic Presentation Forms" codepoints (U+FE70–FEFC). reportlab has no text
+# shaper, so the old arabic-reshaper approach produced blanks with this font.
+# So at startup we:
+#   1. read the font's GSUB tables with fontTools and write a derived copy in
+#      which every joined glyph ALSO lives at its presentation-form codepoint,
+#   2. join letters ourselves (_ramis_shape) into those codepoints,
+#   3. reorder each LINE right-to-left (_bidi_visual — a compact UAX #9),
+#   4. wrap in LOGICAL order and only then reorder each line, so a multi-line
+#      Arabic paragraph reads in the right order (the old code reordered the
+#      whole text first, which put the END of the sentence on the first line).
+# Needs:  pip install fonttools      (pure Python, a few hundred KB)
+# If fontTools or the font file is missing everything falls back to the old
+# arabic-reshaper path, so the bot never fails to start because of this.
+# ═══════════════════════════════════════════════════════════════
+import unicodedata as _ud
+
+RAMIS_FONT_NAME = "RamisArabic"
+RAMIS_READY     = False
+_RAMIS_JOIN     = {}   # base codepoint -> "D" (joins both sides) / "R" (joins the letter before it only)
+_RAMIS_FORMS    = {}   # (base codepoint, "init"|"medi"|"fina") -> presentation-form codepoint
+_RAMIS_LAMALEF  = {}   # (alef codepoint, joined_to_previous_letter) -> ligature codepoint
+_RAMIS_ALLAH    = None # codepoint of the الله ligature, if the font has it
+
+_RTL_RE = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
+_ALEFS  = {"\u0622", "\u0623", "\u0625", "\u0627"}
+
+def _is_arabic_cp(cp: int) -> bool:
+    return (0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0x08A0 <= cp <= 0x08FF
+            or 0xFB50 <= cp <= 0xFDFF or 0xFE70 <= cp <= 0xFEFF
+            or _RAMIS_PUA[0] <= cp < _RAMIS_PUA[1])
+
+def _unwrap_subtables(lookup):
+    for st in lookup.SubTable:
+        yield getattr(st, "ExtSubTable", st)     # lookup type 7 = extension wrapper
+
+_RAMIS_BUILD_VERSION = "v3"       # bump to force the cached derived font to be rebuilt
+_RAMIS_COMP = {}                  # (base codepoint, (mark codepoints…)) -> private-use codepoint of base+marks glyph
+_RAMIS_PUA  = (0, 0)              # [lo, hi) range those private-use codepoints occupy
+
+def _build_ramis_shaped_font(src: str, dst: str):
+    """Reads Ramis' GSUB/GPOS and writes `dst`: a copy of the font in which
+      • every joined glyph (initial/medial/final, lam-alef, الله) is ALSO reachable at
+        its standard Arabic presentation-form codepoint, and
+      • every (letter + diacritic[s]) pair the font positions with GPOS anchors exists
+        as a ready-made composite glyph (the mark offset to its anchor) at a private-use
+        codepoint — reportlab can't apply GPOS itself, so this is what puts a fatha
+        over the right part of its letter instead of between two letters.
+    The slow part (writing the font) is skipped when a cached copy already exists.
+    Returns the lookup tables the shaper needs."""
+    from fontTools.ttLib import TTFont as _FTFont
+    from fontTools.ttLib.tables._g_l_y_f import Glyph as _Glyph, GlyphComponent as _GComp
+    f = _FTFont(src)
+    cmap = f.getBestCmap()
+    g2c = {}
+    for c, g in cmap.items():
+        g2c.setdefault(g, c)
+    gsub = f["GSUB"].table
+
+    # Lookups used by each feature in the Arabic script (fall back to DFLT).
+    scripts = {s.ScriptTag: s.Script for s in gsub.ScriptList.ScriptRecord}
+    script = scripts.get("arab") or scripts.get("DFLT")
+    lookups_of = {}
+    for i in script.DefaultLangSys.FeatureIndex:
+        rec = gsub.FeatureList.FeatureRecord[i]
+        lookups_of.setdefault(rec.FeatureTag, []).extend(rec.Feature.LookupListIndex)
+
+    def lookups(tag):
+        return [gsub.LookupList.Lookup[li] for li in lookups_of.get(tag, [])]
+
+    def single_map(tag):
+        m = {}
+        for lk in lookups(tag):
+            for st in _unwrap_subtables(lk):
+                m.update(getattr(st, "mapping", None) or {})
+        return m
+
+    def ligatures(tags):
+        out = []                                  # (first glyph, [rest of components], ligature glyph)
+        for tag in tags:
+            for lk in lookups(tag):
+                for st in _unwrap_subtables(lk):
+                    for first, ligs in (getattr(st, "ligatures", {}) or {}).items():
+                        for lig in ligs:
+                            out.append((first, list(lig.Component), lig.LigGlyph))
+        return out
+
+    init_m, medi_m, fina_m = single_map("init"), single_map("medi"), single_map("fina")
+    rlig = ligatures(("rlig", "liga"))
+    ligature = lambda seq: next((lg for first, rest, lg in rlig if [first] + rest == list(seq)), None)
+
+    join = {}
+    for g in init_m:
+        if g in g2c: join[g2c[g]] = "D"
+    for g in fina_m:
+        if g in g2c and g2c[g] not in join: join[g2c[g]] = "R"
+    if 0x0640 in cmap:
+        join[0x0640] = "D"                       # tatweel: joins both sides, looks the same
+
+    add = {}                                     # presentation codepoint -> glyph name
+    forms, lamalef = {}, {}
+    maps = {"init": init_m, "medi": medi_m, "fina": fina_m}
+    for cp in list(range(0xFB50, 0xFE00)) + list(range(0xFE70, 0xFEFD)):
+        d = _ud.decomposition(chr(cp))
+        if not d.startswith("<") or " " not in d:
+            continue
+        tag, *parts = d.split()
+        kind = {"<isolated>": "isol", "<initial>": "init", "<medial>": "medi", "<final>": "fina"}.get(tag)
+        if kind is None:
+            continue
+        if len(parts) == 1:
+            base = int(parts[0], 16)
+            bg = cmap.get(base)
+            if bg is None:
+                continue
+            gname = bg if kind == "isol" else maps[kind].get(bg)
+            if gname:
+                add[cp] = gname
+                if kind != "isol":
+                    forms[(base, kind)] = cp
+        elif len(parts) == 2 and 0xFEF5 <= cp <= 0xFEFC:     # lam + alef ligatures
+            lam, alef = (int(p, 16) for p in parts)
+            lg, ag = cmap.get(lam), cmap.get(alef)
+            if not lg or not ag:
+                continue
+            first = (init_m if kind == "isol" else medi_m).get(lg)
+            second = fina_m.get(ag)
+            gname = ligature([first, second]) if first and second else None
+            if gname:
+                add[cp] = gname
+                lamalef[(chr(alef), kind == "fina")] = cp
+    allah = None
+    seq = [cmap.get(0x0627), init_m.get(cmap.get(0x0644)), medi_m.get(cmap.get(0x0644)), fina_m.get(cmap.get(0x0647))]
+    if all(seq):
+        gname = ligature(seq)
+        if gname:
+            add[0xFDF2] = gname
+            allah = 0xFDF2
+
+    # ── diacritics: GPOS mark-to-base anchors -> composite glyphs ──────────────
+    comp_plan = []                               # (new glyph name, base glyph, mark glyph, dx, dy)
+    comp_tab, pua_range = {}, (0, 0)
+    try:
+        gpos = f["GPOS"].table
+        scripts_p = {s.ScriptTag: s.Script for s in gpos.ScriptList.ScriptRecord}
+        sp = scripts_p.get("arab") or scripts_p.get("DFLT")
+        wanted = set()
+        for i in sp.DefaultLangSys.FeatureIndex:
+            rec = gpos.FeatureList.FeatureRecord[i]
+            if rec.FeatureTag == "mark":
+                wanted.update(rec.Feature.LookupListIndex)
+        attach = []                              # per lookup: (marks{glyph:(cls,x,y)}, bases{glyph:{cls:(x,y)}})
+        for li in sorted(wanted):
+            lk = gpos.LookupList.Lookup[li]
+            for st in _unwrap_subtables(lk):
+                if not hasattr(st, "BaseArray"):
+                    continue
+                marks = {}
+                for gname, rec in zip(st.MarkCoverage.glyphs, st.MarkArray.MarkRecord):
+                    marks[gname] = (rec.Class, rec.MarkAnchor.XCoordinate, rec.MarkAnchor.YCoordinate)
+                bases = {}
+                for gname, rec in zip(st.BaseCoverage.glyphs, st.BaseArray.BaseRecord):
+                    bases[gname] = {c: (a.XCoordinate, a.YCoordinate) for c, a in enumerate(rec.BaseAnchor) if a}
+                attach.append((marks, bases))
+
+        # mark sequences -> the single glyph that draws them (plain marks + GSUB ccmp pairs such as shadda+fatha)
+        mark_cps = [c for c in cmap if 0x064B <= c <= 0x065F or c == 0x0670]
+        seq_glyph = {(c,): cmap[c] for c in mark_cps}
+        for first, rest, lg in ligatures(("ccmp",)):
+            if len(rest) == 1 and first in g2c and rest[0] in g2c:
+                seq_glyph[(g2c[first], g2c[rest[0]])] = lg
+
+        cp2glyph = {c: g for c, g in cmap.items() if 0x0620 <= c <= 0x06FF and _ud.category(chr(c)) != "Mn"}
+        cp2glyph.update(add)
+        made = {}
+        nxt = 0xE000
+        for cp in sorted(cp2glyph):
+            bg = cp2glyph[cp]
+            for seq_cps in sorted(seq_glyph):
+                mg = seq_glyph[seq_cps]
+                key = (bg, mg)
+                if key not in made:
+                    found = None
+                    for marks, bases in attach:
+                        if mg in marks and bg in bases and marks[mg][0] in bases[bg]:
+                            cls, mx, my = marks[mg]
+                            bx, by = bases[bg][cls]
+                            found = (bx - mx, by - my)
+                            break
+                    if not found:
+                        made[key] = None
+                        continue
+                    made[key] = (nxt, f"{bg}.{mg}.att")
+                    comp_plan.append((f"{bg}.{mg}.att", bg, mg, found[0], found[1], nxt))
+                    nxt += 1
+                    if nxt > 0xF8FF:
+                        break
+                if made.get(key):
+                    comp_tab[(cp, seq_cps)] = made[key][0]
+            if nxt > 0xF8FF:
+                break
+        pua_range = (0xE000, nxt)
+    except Exception as e:
+        comp_plan, comp_tab, pua_range = [], {}, (0, 0)
+        print(f"Ramis diacritic positioning skipped ({e})")
+
+    if not os.path.exists(dst):                  # cached copy from an earlier start is reused
+        for t in f["cmap"].tables:
+            if t.isUnicode():
+                for cp, gname in add.items():
+                    t.cmap[cp] = gname
+        if comp_plan:
+            glyf, hmtx, order = f["glyf"], f["hmtx"], f.getGlyphOrder()
+            for name, bg, mg, dx, dy, pua in comp_plan:
+                g = _Glyph()
+                g.numberOfContours = -1
+                comps = []
+                for gn, x, y, flags in ((bg, 0, 0, 0x0002 | 0x0004 | 0x0200), (mg, int(round(dx)), int(round(dy)), 0x0002 | 0x0004)):
+                    c = _GComp()
+                    c.glyphName, c.x, c.y, c.flags = gn, x, y, flags
+                    comps.append(c)
+                g.components = comps
+                glyf.glyphs[name] = g
+                order.append(name)
+                hmtx.metrics[name] = hmtx.metrics[bg]
+                for t in f["cmap"].tables:
+                    if t.isUnicode() and (t.format != 4 or pua <= 0xFFFF):
+                        t.cmap[pua] = name
+            f.setGlyphOrder(order)
+            glyf.setGlyphOrder(order)
+        tmp = dst + ".tmp"
+        f.save(tmp)
+        os.replace(tmp, dst)
+    return join, forms, lamalef, allah, comp_tab, pua_range
+
+def _init_ramis():
+    global RAMIS_READY, _RAMIS_JOIN, _RAMIS_FORMS, _RAMIS_LAMALEF, _RAMIS_ALLAH, _RAMIS_COMP, _RAMIS_PUA
+    src = _find_ramis_file()
+    if not src:
+        print("Ramis Arabic font not found — put Ramis_Arabic.otf in ./fonts/ . "
+              "Arabic will use the fallback fonts.")
+        return
+    try:
+        os.makedirs(FONT_BASE_DIR, exist_ok=True)
+        st = os.stat(src)
+        dst = os.path.join(FONT_BASE_DIR, f"RamisArabic_{_RAMIS_BUILD_VERSION}_{st.st_size}_{int(st.st_mtime)}.ttf")
+        join, forms, lamalef, allah, comp, pua = _build_ramis_shaped_font(src, dst)
+        pdfmetrics.registerFont(TTFont(RAMIS_FONT_NAME, dst))
+        _RAMIS_JOIN, _RAMIS_FORMS, _RAMIS_LAMALEF, _RAMIS_ALLAH, _RAMIS_COMP, _RAMIS_PUA = join, forms, lamalef, allah, comp, pua
+        RAMIS_READY = True
+        print(f"Ramis Arabic loaded: {os.path.basename(src)} "
+              f"({len(join)} joining letters, {len(forms)} joined forms, {pua[1] - pua[0]} positioned diacritic glyphs)")
+    except ImportError:
+        print("Ramis Arabic needs fontTools:  pip install fonttools  — using the fallback Arabic path.")
+    except Exception as e:
+        print(f"Ramis Arabic could not be prepared ({e}) — using the fallback Arabic path.")
+
+_init_ramis()
+
+def _ramis_shape(text: str) -> str:
+    """Logical-order Arabic -> logical-order string where every letter is the
+    presentation-form codepoint of its joined shape (isolated / initial /
+    medial / final), with lam-alef (and الله) ligatures merged. Marks are
+    transparent for joining. Non-Arabic characters pass through untouched."""
+    n = len(text)
+    if not n:
+        return text
+    res = list(text)
+    idx = [i for i, ch in enumerate(text) if _ud.category(ch) != "Mn"]   # joining ignores marks
+    jc = lambda i: _RAMIS_JOIN.get(ord(text[i]))
+    joined_prev = {}
+    for k, i in enumerate(idx):
+        c = jc(i)
+        if not c:
+            continue
+        pj = k > 0 and jc(idx[k - 1]) == "D"
+        nj = c == "D" and k + 1 < len(idx) and jc(idx[k + 1]) in ("D", "R")
+        joined_prev[i] = pj
+        if pj and nj:   form = "medi"
+        elif pj:        form = "fina"
+        elif nj:        form = "init"
+        else:           continue                                   # isolated = the plain letter
+        cp = _RAMIS_FORMS.get((ord(text[i]), form))
+        if cp:
+            res[i] = chr(cp)
+    # Ligatures (on adjacent letters only).
+    for i in range(n - 1):
+        if text[i] == "\u0644" and text[i + 1] in _ALEFS and res[i + 1] != "":
+            cp = _RAMIS_LAMALEF.get((text[i + 1], joined_prev.get(i, False)))
+            if cp:
+                res[i], res[i + 1] = chr(cp), ""
+    if _RAMIS_ALLAH:
+        for i in range(n - 3):
+            if (text[i:i + 4] == "\u0627\u0644\u0644\u0647" and not joined_prev.get(i, False)
+                    and all(res[i + k] != text[i + k] for k in (1, 2, 3))):   # lams + heh took joined shapes
+                res[i], res[i + 1], res[i + 2], res[i + 3] = chr(_RAMIS_ALLAH), "", "", ""
+    # Diacritics: letter + marks -> one pre-positioned glyph (see _build_ramis_shaped_font).
+    if _RAMIS_COMP:
+        for i in range(n):
+            if res[i] == "" or _ud.category(text[i]) == "Mn":
+                continue
+            j, seq = i + 1, []
+            while j < n and _ud.category(text[j]) == "Mn":
+                seq.append(ord(text[j]))
+                j += 1
+            if seq:
+                cp = _RAMIS_COMP.get((ord(res[i]), tuple(seq)))
+                if cp:
+                    res[i] = chr(cp)
+                    for k in range(i + 1, j):
+                        res[k] = ""
+    return "".join(res)
+
+_MIRROR = {"(": ")", ")": "(", "[": "]", "]": "[", "{": "}", "}": "{", "<": ">", ">": "<", "«": "»", "»": "«"}
+
+def _bidi_visual(text: str, base_rtl: bool) -> str:
+    """One line, logical order -> visual (left-to-right drawing) order.
+    A compact implementation of the Unicode bidirectional algorithm (weak types,
+    neutrals, implicit levels, line reordering, bracket mirroring) for text
+    without explicit embedding controls, which normalize_text() already strips."""
+    n = len(text)
+    if n == 0:
+        return text
+    base = 1 if base_rtl else 0
+    sos = "R" if base else "L"
+    lo, hi = _RAMIS_PUA
+    t = [("R" if lo <= ord(c) < hi else _ud.bidirectional(c)) for c in text]
+    prev = sos                                           # W1
+    for i in range(n):
+        if t[i] == "NSM":
+            t[i] = prev
+        prev = t[i]
+    last = sos                                           # W2
+    for i in range(n):
+        if t[i] in ("L", "R", "AL"): last = t[i]
+        elif t[i] == "EN" and last == "AL": t[i] = "AN"
+    t = ["R" if x == "AL" else x for x in t]             # W3
+    for i in range(1, n - 1):                            # W4
+        if t[i] == "ES" and t[i - 1] == "EN" and t[i + 1] == "EN": t[i] = "EN"
+        elif t[i] == "CS":
+            if t[i - 1] == "EN" and t[i + 1] == "EN": t[i] = "EN"
+            elif t[i - 1] == "AN" and t[i + 1] == "AN": t[i] = "AN"
+    i = 0                                                # W5
+    while i < n:
+        if t[i] == "ET":
+            j = i
+            while j < n and t[j] == "ET": j += 1
+            if (i > 0 and t[i - 1] == "EN") or (j < n and t[j] == "EN"):
+                for k in range(i, j): t[k] = "EN"
+            i = j
+        else:
+            i += 1
+    t = ["ON" if x in ("ES", "ET", "CS") else x for x in t]      # W6
+    last = sos                                           # W7
+    for i in range(n):
+        if t[i] in ("L", "R"): last = t[i]
+        elif t[i] == "EN" and last == "L": t[i] = "L"
+    emb = "R" if base else "L"                           # N1 / N2
+    strong = lambda x: "L" if x == "L" else "R"
+    i = 0
+    while i < n:
+        if t[i] not in ("L", "R", "EN", "AN"):
+            j = i
+            while j < n and t[j] not in ("L", "R", "EN", "AN"): j += 1
+            before = strong(t[i - 1]) if i > 0 else sos
+            after = strong(t[j]) if j < n else sos
+            d = before if before == after else emb
+            for k in range(i, j): t[k] = d
+            i = j
+        else:
+            i += 1
+    if base == 0:                                        # I1 / I2
+        lv = [0 if x == "L" else 1 if x == "R" else 2 for x in t]
+    else:
+        lv = [1 if x == "R" else 2 for x in t]
+    order = list(range(n))                               # L2
+    odd = [x for x in lv if x % 2 == 1]
+    if odd:
+        for lvl in range(max(lv), min(odd) - 1, -1):
+            i = 0
+            while i < n:
+                if lv[order[i]] >= lvl:
+                    j = i
+                    while j < n and lv[order[j]] >= lvl: j += 1
+                    order[i:j] = order[i:j][::-1]
+                    i = j
+                else:
+                    i += 1
+    out = []
+    for k in order:
+        ch = text[k]
+        out.append(_MIRROR.get(ch, ch) if lv[k] % 2 == 1 else ch)
+    return "".join(out)
+
+def _para_is_rtl(text: str) -> bool:
+    """Paragraph direction: right-to-left when most words contain Arabic/Hebrew
+    letters (so an Arabic sentence with a few English terms is RTL, while an
+    English sentence with one Arabic word stays LTR)."""
+    rtl = ltr = 0
+    for w in text.split():
+        bc = [_ud.bidirectional(c) for c in w]
+        if "R" in bc or "AL" in bc: rtl += 1
+        elif "L" in bc:            ltr += 1
+    return rtl > 0 and rtl >= ltr
+
+def _pick_font(ch: str, font_name: str, bold: bool):
+    """Which registered font draws `ch`: Ramis for ANY Arabic character (that is the
+    rule), otherwise the active font, otherwise the fallback chain, else None."""
+    if RAMIS_READY and _is_arabic_cp(ord(ch)) and _font_has_glyph(RAMIS_FONT_NAME, ch):
+        return RAMIS_FONT_NAME
+    if _font_has_glyph(font_name, ch):
+        return font_name
+    return _chain_font_for(ch, bold, font_name)
+
+def _visual_width(text: str, font_name: str, bold: bool, size: float) -> float:
+    total = 0.0
+    for ch in text:
+        f = _pick_font(ch, font_name, bold)
+        if f is None:
+            ch, f = _last_resort_char(font_name, bold), font_name
+        try:
+            total += pdfmetrics.stringWidth(ch, f, size)
+        except Exception:
+            total += size * 0.5
+    return total
+
+def _rtl_visual_line(text: str) -> str:
+    """Single un-wrapped line (titles, short labels): shape + reorder."""
+    if not (RAMIS_READY and _RTL_RE.search(text)):
+        return text
+    shaped = " ".join(_ramis_shape(w) for w in text.split(" "))
+    return _bidi_visual(shaped, _para_is_rtl(text))
+
+def rtl_wrap_lines(text: str, font_name: str, bold: bool, size: float, avail: float,
+                   first_avail: float = None, base_rtl: bool = None) -> list:
+    """Greedy word-wrap in LOGICAL order, then shape + reorder every line.
+    Returns (list of visual-order lines, base_rtl). `text` may contain \\n."""
+    space_w = _visual_width(" ", font_name, bold, size)
+    first_avail = avail if first_avail is None else first_avail
+    if base_rtl is None:
+        base_rtl = _para_is_rtl(text)
+    out, first = [], True
+    for para in text.split("\n"):
+        words = [_ramis_shape(w) for w in para.split()]
+        if not words:
+            out.append("")
+            continue
+        cur, cur_w = [], 0.0
+        limit = first_avail if first else avail
+        for w in words:
+            ww = _visual_width(w, font_name, bold, size)
+            if cur and cur_w + space_w + ww > limit:
+                out.append(_bidi_visual(" ".join(cur), base_rtl))
+                first = False
+                limit = avail
+                cur, cur_w = [w], ww
+            else:
+                cur_w = cur_w + (space_w if cur else 0.0) + ww
+                cur.append(w)
+        out.append(_bidi_visual(" ".join(cur), base_rtl))
+        first = False
+    return out, base_rtl
+
+_OPT_LABEL_RE = re.compile(r"^\s*[\(\[]?(?:[A-Za-z]|\d{1,2})[\)\]\.:]\s+")
+
+def rtl_para_markup(text, font_name: str, bold: bool, size: float, avail: float,
+                    lead=(), ltr_pad: str = "", extract_label: bool = False):
+    """Markup for a Paragraph that contains Arabic/Hebrew, wrapped and ordered
+    correctly; returns (markup, is_rtl) or None when the text has no RTL
+    characters (or the engine isn't ready) so the caller uses the normal path.
+
+    `lead` = [(plain_text, markup), ...] pieces that belong at the START of the
+    paragraph in reading order (the Q-number, the ✓ marker): they sit on the
+    LEFT for a left-to-right paragraph and on the RIGHT for an RTL one.
+    `ltr_pad` is extra indent markup used only for LTR paragraphs.
+    `extract_label` peels a leading option label ("A) ") off an RTL paragraph
+    and treats it as a lead piece, so it stays literally "A)" at the right."""
+    if not RAMIS_READY:
+        return None
+    text = normalize_text(text, shape_rtl=False)
+    if not _RTL_RE.search(text):
+        return None
+    pieces = list(lead)
+    body = text
+    m = _OPT_LABEL_RE.match(text) if extract_label else None
+    rtl = _para_is_rtl(text[m.end():] if m else text)
+    if rtl and m:
+        label = m.group(0).strip()
+        pieces += [(label, html.escape(label)), (" ", "&nbsp;")]
+        body = text[m.end():]
+    lead_w = sum(_visual_width(p, font_name, bold, size) for p, _ in pieces)
+    lines, rtl = rtl_wrap_lines(body, font_name, bold, size, avail - 3.0,
+                                first_avail=avail - 3.0 - lead_w, base_rtl=rtl)
+    marked = [_runs_markup(l, font_name, bold) if l else "&nbsp;" for l in lines]
+    if rtl:
+        marked[0] += "".join(h for _, h in reversed(pieces))
+    else:
+        marked[0] = ltr_pad + "".join(h for _, h in pieces) + marked[0]
+    return "<br/>".join(marked), rtl
 
 def _flags_to_codes(text: str) -> str:
     """🇪🇬 is two 'regional indicator' codepoints (U+1F1EA U+1F1EC) that no
@@ -906,7 +1433,13 @@ def pdf_safe_markup(text: str, font_name: str, fallback_name: str = None,
         bold = ("bold" in str(font_name).lower()) or (fallback_name in FALLBACK_CHAIN_BOLD and fallback_name not in FALLBACK_CHAIN)
         if fallback_name and fallback_name == FALLBACK_FONT_NAME_BOLD and fallback_name != FALLBACK_FONT_NAME:
             bold = True
+    return _runs_markup(text, font_name, bold)
 
+def _runs_markup(text: str, font_name: str, bold: bool) -> str:
+    """Already-normalised (and, for RTL, already-ordered) text -> Paragraph markup,
+    one <font> run per stretch drawn by the same font. Arabic characters ALWAYS go
+    to Ramis Arabic (see _pick_font); everything else uses the active font, then
+    the fallback chain, then a harmless placeholder."""
     out, buf, current = [], [], None          # current = fallback font name in use, or None for primary
 
     def flush():
@@ -917,13 +1450,15 @@ def pdf_safe_markup(text: str, font_name: str, fallback_name: str = None,
     for ch in text:
         if ch == "\n":
             target = current                  # newlines ride along with the current run
-        elif _font_has_glyph(font_name, ch):
-            target = None
         else:
-            target = _chain_font_for(ch, bold, font_name)
-            if target is None:                # nothing can draw it → placeholder in primary font
+            f = _pick_font(ch, font_name, bold)
+            if f is None:                     # nothing can draw it → placeholder in primary font
                 ch = _last_resort_char(font_name, bold)
                 target = None
+            elif f == font_name:
+                target = None
+            else:
+                target = f
         if target != current:
             flush()
             if current is not None:
@@ -1163,14 +1698,18 @@ def edit_pick_keyboard(items: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def font_prompt_keyboard() -> InlineKeyboardMarkup:
-    """Preset font buttons (bundled .otf files, see BUNDLED_FONTS) plus
-    Skip — shown alongside the option to just upload a font file instead."""
+    """Preset font buttons (bundled font files, see BUNDLED_FONTS) plus Skip —
+    shown alongside the option to just upload a font file instead. The FIRST
+    preset (Ramis Arabic) gets its own full-width row at the very top; the rest
+    follow two per row. Callback data is the index into BUNDLED_FONTS."""
     names = list(BUNDLED_FONTS.keys())
-    rows  = [
-        [InlineKeyboardButton(names[i], callback_data=f"font_preset:{i}") for i in range(0, 2)],
-        [InlineKeyboardButton(names[i], callback_data=f"font_preset:{i}") for i in range(2, 4)],
-        [InlineKeyboardButton("⏭ Skip", callback_data="font_skip")],
-    ]
+    rows  = []
+    if names:
+        rows.append([InlineKeyboardButton(names[0], callback_data="font_preset:0")])
+    rest = list(range(1, len(names)))
+    for i in range(0, len(rest), 2):
+        rows.append([InlineKeyboardButton(names[j], callback_data=f"font_preset:{j}") for j in rest[i:i + 2]])
+    rows.append([InlineKeyboardButton("⏭ Skip", callback_data="font_skip")])
     return InlineKeyboardMarkup(rows)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1457,12 +1996,19 @@ class _OutlinedTitle(Flowable):
             self.text = normalize_text(text, shape_rtl=True).strip()
         except Exception:
             self.text = str(text).strip()
+        # Logical-order copy for Arabic titles, so a long one can wrap in the right order.
+        try:
+            self._logical = normalize_text(text, shape_rtl=False).strip()
+        except Exception:
+            self._logical = self.text
         self.base_size = base_size
         self.size, self.lines, self.ow, self.leading = base_size, [self.text], 2.0, base_size * 1.2
         self.ow_white = self.ow_black = 1.0
         self._w = self._h = 0
 
     def _font_for(self, ch):
+        if RAMIS_READY and _is_arabic_cp(ord(ch)) and _font_has_glyph(RAMIS_FONT_NAME, ch):
+            return RAMIS_FONT_NAME        # Arabic is always Ramis, even in the title
         if _font_has_glyph(TITLE_FONT, ch):
             return TITLE_FONT
         f = _chain_font_for(ch, True, TITLE_FONT)
@@ -1489,8 +2035,23 @@ class _OutlinedTitle(Flowable):
         return total
 
     def _layout(self, size, avail):
-        # Arabic/Hebrew is already in visual order after shaping — wrapping it
-        # by words would scramble the reading order, so keep it on one line.
+        if RAMIS_READY and _RTL_RE.search(self._logical):
+            # Wrap in LOGICAL order, then reorder each line (Ramis engine).
+            rtl = _para_is_rtl(self._logical)
+            lines, cur = [], []
+            for word in self._logical.split():
+                sw = _ramis_shape(word)
+                trial = " ".join(cur + [sw])
+                if cur and self._width(trial, size) > avail:
+                    lines.append(_bidi_visual(" ".join(cur), rtl))
+                    cur = [sw]
+                else:
+                    cur.append(sw)
+            if cur:
+                lines.append(_bidi_visual(" ".join(cur), rtl))
+            return lines or [""]
+        # Old fallback: Arabic/Hebrew is already in visual order after shaping —
+        # wrapping it by words would scramble the reading order, so keep it on one line.
         if re.search(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]", self.text):
             return [self.text]
         lines, cur = [], ""
@@ -1744,6 +2305,9 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # case box on the PAGE (the card/frame is symmetric about the page centre).
     FRAME_LEFT  = _DOC_MARGINS["leftMargin"]
     FRAME_RIGHT = A4[0] - _DOC_MARGINS["rightMargin"]
+    # Width a flowable is really given: page − margins − the frame's own 6 pt padding on each side.
+    # Arabic paragraphs are line-wrapped by us (in logical order, see rtl_para_markup), so we need it.
+    FRAME_AW    = A4[0] - _DOC_MARGINS["leftMargin"] - _DOC_MARGINS["rightMargin"] - 12
 
     # Images are capped at IMG_MAX_LINES lines of option text (same line height
     # the options use), so they follow the font-size setting and stay small.
@@ -1800,6 +2364,36 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         spaceBefore=8, spaceAfter=6,
     )
 
+    _rtl_styles = {}
+
+    def _rtl_style(style):
+        """Right-aligned twin of a paragraph style (indent moves to the right side)."""
+        st = _rtl_styles.get(style.name)
+        if st is None:
+            st = ParagraphStyle(style.name + "_RTL", parent=style, alignment=TA_RIGHT,
+                                leftIndent=0, rightIndent=style.leftIndent + style.rightIndent)
+            _rtl_styles[style.name] = st
+        return st
+
+    def mk_para(text, style, *, bold, lead=(), ltr_pad="", label=False, avail=None, br=False):
+        """One Paragraph for any piece of text. Text containing Arabic/Hebrew goes through
+        the Ramis engine: wrapped in logical order, every line reordered, right-aligned
+        when the paragraph is mostly RTL (question number / ✓ / "A)" on the right).
+        Everything else is built EXACTLY as before. `lead` = [(plain, markup), …] pieces
+        that start the paragraph; `ltr_pad` = indent markup for left-to-right paragraphs;
+        `label` peels an "A) " option label; `br` keeps line breaks (case box)."""
+        width = (FRAME_AW if avail is None else avail) - style.leftIndent - style.rightIndent
+        res = rtl_para_markup(text, style.fontName, bold, style.fontSize, width,
+                              lead=lead, ltr_pad=ltr_pad, extract_label=label)
+        if res is not None:
+            markup, is_rtl = res
+            return Paragraph(markup, _rtl_style(style) if is_rtl else style)
+        if br:
+            body = "<br/>".join(pdf_safe_markup(ln, style.fontName, bold=bold) for ln in str(text).split("\n"))
+        else:
+            body = pdf_safe_markup(text, style.fontName, bold=bold)
+        return Paragraph(ltr_pad + "".join(h for _, h in lead) + body, style)
+
     def _build_story(page_of_idx):
         """Builds the flowables for the document. `page_of_idx` is a dict
         that _PageRecorder fills in with question_number -> 1-indexed page
@@ -1820,21 +2414,21 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # The number sits INLINE, in front of the question text (same line),
             # instead of on a separate line above it. Image-only items have no
             # question text to sit next to, so they keep the standalone label.
-            q_num_inline = (
-                f'<font color="{Q_NUM_COLOR}">{pdf_safe_markup(q_num_label, font_name_bold, bold=True)}</font>'
-                f'&nbsp;&nbsp;&nbsp;'
-            )
+            q_lead = [
+                (q_num_label, f'<font color="{Q_NUM_COLOR}">{pdf_safe_markup(q_num_label, font_name_bold, bold=True)}</font>'),
+                ("   ", "&nbsp;&nbsp;&nbsp;"),
+            ]
+            ok_lead = [("✓", _pdf_marker('✓', font_name_bold, bold=True)), ("  ", "  ")]
 
             if item["type"] == "mcq":
                 if item.get("case"):
                     # Per-line markup so the case keeps its line breaks and each
                     # character still gets a font that can draw it.
-                    case_markup = "<br/>".join(
-                        pdf_safe_markup(ln, font_name, bold=False) for ln in item["case"].split("\n")
-                    )
-                    block.append(_PageCentered(Paragraph(case_markup, CASE_STYLE), FRAME_LEFT, FRAME_RIGHT, pad=8))
+                    case_w = _PageCentered(None, FRAME_LEFT, FRAME_RIGHT, pad=8)._geometry(FRAME_AW)[1]
+                    block.append(_PageCentered(mk_para(item["case"], CASE_STYLE, bold=False, avail=case_w, br=True),
+                                               FRAME_LEFT, FRAME_RIGHT, pad=8))
                     block.append(Spacer(1, 12))
-                block.append(Paragraph(q_num_inline + pdf_safe_markup(item["q"], font_name_bold, bold=True), Q_STYLE))
+                block.append(mk_para(item["q"], Q_STYLE, bold=True, lead=q_lead))
                 image_paths = ([item["image"]] if item.get("image") else [])
                 image_paths.extend(item.get("additional_images", []))
                 for image_index, image_path in enumerate(image_paths):
@@ -1843,23 +2437,21 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                         block.append(Spacer(1, 6))
                         block.append(img)
                         if image_index == 0 and item.get("image_caption"):
-                            block.append(Paragraph(pdf_safe_markup(item["image_caption"], font_name, bold=False), IMG_CAPTION))
+                            block.append(mk_para(item["image_caption"], IMG_CAPTION, bold=False))
                         else:
                             block.append(Spacer(1, 6))
                     except Exception as e:
                         block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
                 for i, opt in enumerate(item["options"]):
-                    safe_opt = pdf_safe_markup(opt, font_name_bold if (show_answers and i == item["correct"]) else font_name,
-                                               bold=bool(show_answers and i == item["correct"]))
                     if show_answers and i == item["correct"]:
-                        block.append(Paragraph(f"{_pdf_marker('✓', font_name_bold, bold=True)}  {safe_opt}", OPT_CORRECT))
+                        block.append(mk_para(opt, OPT_CORRECT, bold=True, lead=ok_lead, label=True))
                     else:
-                        block.append(Paragraph(f"     {safe_opt}", OPT_STYLE))
+                        block.append(mk_para(opt, OPT_STYLE, bold=False, ltr_pad="     ", label=True))
                 if item.get("correct") is not None:
                     answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
 
             elif item["type"] == "written":
-                block.append(Paragraph(q_num_inline + pdf_safe_markup(item.get("title") or "", font_name_bold, bold=True), WRITTEN_TITLE))
+                block.append(mk_para(item.get("title") or "", WRITTEN_TITLE, bold=True, lead=q_lead))
                 if item.get("image"):                      # picture that belongs to the QUESTION
                     try:
                         block.append(Spacer(1, 6))
@@ -1869,10 +2461,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                         block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
                 if show_answers:
                     if item.get("content"):
-                        block.append(Paragraph(
-                            f"{_pdf_marker('✓', font_name_bold, bold=True)}  {pdf_safe_markup(item['content'], font_name_bold, bold=True)}",
-                            WRITTEN_ANSWER,
-                        ))
+                        block.append(mk_para(item["content"], WRITTEN_ANSWER, bold=True, lead=ok_lead))
                     if item.get("answer_image"):           # spoilered picture = the ANSWER (answered PDF only)
                         try:
                             block.append(Spacer(1, 4))
@@ -1893,8 +2482,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     block.append(Spacer(1, 8))
                     block.append(img)
                     if item.get("caption"):
-                        safe_cap = pdf_safe_markup(item["caption"], font_name, bold=False)
-                        block.append(Paragraph(f"{safe_cap}", IMG_CAPTION))
+                        block.append(mk_para(item["caption"], IMG_CAPTION, bold=False))
                     block.append(Spacer(1, 4))
                 except Exception as e:
                     block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
