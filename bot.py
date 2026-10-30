@@ -8,6 +8,7 @@ import traceback
 import asyncio
 import itertools
 import zlib
+import threading
 from io import BytesIO
 
 # ═══════════════════════════════════════════════════════════════
@@ -241,6 +242,20 @@ def _find_ramis_file():
                 p = os.path.join(d, base + ext)
                 if os.path.exists(p):
                     return p
+    return None
+
+def _find_ramis_weight(keyword: str):
+    """A Ramis Arabic file whose name contains `keyword` (e.g. "medium", "extrabold"),
+    looked up in ./fonts/ first, then next to bot.py. .ttf preferred (reportlab can't embed CFF)."""
+    for d in (FONTS_DIR, BASE_DIR):
+        try:
+            names = sorted(os.listdir(d), key=lambda n: (not n.lower().endswith(".ttf"), n))
+        except Exception:
+            continue
+        for fn in names:
+            low = fn.lower()
+            if "ramis" in low and keyword in low and low.endswith((".ttf", ".otf")):
+                return os.path.join(d, fn)
     return None
 
 BUNDLED_FONTS = {
@@ -814,8 +829,11 @@ def _shape_arabic_hebrew(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 import unicodedata as _ud
 
-RAMIS_FONT_NAME = "RamisArabic"
+RAMIS_FONT_NAME    = "RamisArabic"      # Medium weight — used for the answer CHOICES and everything else
+RAMIS_FONT_NAME_XB = "RamisArabicXB"    # ExtraBold weight — used for the QUESTIONS
 RAMIS_READY     = False
+RAMIS_XB_READY  = False
+_AR_TLS         = threading.local()     # .weight = "md" (default) or "xb"; set per paragraph by mk_para
 _RAMIS_JOIN     = {}   # base codepoint -> "D" (joins both sides) / "R" (joins the letter before it only)
 _RAMIS_FORMS    = {}   # (base codepoint, "init"|"medi"|"fina") -> presentation-form codepoint
 _RAMIS_LAMALEF  = {}   # (alef codepoint, joined_to_previous_letter) -> ligature codepoint
@@ -1033,8 +1051,8 @@ def _build_ramis_shaped_font(src: str, dst: str):
     return join, forms, lamalef, allah, comp_tab, pua_range
 
 def _init_ramis():
-    global RAMIS_READY, _RAMIS_JOIN, _RAMIS_FORMS, _RAMIS_LAMALEF, _RAMIS_ALLAH, _RAMIS_COMP, _RAMIS_PUA
-    src = _find_ramis_file()
+    global RAMIS_READY, RAMIS_XB_READY, _RAMIS_JOIN, _RAMIS_FORMS, _RAMIS_LAMALEF, _RAMIS_ALLAH, _RAMIS_COMP, _RAMIS_PUA
+    src = _find_ramis_weight("medium") or _find_ramis_file()
     if not src:
         print("Ramis Arabic font not found — put Ramis_Arabic.otf in ./fonts/ . "
               "Arabic will use the fallback fonts.")
@@ -1047,8 +1065,29 @@ def _init_ramis():
         pdfmetrics.registerFont(TTFont(RAMIS_FONT_NAME, dst))
         _RAMIS_JOIN, _RAMIS_FORMS, _RAMIS_LAMALEF, _RAMIS_ALLAH, _RAMIS_COMP, _RAMIS_PUA = join, forms, lamalef, allah, comp, pua
         RAMIS_READY = True
-        print(f"Ramis Arabic loaded: {os.path.basename(src)} "
+        print(f"Ramis Arabic (choices) loaded: {os.path.basename(src)} "
               f"({len(join)} joining letters, {len(forms)} joined forms, {pua[1] - pua[0]} positioned diacritic glyphs)")
+        if "medium" not in os.path.basename(src).lower():
+            print("NOTE: no Ramis *Medium* file found in ./fonts/ — choices use "
+                  f"{os.path.basename(src)} instead. Drop e.g. RamisArabic-Medium.ttf in ./fonts/ to use Medium.")
+        # ExtraBold — questions. Same shaping tables as Medium (same design family), verified below.
+        xb_src = _find_ramis_weight("extrabold")
+        if xb_src:
+            try:
+                stx = os.stat(xb_src)
+                dstx = os.path.join(FONT_BASE_DIR, f"RamisArabicXB_{_RAMIS_BUILD_VERSION}_{stx.st_size}_{int(stx.st_mtime)}.ttf")
+                xjoin, xforms, xlam, xallah, xcomp, xpua = _build_ramis_shaped_font(xb_src, dstx)
+                if (xjoin, xforms, xlam, xallah, xcomp, xpua) == (join, forms, lamalef, allah, comp, pua):
+                    pdfmetrics.registerFont(TTFont(RAMIS_FONT_NAME_XB, dstx))
+                    RAMIS_XB_READY = True
+                    print(f"Ramis Arabic (questions) loaded: {os.path.basename(xb_src)}")
+                else:
+                    print("Ramis ExtraBold has different glyph tables than the Medium file — "
+                          "questions will use the Medium weight instead.")
+            except Exception as e:
+                print(f"Ramis ExtraBold could not be prepared ({e}) — questions will use the Medium weight.")
+        else:
+            print("Ramis ExtraBold not found in ./fonts/ — questions will use the same weight as choices.")
     except ImportError:
         print("Ramis Arabic needs fontTools:  pip install fonttools  — using the fallback Arabic path.")
     except Exception as e:
@@ -1205,8 +1244,12 @@ def _para_is_rtl(text: str) -> bool:
 def _pick_font(ch: str, font_name: str, bold: bool):
     """Which registered font draws `ch`: Ramis for ANY Arabic character (that is the
     rule), otherwise the active font, otherwise the fallback chain, else None."""
-    if RAMIS_READY and _is_arabic_cp(ord(ch)) and _font_has_glyph(RAMIS_FONT_NAME, ch):
-        return RAMIS_FONT_NAME
+    if RAMIS_READY and _is_arabic_cp(ord(ch)):
+        if (RAMIS_XB_READY and getattr(_AR_TLS, "weight", "md") == "xb"
+                and _font_has_glyph(RAMIS_FONT_NAME_XB, ch)):
+            return RAMIS_FONT_NAME_XB
+        if _font_has_glyph(RAMIS_FONT_NAME, ch):
+            return RAMIS_FONT_NAME
     if _font_has_glyph(font_name, ch):
         return font_name
     return _chain_font_for(ch, bold, font_name)
@@ -2375,7 +2418,17 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             _rtl_styles[style.name] = st
         return st
 
-    def mk_para(text, style, *, bold, lead=(), ltr_pad="", label=False, avail=None, br=False):
+    def mk_para(text, style, *, bold, lead=(), ltr_pad="", label=False, avail=None, br=False, ar="md"):
+        """Arabic weight: ar="xb" (Ramis ExtraBold) for questions, "md" (Ramis Medium) for
+        choices and everything else. Applies to Arabic characters only."""
+        _AR_TLS.weight = ar
+        try:
+            return _mk_para_inner(text, style, bold=bold, lead=lead, ltr_pad=ltr_pad,
+                                  label=label, avail=avail, br=br)
+        finally:
+            _AR_TLS.weight = "md"
+
+    def _mk_para_inner(text, style, *, bold, lead=(), ltr_pad="", label=False, avail=None, br=False):
         """One Paragraph for any piece of text. Text containing Arabic/Hebrew goes through
         the Ramis engine: wrapped in logical order, every line reordered, right-aligned
         when the paragraph is mostly RTL (question number / ✓ / "A)" on the right).
@@ -2428,7 +2481,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     block.append(_PageCentered(mk_para(item["case"], CASE_STYLE, bold=False, avail=case_w, br=True),
                                                FRAME_LEFT, FRAME_RIGHT, pad=8))
                     block.append(Spacer(1, 12))
-                block.append(mk_para(item["q"], Q_STYLE, bold=True, lead=q_lead))
+                block.append(mk_para(item["q"], Q_STYLE, bold=True, lead=q_lead, ar="xb"))
                 image_paths = ([item["image"]] if item.get("image") else [])
                 image_paths.extend(item.get("additional_images", []))
                 for image_index, image_path in enumerate(image_paths):
@@ -2451,7 +2504,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
 
             elif item["type"] == "written":
-                block.append(mk_para(item.get("title") or "", WRITTEN_TITLE, bold=True, lead=q_lead))
+                block.append(mk_para(item.get("title") or "", WRITTEN_TITLE, bold=True, lead=q_lead, ar="xb"))
                 if item.get("image"):                      # picture that belongs to the QUESTION
                     try:
                         block.append(Spacer(1, 6))
