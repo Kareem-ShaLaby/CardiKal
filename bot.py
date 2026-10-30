@@ -262,8 +262,8 @@ BUNDLED_FONTS = {
     # FIRST entry = the top button in the font picker. Arabic text is drawn with
     # this font no matter which preset is chosen (see the RAMIS ARABIC ENGINE).
     "Ramis Arabic": {
-        "regular": _find_ramis_file(),
-        "bold":    None,          # single weight — bold text reuses the regular face
+        "regular": _find_ramis_weight("medium") or _find_ramis_file(),   # Medium: choices + body text
+        "bold":    _find_ramis_weight("extrabold"),                       # ExtraBold: questions (None → reuse regular)
     },
     "Comic Sans": {
         "regular": _find_font_file("ComicSans"),
@@ -2272,6 +2272,13 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         except Exception as e:
             print(f"Custom PDF font load error: {e} — using default")
 
+    # With the Ramis preset the "bold" face is ExtraBold, meant for QUESTIONS only.
+    # The correct choice / written answer must stay Medium (just green + ✓), so they
+    # use the regular face there instead of the bold one.
+    _ramis_bold = bool(font_bold_path and "ramis" in os.path.basename(font_bold_path).lower()
+                       and font_name_bold != font_name)
+    font_name_choice_bold = font_name if _ramis_bold else font_name_bold
+
     def draw_header(canvas, doc):
         canvas.saveState()
         if bg_image_path and os.path.exists(bg_image_path):
@@ -2370,7 +2377,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         textColor=colors.HexColor("#1A1A2E"), leftIndent=14, spaceAfter=OPT_GAP,
     )
     OPT_CORRECT = ParagraphStyle(
-        "OptCorrect", fontName=font_name_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
+        "OptCorrect", fontName=font_name_choice_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
         textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=OPT_GAP,
     )
     WRITTEN_TITLE = ParagraphStyle(
@@ -2385,7 +2392,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # "answered" PDF, in the same green as a correct MCQ option; the blank
     # PDF gets writing space instead (see the "written" branch below).
     WRITTEN_ANSWER = ParagraphStyle(
-        "WAnswer", fontName=font_name_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
+        "WAnswer", fontName=font_name_choice_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
         textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=6,
     )
     NUM_STYLE = ParagraphStyle(
