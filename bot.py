@@ -258,6 +258,28 @@ def _find_ramis_weight(keyword: str):
                 return os.path.join(d, fn)
     return None
 
+_RAMIS_FILE_CACHE = {}
+
+def _is_ramis_file(path: str) -> bool:
+    """True if the font file at `path` is a Ramis Arabic face — decided by the font's own
+    internal name, so it also recognises a Ramis file uploaded through the bot (which gets
+    saved as plain font.otf / font.ttf and loses its original name)."""
+    if not path:
+        return False
+    key = (path, os.path.getmtime(path) if os.path.exists(path) else 0)
+    if key in _RAMIS_FILE_CACHE:
+        return _RAMIS_FILE_CACHE[key]
+    ok = "ramis" in os.path.basename(path).lower()
+    if not ok:
+        try:
+            from fontTools.ttLib import TTFont as _FT
+            names = _FT(path, lazy=True)["name"].names
+            ok = any("ramis" in n.toUnicode().lower() for n in names if n.nameID in (1, 4, 6, 16))
+        except Exception:
+            ok = False
+    _RAMIS_FILE_CACHE[key] = ok
+    return ok
+
 BUNDLED_FONTS = {
     # FIRST entry = the top button in the font picker. Arabic text is drawn with
     # this font no matter which preset is chosen (see the RAMIS ARABIC ENGINE).
@@ -2260,6 +2282,11 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # reusing the regular file for bold otherwise (e.g. a plain user
     # upload, which never comes with a bold companion).
     font_name, font_name_bold = FONT_NAME, FONT_NAME_BOLD
+    # Ramis picked as the font (preset OR uploaded to the bot): questions get ExtraBold from ./fonts/.
+    if font_path and os.path.exists(font_path) and not (font_bold_path and os.path.exists(font_bold_path)):
+        if _is_ramis_file(font_path):
+            font_bold_path = _find_ramis_weight("extrabold") or font_bold_path
+    print(f"PDF fonts: regular={font_path and os.path.basename(font_path)} bold={font_bold_path and os.path.basename(font_bold_path)}")
     if font_path and os.path.exists(font_path):
         try:
             custom_name = f"CustomFont_{abs(hash(font_path)) % 10**8}"
@@ -2275,7 +2302,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # With the Ramis preset the "bold" face is ExtraBold, meant for QUESTIONS only.
     # The correct choice / written answer must stay Medium (just green + ✓), so they
     # use the regular face there instead of the bold one.
-    _ramis_bold = bool(font_bold_path and "ramis" in os.path.basename(font_bold_path).lower()
+    _ramis_bold = bool(font_bold_path and _is_ramis_file(font_bold_path)
                        and font_name_bold != font_name)
     font_name_choice_bold = font_name if _ramis_bold else font_name_bold
 
