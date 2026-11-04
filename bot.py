@@ -390,6 +390,7 @@ MSG_PDF_EMPTY = "❌ لا يوجد أسئلة محفوظة"
 MSG_EXPORT_EMPTY = "❌ لا يوجد أسئلة محفوظة بعد"
 MSG_EXPORT_GENERATING = "⏳ جاري توليد {kind} لـ {count} عنصر..."
 MSG_PDF_GENERATING = "⏳ جاري توليد PDF لـ {count} عنصر..."
+MSG_DOCX_CAPTION = "📝 {count} سؤال — {name} ({label}) — Word ❤️\n\n <i>{quizzy_line}</i>"
 MSG_PDF_CAPTION = "📄 {count} سؤال — {name} ({label}) ❤️\n\n <i>{quizzy_line}</i>"
 LABEL_ANSWERED = "بالإجابات"
 LABEL_BLANK = "بدون إجابات"
@@ -443,6 +444,7 @@ PDF_TOP_MARGIN_CM      = {}    # user_id -> float, how far the first question st
 PDF_AK_WALL_GAP_CM     = {}    # user_id -> float, how close the answer-key box sits to the page's right edge
 PDF_AK_UP_NUDGE_CM     = {}    # user_id -> float, how many cm the answer-key box is lifted above its default corner spot
 PDF_Q_GAP_CM           = {}    # user_id -> float, space between one question and the next, in cm
+PDF_WRITTEN_SHOW       = {}    # user_id -> bool, show written-question answers in the ANSWERED export (default True)
 PDF_OPT_GAP_CM         = {}    # user_id -> float, space between the options (A/B/C/D) of a question, in cm
 AWAITING_LAYOUT        = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the combined layout numbers
 
@@ -1688,7 +1690,7 @@ async def _render_progress(context, user_id: int, chat_id: int):
     """Replace the progress message so it stays at the end of the chat."""
     items    = PDF_BUFFER.get(user_id, [])
     text     = build_progress_text(items, pending=_pending_summary(user_id))
-    keyboard = export_keyboard()
+    keyboard = export_keyboard(user_id)
     msg_id   = PROGRESS_MSG_ID.get(user_id)
 
     if msg_id:
@@ -1731,13 +1733,19 @@ async def update_progress(context, user_id: int, chat_id: int, latest_label: str
 # ═══════════════════════════════════════════════════════════════
 # KEYBOARD HELPERS
 # ═══════════════════════════════════════════════════════════════
-def export_keyboard():
-    row = [InlineKeyboardButton("📄 Export as PDF", callback_data="gen_pdf")]
+def export_keyboard(user_id: int = None):
+    written_on = PDF_WRITTEN_SHOW.get(user_id, True) if user_id is not None else True
     return InlineKeyboardMarkup([
-        row,
-        [InlineKeyboardButton("👁 Preview", callback_data="preview_pdf")],
-        [InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
-        [InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
+        [InlineKeyboardButton("📄 PDF · ✅ Answered", callback_data="gen_pdf_a"),
+         InlineKeyboardButton("📄 PDF · ⬜ Blank",    callback_data="gen_pdf_b")],
+        [InlineKeyboardButton("📝 DOCX · ✅ Answered", callback_data="gen_docx_a"),
+         InlineKeyboardButton("📝 DOCX · ⬜ Blank",    callback_data="gen_docx_b")],
+        [InlineKeyboardButton("✍️ Written answers: " + ("✅ shown" if written_on else "🙈 hidden"),
+                              callback_data="toggle_written")],
+        [InlineKeyboardButton("👁 Preview", callback_data="preview_pdf"),
+         InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
+        [InlineKeyboardButton("🆕 New session", callback_data="new_session"),
+         InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
 
 def _item_preview_label(item: dict, max_len: int = 40) -> str:
@@ -1810,9 +1818,9 @@ HOW_TO_USE_TEXT = (
     "<b>7) Captioned PDFs</b>\n"
     "Send a PDF file with a full question as its caption.\n\n"
     "<b>8) Export</b>\n"
-    "/pdf_generate — builds a PDF from everything collected so far.\n"
-    "Or use the ✏️ Edit / 📄 Export as PDF / 🗑 Clear buttons "
-    "on the progress message.\n\n"
+    "/pdf_generate — builds a PDF (answered + blank) from everything collected so far. The session is kept.\n"
+    "Or use the buttons on the progress message: 📄 PDF / 📝 DOCX — answered or blank, ✍️ show/hide written answers, 🆕 New session.\n\n"
+    "/docx_generate — same content as an editable Word (.docx) file (answered + blank). The session is kept.\n"
     "/pdf_clear — clears the current session.\n"
     "/cancel — cancels whatever's in progress (session, pending image, setup step).\n"
     "😴 /sleep — mute the bot until /start"
@@ -2270,7 +2278,9 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               ak_up_nudge_cm: float = DEFAULT_AK_UP_NUDGE_CM,
               cover_image_path: str = None,
               q_gap_cm: float = DEFAULT_Q_GAP_CM,
-              opt_gap_cm: float = DEFAULT_OPT_GAP_CM) -> BytesIO:
+              opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
+              page_map_out: dict = None,
+              show_written_answers: bool = True) -> BytesIO:
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
@@ -2546,7 +2556,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                         block.append(Spacer(1, 6))
                     except Exception as e:
                         block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
-                if show_answers:
+                if show_answers and show_written_answers:
                     if item.get("content"):
                         block.append(mk_para(item["content"], WRITTEN_ANSWER, bold=True, lead=ok_lead))
                     if item.get("answer_image"):           # spoilered picture = the ANSWER (answered PDF only)
@@ -2619,8 +2629,578 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         onLaterPages=draw_header,
         canvasmaker=_make_canvas,
     )
+    if page_map_out is not None:
+        page_map_out.update(page_of_idx)
     buffer.seek(0)
     return buffer
+
+# ═══════════════════════════════════════════════════════════════
+# DOCX BUILDER — same items as build_pdf, but as a real, editable Word
+# document (live paragraphs / runs / table, not a drawing). Arabic is NOT
+# pre-shaped here: Word shapes + reorders it natively, we only mark RTL
+# paragraphs. Needs:  pip install python-docx
+# ═══════════════════════════════════════════════════════════════
+_DX_PPR_ORDER = ["w:pStyle", "w:keepNext", "w:keepLines", "w:pageBreakBefore", "w:pBdr",
+                 "w:shd", "w:bidi", "w:spacing", "w:ind", "w:jc"]
+_DX_RPR_ORDER = ["w:rStyle", "w:rFonts", "w:b", "w:bCs", "w:i", "w:iCs", "w:color",
+                 "w:sz", "w:szCs", "w:rtl"]
+
+def _dx_insert(parent, el, order):
+    """Insert `el` into `parent` at its schema-correct position (Word rejects
+    files whose pPr/rPr children are out of order)."""
+    from docx.oxml.ns import qn
+    tag = el.tag
+    idx = [qn(t) for t in order].index(tag)
+    later = {qn(t) for t in order[idx + 1:]}
+    for child in parent:
+        if child.tag in later:
+            child.addprevious(el)
+            return el
+    parent.append(el)
+    return el
+
+def _dx_el(name, **attrs):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    el = OxmlElement(name)
+    for k, v in attrs.items():
+        el.set(qn("w:" + k), str(v))
+    return el
+
+def _dx_clean(text) -> str:
+    import unicodedata
+    if text is None:
+        return ""
+    text = str(text)
+    try:
+        text = unicodedata.normalize("NFC", text)
+    except Exception:
+        pass
+    return _strip_control_and_invisible(text)
+
+def _dx_font_family(font_path: str):
+    """Family name stored inside a .ttf/.otf, so Word uses it if it's installed
+    on the machine that opens the file (fonts are not embedded)."""
+    if not font_path or not os.path.exists(font_path):
+        return None
+    try:
+        from fontTools.ttLib import TTFont as _FT
+        f = _FT(font_path, lazy=True, fontNumber=0)
+        for nid in (16, 1):
+            for rec in f["name"].names:
+                if rec.nameID == nid:
+                    s = rec.toUnicode().strip()
+                    if s:
+                        return s
+    except Exception as e:
+        print(f"DOCX font name read error: {e}")
+    return None
+
+def _dx_set_run(run, *, font, size, bold=False, color=None, rtl=False):
+    rPr = run._r.get_or_add_rPr()
+    _dx_insert(rPr, _dx_el("w:rFonts", ascii=font, hAnsi=font, cs=font, eastAsia=font), _DX_RPR_ORDER)
+    if bold:
+        _dx_insert(rPr, _dx_el("w:b"), _DX_RPR_ORDER)
+        _dx_insert(rPr, _dx_el("w:bCs"), _DX_RPR_ORDER)
+    if color:
+        _dx_insert(rPr, _dx_el("w:color", val=color.lstrip("#")), _DX_RPR_ORDER)
+    half = int(round(size * 2))
+    _dx_insert(rPr, _dx_el("w:sz", val=half), _DX_RPR_ORDER)
+    _dx_insert(rPr, _dx_el("w:szCs", val=half), _DX_RPR_ORDER)
+    if rtl:
+        _dx_insert(rPr, _dx_el("w:rtl"), _DX_RPR_ORDER)
+
+def _dx_image_stream(path: str):
+    """Returns (stream, width_pt, height_pt). Formats Word can't take (webp…) go through PNG."""
+    from PIL import Image as _PILImage
+    with _PILImage.open(path) as im:
+        w, h = im.size
+        fmt = (im.format or "").upper()
+        if fmt in ("JPEG", "PNG", "GIF", "BMP", "TIFF"):
+            return open(path, "rb"), w, h
+        buf = BytesIO()
+        im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB").save(buf, "PNG")
+        buf.seek(0)
+        return buf, w, h
+
+def _dx_make_anchor(run, x_pt=0.0, y_pt=0.0, behind=True, rel_height=1):
+    """Turns the inline picture just added to `run` into a floating one placed at (x, y) points
+    from the PAGE's top-left corner, behind the text (or in front of it when behind=False)."""
+    from lxml import etree
+    WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    inline = run._r.find(".//{%s}inline" % WP)
+    anchor = etree.SubElement(inline.getparent(), "{%s}anchor" % WP, nsmap={"wp": WP})
+    for k, v in dict(distT="0", distB="0", distL="0", distR="0", simplePos="0",
+                     relativeHeight=str(rel_height), behindDoc="1" if behind else "0", locked="0",
+                     layoutInCell="1", allowOverlap="1").items():
+        anchor.set(k, v)
+    sp = etree.SubElement(anchor, "{%s}simplePos" % WP); sp.set("x", "0"); sp.set("y", "0")
+    for axis, val in (("positionH", x_pt), ("positionV", y_pt)):
+        pos = etree.SubElement(anchor, "{%s}%s" % (WP, axis)); pos.set("relativeFrom", "page")
+        off = etree.SubElement(pos, "{%s}posOffset" % WP); off.text = str(int(round(val * 12700)))
+    for child in list(inline):
+        if child.tag == "{%s}extent" % WP:
+            anchor.append(child)
+    ee = etree.SubElement(anchor, "{%s}effectExtent" % WP)
+    for k in ("l", "t", "r", "b"):
+        ee.set(k, "0")
+    etree.SubElement(anchor, "{%s}wrapNone" % WP)
+    for child in list(inline):
+        anchor.append(child)          # docPr, cNvGraphicFramePr, graphic (in order)
+    inline.getparent().remove(inline)
+
+def _dx_picture_run(par, stream, w_pt, h_pt, x_pt, y_pt, behind=True, rel_height=1):
+    from docx.shared import Emu
+    run = par.add_run()
+    run.add_picture(stream, width=Emu(int(w_pt * 12700)), height=Emu(int(h_pt * 12700)))
+    _dx_make_anchor(run, x_pt, y_pt, behind, rel_height)
+    return run
+
+def _dx_page_background(doc, sec, path, skip_first=False):
+    """FALLBACK frame (used only when no page map is known): a full-page picture in the page
+    header. Note Word shows header content faded while you edit the body."""
+    if skip_first:
+        sec.different_first_page_header_footer = True
+    hdr = sec.header
+    hdr.is_linked_to_previous = False
+    p = hdr.paragraphs[0] if hdr.paragraphs else hdr.add_paragraph()
+    p.paragraph_format.space_before = p.paragraph_format.space_after = 0
+    stream, _, _ = _dx_image_stream(path)
+    _dx_picture_run(p, stream, 21.0 * 28.3465, 29.7 * 28.3465, 0, 0)
+
+_DX_TBLPR_ORDER = ["w:tblStyle", "w:tblpPr", "w:tblOverlap", "w:bidiVisual", "w:tblW", "w:tblBorders",
+                   "w:tblLayout", "w:tblCellMar", "w:tblLook"]
+
+def _dx_clipboard_png(n_rows, w_pt, row_h_pt):
+    """The PDF's purple clipboard (board, paper, clip, ruled rows, tick boxes) as a PNG.
+    Returns (BytesIO, img_w_pt, img_h_pt, pad_top_pt, box_h_pt)."""
+    from PIL import Image as _I, ImageDraw
+    S, PAD = 5, 4                                   # 5 px per pt; 4 pt spare above for the clip
+    h = 22 + row_h_pt * n_rows + 10
+    W, H = int(round(w_pt * S)), int(round((h + PAD) * S))
+    im = _I.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    P600, P800, P500 = "#6D28D9", "#4C1D95", "#7C3AED"
+    P400, P300, P200 = "#A78BFA", "#C4B5FD", "#DDD6FE"
+    ty = lambda y: (PAD + h - y) * S                 # PDF y (bottom origin, box-local) -> pixel y
+    tx = lambda x: x * S
+    def rrect(x, y, w, hh, r, fill=None, outline=None, width=1):
+        d.rounded_rectangle((tx(x), ty(y + hh), tx(x + w), ty(y)), radius=r * S, fill=fill, outline=outline, width=int(width * S))
+    rrect(0, 0, w_pt, h, 7, fill=P600)                         # board
+    rrect(5, 5, w_pt - 10, h - 19, 3, fill="#FFFFFF")          # paper
+    cw = 38
+    rrect(w_pt / 2 - cw / 2, h - 13, cw, 15, 4, fill=P200)     # clip
+    rrect(w_pt / 2 - 9, h - 9, 18, 5, 2.5, fill=P800)
+    cx, cy, rr = tx(w_pt / 2), ty(h - 1.5), 2.2 * S
+    d.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), fill=P300)
+    top = h - 19
+    for i in range(n_rows):
+        base = top - row_h_pt * (i + 1) + 5
+        d.line((tx(11), ty(base - 4), tx(w_pt - 11), ty(base - 4)), fill=P200, width=max(1, int(0.7 * S)))
+        rrect(12, base - 1, 9, 9, 2, outline=P400, width=1)    # tick box
+        pts = [(tx(14), ty(base + 3.4)), (tx(16.2), ty(base + 1.3)), (tx(20.5), ty(base + 6.6))]
+        d.line(pts, fill=P600, width=int(1.4 * S), joint="curve")
+        for px, py in (pts[0], pts[-1]):
+            e = 0.7 * S
+            d.ellipse((px - e, py - e, px + e, py + e), fill=P600)
+    buf = BytesIO()
+    im.save(buf, "PNG")
+    buf.seek(0)
+    return buf, w_pt, h + PAD, PAD, h
+
+def _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font):
+    """Clipboard = PNG of the board (behind the text) + a transparent floating table on top
+    holding the editable "N.  Letter" text, row-aligned with the picture's ruled lines."""
+    from docx.shared import Pt
+    from docx.oxml.ns import qn as _qn
+    from reportlab.pdfbase import pdfmetrics as _pm
+    n = len(pairs)
+    stream, iw, ih, pad, box_h = _dx_clipboard_png(n, w, row_h)
+    _dx_picture_run(after_par, stream, iw, ih, x_left, y_top - pad, rel_height=50)
+    num_w = max(_pm.stringWidth(f"{q}.", FONT_NAME_BOLD, 13) for q, _ in pairs)
+    c1, c2 = num_w + 6, max(w - 28 - num_w - 6 - 8, 14)
+    tw = lambda pt: int(round(pt * 20))
+
+    tbl = doc.add_table(rows=n, cols=2)
+    t = tbl._tbl
+    tp = t.tblPr
+    for ch in list(tp):
+        tp.remove(ch)
+    _dx_insert(tp, _dx_el("w:tblpPr", leftFromText=0, rightFromText=0, topFromText=0, bottomFromText=0,
+                          vertAnchor="page", horzAnchor="page",
+                          tblpX=tw(x_left + 28), tblpY=tw(y_top + 18)), _DX_TBLPR_ORDER)
+    _dx_insert(tp, _dx_el("w:tblOverlap", val="overlap"), _DX_TBLPR_ORDER)
+    _dx_insert(tp, _dx_el("w:bidiVisual", val="0"), _DX_TBLPR_ORDER)   # never inherit RTL from an Arabic neighbour
+    _dx_insert(tp, _dx_el("w:tblW", w=tw(c1 + c2), type="dxa"), _DX_TBLPR_ORDER)
+    _dx_insert(tp, _dx_el("w:tblLayout", type="fixed"), _DX_TBLPR_ORDER)
+    mar = _dx_el("w:tblCellMar")
+    for side in ("top", "left", "bottom", "right"):
+        mar.append(_dx_el("w:" + side, w=0, type="dxa"))
+    _dx_insert(tp, mar, _DX_TBLPR_ORDER)
+    for gc, wd in zip(t.tblGrid.findall(_qn("w:gridCol")), (c1, c2)):
+        gc.set(_qn("w:w"), str(tw(wd)))
+    for i, row in enumerate(tbl.rows):
+        row._tr.get_or_add_trPr().append(_dx_el("w:trHeight", val=tw(row_h), hRule="exact"))
+        q, letter = pairs[i]
+        for ci, (cell, wd, txt, col) in enumerate(((row.cells[0], c1, f"{q}.", "7C3AED"),
+                                                     (row.cells[1], c2, str(letter), "2E1065"))):
+            tcPr = cell._tc.get_or_add_tcPr()
+            for ch in list(tcPr):
+                tcPr.remove(ch)
+            tcPr.append(_dx_el("w:tcW", w=tw(wd), type="dxa"))
+            tcPr.append(_dx_el("w:vAlign", val="bottom"))
+            cp = cell.paragraphs[0]
+            cp.paragraph_format.space_before = Pt(0)
+            cp.paragraph_format.space_after = Pt(1)
+            rr = cp.add_run(txt)
+            _dx_set_run(rr, font=font, size=13, bold=True, color=col)
+    after_par._p.addnext(t)
+    return tbl
+
+def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri"):
+    """Floating table = the per-page answer key. Anchored to the paragraph it follows, so it
+    lands on that paragraph's page, at the same spot as the PDF's box (measured from the
+    page's right edge / bottom edge). Fully editable in Word."""
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    CM = 28.3465
+    PAGE_W, PAGE_H = 21.0 * CM, 29.7 * CM
+    if style == "column":
+        lines = [(q, letter) for q, letter in pairs]
+        row_h, w = 0.65 * CM, box_w_pt
+        h = 22 + row_h * len(lines) + 10
+        border, fill, hline = "6D28D9", "FFFFFF", "C4B5FD"
+    else:
+        per_row = 4
+        lines = ["   ".join(f"{n}-{l}" for n, l in pairs[i:i + per_row]) for i in range(0, len(pairs), per_row)]
+        row_h, w = 0.48 * CM + 6, 6.6 * CM
+        h = row_h * len(lines) + 0.6 * CM
+        border, fill, hline = "90A4AE", "F5F7F8", None
+    x_left = PAGE_W - wall_gap_cm * CM - nudge_cm * CM - w
+    y_top = PAGE_H - (2.1 * CM + up_nudge_cm * CM + h)
+    tw = lambda pt: int(round(pt * 20))
+
+    if style == "column":
+        return _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font)
+
+    tbl = doc.add_table(rows=len(lines), cols=1)
+    t = tbl._tbl
+    pPr_old = t.tblPr
+    for ch in list(pPr_old):
+        pPr_old.remove(ch)
+    _dx_insert(pPr_old, _dx_el("w:tblpPr", leftFromText=170, rightFromText=170, topFromText=100,
+                               bottomFromText=100, vertAnchor="page", horzAnchor="page",
+                               tblpX=tw(x_left), tblpY=tw(y_top)), _DX_TBLPR_ORDER)
+    _dx_insert(pPr_old, _dx_el("w:tblOverlap", val="never"), _DX_TBLPR_ORDER)
+    _dx_insert(pPr_old, _dx_el("w:bidiVisual", val="0"), _DX_TBLPR_ORDER)
+    _dx_insert(pPr_old, _dx_el("w:tblW", w=tw(w), type="dxa"), _DX_TBLPR_ORDER)
+    b = _dx_el("w:tblBorders")
+    bsz = 36 if style == "column" else 6
+    for side in ("top", "left", "bottom", "right"):
+        b.append(_dx_el("w:" + side, val="single", sz=bsz, space=0, color=border))
+    if hline:
+        b.append(_dx_el("w:insideH", val="single", sz=4, space=0, color=hline))
+    _dx_insert(pPr_old, b, _DX_TBLPR_ORDER)
+    _dx_insert(pPr_old, _dx_el("w:tblLayout", type="fixed"), _DX_TBLPR_ORDER)
+    mar = _dx_el("w:tblCellMar")
+    for side, v in (("top", 30), ("left", 140), ("bottom", 30), ("right", 100)):
+        mar.append(_dx_el("w:" + side, w=v, type="dxa"))
+    _dx_insert(pPr_old, mar, _DX_TBLPR_ORDER)
+    from docx.oxml.ns import qn as _qn
+    for gc in t.tblGrid.findall(_qn("w:gridCol")):
+        gc.set(_qn("w:w"), str(tw(w)))
+
+    for i, row in enumerate(tbl.rows):
+        trPr = row._tr.get_or_add_trPr()
+        trPr.append(_dx_el("w:trHeight", val=tw(row_h), hRule="atLeast"))
+        cell = row.cells[0]
+        tcPr = cell._tc.get_or_add_tcPr()
+        for ch in list(tcPr):
+            tcPr.remove(ch)
+        tcPr.append(_dx_el("w:tcW", w=tw(w), type="dxa"))
+        tcPr.append(_dx_el("w:shd", val="clear", color="auto", fill=fill))
+        tcPr.append(_dx_el("w:vAlign", val="center"))
+        cp = cell.paragraphs[0]
+        cp.paragraph_format.space_before = cp.paragraph_format.space_after = Pt(0)
+        if style == "column":
+            q, letter = lines[i]
+            for txt, col, bold in (("✓  ", "6D28D9", True), (f"{q}.  ", "7C3AED", True), (str(letter), "2E1065", True)):
+                rr = cp.add_run(txt)
+                _dx_set_run(rr, font="Calibri", size=13, bold=bold, color=col)
+        else:
+            rr = cp.add_run(lines[i])
+            _dx_set_run(rr, font="Calibri", size=10, color="1A1A2E")
+    after_par._p.addnext(t)
+    return tbl
+
+def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
+               show_answers: bool = True, font_size: float = DEFAULT_FONT_SIZE,
+               cover_image_path: str = None, bg_image_path: str = None,
+               top_margin_cm: float = DEFAULT_TOP_MARGIN_CM,
+               page_map: dict = None, ak_style: str = "grouped", ak_nudge_cm: float = 0.0,
+               ak_wall_gap_cm: float = DEFAULT_AK_WALL_GAP_CM,
+               ak_up_nudge_cm: float = DEFAULT_AK_UP_NUDGE_CM,
+               q_gap_cm: float = DEFAULT_Q_GAP_CM,
+               opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
+               show_written_answers: bool = True,
+               **_ignored) -> BytesIO:
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    FS = font_size / DEFAULT_FONT_SIZE
+    FONT = _dx_font_family(font_path) or "Calibri"
+    CM_PT = 28.3465
+    Q_GAP, OPT_GAP = q_gap_cm * CM_PT, opt_gap_cm * CM_PT
+    IMG_MAX_H = IMG_MAX_LINES * 15 * FS
+    DARK, GREEN, GREY, CASE_TXT, WR_TXT = "1A1A2E", "1B5E20", "90A4AE", "2D2A3E", "37474F"
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
+    # Margins mirror build_pdf so Word breaks pages the same way the PDF did
+    ak_style = ak_style if ak_style in ("grouped", "column") else "grouped"
+    _ans = [(i, string.ascii_uppercase[it["correct"]]) for i, it in enumerate(items, 1)
+            if it.get("type") == "mcq" and it.get("correct") is not None]
+    AK_BOX_W = _clipboard_box_width(max([q for q, _ in _ans], default=1), [l for _, l in _ans], FONT_NAME_BOLD)
+    left_cm, right_cm, bottom_cm = LEFT_MARGIN_CM, 2.0, 3.6
+    if ak_style == "column":
+        PW = 21.0 * 28.3465
+        box_left = PW - ak_wall_gap_cm * 28.3465 - ak_nudge_cm * 28.3465 - AK_BOX_W
+        rm = max(MIN_RIGHT_MARGIN_CM * 28.3465, PW - box_left + TEXT_TO_BOX_GAP_CM * 28.3465)
+        rm = min(rm, PW - left_cm * 28.3465 - MIN_TEXT_WIDTH_CM * 28.3465)
+        right_cm, bottom_cm = rm / 28.3465, 2.0
+    sec.left_margin, sec.right_margin = Cm(left_cm), Cm(right_cm)
+    sec.top_margin, sec.bottom_margin = Cm(top_margin_cm), Cm(bottom_cm)
+    doc.core_properties.title = str(doc_title or "questions")
+
+    # Normal style → the chosen font for Latin AND complex scripts (Arabic).
+    normal = doc.styles["Normal"]
+    nrPr = normal.element.get_or_add_rPr()
+    for old in nrPr.findall(_dx_el("w:rFonts").tag):
+        nrPr.remove(old)
+    _dx_insert(nrPr, _dx_el("w:rFonts", ascii=FONT, hAnsi=FONT, cs=FONT, eastAsia=FONT), _DX_RPR_ORDER)
+
+    pend = {"break": False, "box": None, "frame": False}
+    PAGE_W_PT, PAGE_H_PT = 21.0 * CM_PT, 29.7 * CM_PT
+    frame_ok = bool(bg_image_path and os.path.exists(bg_image_path))
+    body_frame = bool(frame_ok and page_map)      # per-page picture behind the text; else header fallback
+
+    def new_par(*, rtl=False, before=0.0, after=0.0, keep_next=False, align=None):
+        p = doc.add_paragraph()
+        if pend["break"]:
+            p.paragraph_format.page_break_before = True
+            pend["break"] = False
+        if pend["frame"]:
+            pend["frame"] = False
+            try:
+                fs_, _, _ = _dx_image_stream(bg_image_path)
+                _dx_picture_run(p, fs_, PAGE_W_PT, PAGE_H_PT, 0, 0)
+            except Exception as e:
+                print(f"DOCX frame error: {e}")
+        pPr = p._p.get_or_add_pPr()
+        if rtl:
+            _dx_insert(pPr, _dx_el("w:bidi"), _DX_PPR_ORDER)
+        pf = p.paragraph_format
+        pf.space_before, pf.space_after = Pt(before), Pt(after)
+        if keep_next:
+            pf.keep_with_next = True
+        if align is not None:
+            p.alignment = align
+        if pend["box"]:
+            _dx_answer_box(doc, p, pend["box"], ak_style, wall_gap_cm=ak_wall_gap_cm,
+                           nudge_cm=ak_nudge_cm, up_nudge_cm=ak_up_nudge_cm, box_w_pt=AK_BOX_W, font=FONT)
+            pend["box"] = None
+        return p
+
+    def add_text(p, text, *, size, bold=False, color=DARK, rtl=False):
+        lines = _dx_clean(text).split("\n")
+        for i, ln in enumerate(lines):
+            r = p.add_run(ln)
+            _dx_set_run(r, font=FONT, size=size, bold=bold, color=color, rtl=rtl)
+            if i < len(lines) - 1:
+                r.add_break()
+
+    def add_image(path, *, keep_next=False, center=False):
+        try:
+            stream, w, h = _dx_image_stream(path)
+            scale = min(PDF_MAX_IMG_WIDTH / w, IMG_MAX_H / h, 1.0)
+            p = new_par(before=4, after=4, keep_next=keep_next,
+                        align=WD_ALIGN_PARAGRAPH.CENTER if center else None)
+            p.add_run().add_picture(stream, width=Pt(w * scale), height=Pt(h * scale))
+            try:
+                stream.close()
+            except Exception:
+                pass
+        except Exception as e:
+            p = new_par(after=4)
+            add_text(p, f"[Image error: {e}]", size=9 * FS, color="B71C1C")
+
+    def lead_runs(p, q_label, *, rtl, marker=False):
+        if marker:
+            add_text(p, "✓  ", size=11 * FS, bold=True, color=GREEN, rtl=rtl)
+        if q_label:
+            add_text(p, q_label + "   ", size=9 * FS * 1.2, bold=True, color=GREY, rtl=rtl)
+
+    # ── cover: full-bleed picture behind the text, anchored to page 1 ──
+    if cover_image_path and os.path.exists(cover_image_path):
+        try:
+            stream, _, _ = _dx_image_stream(cover_image_path)
+            p = new_par()
+            _dx_picture_run(p, stream, PAGE_W_PT, PAGE_H_PT, 0, 0)
+            p.add_run().add_break(WD_BREAK.PAGE)
+        except Exception as e:
+            print(f"DOCX cover error: {e}")
+    if body_frame:
+        pend["frame"] = True          # consumed by the first paragraph of the first content page
+
+    # ── title ───────────────────────────────────────────────
+    if doc_title and str(doc_title).strip():
+        t = _dx_clean(doc_title).strip()
+        p = new_par(rtl=bool(_RTL_RE.search(t)) and _para_is_rtl(t), after=10,
+                    align=WD_ALIGN_PARAGRAPH.CENTER)
+        add_text(p, t, size=26 * FS, bold=True, color="8A2BE2", rtl=bool(_RTL_RE.search(t)))
+
+    # ── page frame: full-page picture anchored behind the text, in the header
+    #    (shows on every page; the cover page, if any, is left clear like the PDF) ──
+    if frame_ok and not body_frame:
+        try:
+            _dx_page_background(doc, sec, bg_image_path, skip_first=bool(cover_image_path and os.path.exists(cover_image_path)))
+        except Exception as e:
+            print(f"DOCX frame error: {e}")
+
+    answer_pairs = []
+    pairs_by_page, first_on_page, content_pages = {}, {}, []
+    if page_map:
+        for q, letter in _ans:
+            if page_map.get(q):
+                pairs_by_page.setdefault(page_map[q], []).append((q, letter))
+        for q in range(1, len(items) + 1):
+            pg = page_map.get(q)
+            if pg and pg not in first_on_page:
+                first_on_page[pg] = q
+        content_pages = sorted(first_on_page)
+
+    for idx, item in enumerate(items, 1):
+        kind = item.get("type")
+        if page_map and page_map.get(idx) and first_on_page.get(page_map[idx]) == idx:
+            pg = page_map[idx]
+            pend["break"] = pg != content_pages[0]       # same page breaks as the PDF
+            if pend["break"] and body_frame:
+                pend["frame"] = True                     # frame picture for this page
+            pend["box"] = pairs_by_page.get(pg)          # this page's own answer box
+        unsure = kind == "mcq" and item.get("correct") is None
+        q_label = f"~Q{idx}" if unsure else f"Q{idx}"
+        first = True   # the first paragraph of each block carries the inter-question gap
+
+        def gap():
+            nonlocal first
+            if first:
+                first = False
+                return Q_GAP
+            return 0.0
+
+        if kind == "mcq":
+            if item.get("case"):
+                case = _dx_clean(item["case"])
+                crtl = bool(_RTL_RE.search(case)) and _para_is_rtl(case)
+                p = new_par(rtl=crtl, before=gap() + 4, after=8, keep_next=True)
+                pPr = p._p.get_or_add_pPr()
+                bdr = _dx_el("w:pBdr")
+                for side in ("top", "left", "bottom", "right"):
+                    bdr.append(_dx_el("w:" + side, val="single", sz=6, space=4, color="C9B8E8"))
+                _dx_insert(pPr, bdr, _DX_PPR_ORDER)
+                _dx_insert(pPr, _dx_el("w:shd", val="clear", color="auto", fill="F5F1FB"), _DX_PPR_ORDER)
+                p.paragraph_format.left_indent = Pt(6)
+                p.paragraph_format.right_indent = Pt(6)
+                add_text(p, case, size=10.5 * FS, color=CASE_TXT, rtl=crtl)
+
+            q = _dx_clean(item.get("q"))
+            qrtl = bool(_RTL_RE.search(q)) and _para_is_rtl(q)
+            p = new_par(rtl=qrtl, before=gap(), after=6, keep_next=True)
+            lead_runs(p, q_label, rtl=qrtl)
+            add_text(p, q, size=12 * FS, bold=True, rtl=qrtl)
+
+            paths = ([item["image"]] if item.get("image") else []) + list(item.get("additional_images", []))
+            for n, path in enumerate(paths):
+                add_image(path, keep_next=True)
+                if n == 0 and item.get("image_caption"):
+                    cap = _dx_clean(item["image_caption"])
+                    crtl = bool(_RTL_RE.search(cap)) and _para_is_rtl(cap)
+                    p = new_par(rtl=crtl, after=6, keep_next=True)
+                    add_text(p, cap, size=9 * FS, color="78909C", rtl=crtl)
+
+            n_opts = len(item["options"])
+            for i, opt in enumerate(item["options"]):
+                o = _dx_clean(opt)
+                ortl = bool(_RTL_RE.search(o)) and _para_is_rtl(_OPT_LABEL_RE.sub("", o, count=1))
+                if ortl:   # LRM after "A)" keeps the label's bracket on its correct side in an RTL line
+                    o = _OPT_LABEL_RE.sub(lambda m: m.group(0).rstrip() + "\u200e ", o, count=1)
+                p = new_par(rtl=ortl, after=OPT_GAP, keep_next=(i < n_opts - 1))
+                p.paragraph_format.left_indent = Pt(14) if not ortl else None
+                p.paragraph_format.right_indent = Pt(14) if ortl else None
+                if show_answers and i == item.get("correct"):
+                    lead_runs(p, "", rtl=ortl, marker=True)
+                    add_text(p, o, size=11 * FS, bold=True, color=GREEN, rtl=ortl)
+                else:
+                    add_text(p, o, size=11 * FS, rtl=ortl)
+            if item.get("correct") is not None:
+                answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
+
+        elif kind == "written":
+            title = _dx_clean(item.get("title"))
+            trtl = bool(_RTL_RE.search(title)) and _para_is_rtl(title)
+            p = new_par(rtl=trtl, before=gap(), after=4, keep_next=True)
+            lead_runs(p, q_label, rtl=trtl)
+            add_text(p, title, size=12 * FS, bold=True, rtl=trtl)
+            if item.get("image"):
+                add_image(item["image"], keep_next=True)
+            if show_answers and show_written_answers:
+                if item.get("content"):
+                    c = _dx_clean(item["content"])
+                    crtl = bool(_RTL_RE.search(c)) and _para_is_rtl(c)
+                    p = new_par(rtl=crtl, after=6)
+                    if not crtl:
+                        p.paragraph_format.left_indent = Pt(14)
+                    lead_runs(p, "", rtl=crtl, marker=True)
+                    add_text(p, c, size=11 * FS, bold=True, color=GREEN, rtl=crtl)
+                if item.get("answer_image"):
+                    add_image(item["answer_image"])
+            else:
+                for _ in range(2):          # writing space in the blank version
+                    new_par(after=10)
+
+        elif kind == "image":
+            p = new_par(before=gap(), after=2, keep_next=True)
+            add_text(p, q_label, size=9 * FS * 1.2, bold=True, color=GREY)
+            add_image(item["path"], keep_next=bool(item.get("caption")))
+            if item.get("caption"):
+                cap = _dx_clean(item["caption"])
+                crtl = bool(_RTL_RE.search(cap)) and _para_is_rtl(cap)
+                p = new_par(rtl=crtl, after=6)
+                add_text(p, cap, size=9 * FS, color="78909C", rtl=crtl)
+
+    # ── answer key (editable table, like the PDF's per-page key) ─────
+    if answer_pairs and not page_map:
+        p = new_par(before=20, after=6, keep_next=True)
+        p.paragraph_format.page_break_before = False
+        add_text(p, "Answer Key", size=14 * FS, bold=True, color="8A2BE2")
+        COLS = 8
+        rows = (len(answer_pairs) + COLS - 1) // COLS
+        tbl = doc.add_table(rows=rows, cols=COLS)
+        tbl.style = "Table Grid"
+        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for n, (q, letter) in enumerate(answer_pairs):
+            cell = tbl.cell(n // COLS, n % COLS)
+            cp = cell.paragraphs[0]
+            cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            add_text(cp, f"{q}-{letter}", size=11 * FS, bold=True)
+
+    out = BytesIO()
+    doc.save(out)
+    out.seek(0)
+    return out
 
 # ═══════════════════════════════════════════════════════════════
 # PREVIEW — sample PDF with random short + long questions, built with the
@@ -3813,7 +4393,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         items = PDF_BUFFER.get(user_id, [])
         await query.edit_message_text(
             build_progress_text(items, pending=_pending_summary(user_id)), parse_mode=ParseMode.HTML,
-            reply_markup=export_keyboard(),
+            reply_markup=export_keyboard(user_id),
         )
         return
 
@@ -3964,19 +4544,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = PDF_BUFFER.get(user_id, [])
     name  = PDF_NAMES.get(user_id, "questions")
 
-    if query.data == "gen_pdf":
+    # (kind, versions): answered = (True,), blank = (False,); the old combined
+    # buttons on previous progress messages still work and send both.
+    _EXPORTS = {
+        "gen_pdf_a":  ("PDF",  (True,)),   "gen_pdf_b":  ("PDF",  (False,)),
+        "gen_docx_a": ("DOCX", (True,)),   "gen_docx_b": ("DOCX", (False,)),
+        "gen_pdf":    ("PDF",  (True, False)), "gen_docx": ("DOCX", (True, False)),
+    }
+    if query.data in _EXPORTS:
+        kind, versions = _EXPORTS[query.data]
         if not items:
             await query.message.reply_text(MSG_EXPORT_EMPTY)
             return
-        await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind="PDF", count=len(items)))
-        await _export_pdf_session(context, query.message, user_id, items, name)
+        label = {(True,): " · answered", (False,): " · blank"}.get(versions, "")
+        await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind=kind + label, count=len(items)))
+        if kind == "PDF":
+            await _export_pdf_session(context, query.message, user_id, items, name, versions)
+        else:
+            await _export_docx_session(context, query.message, user_id, items, name, versions)
+
+    elif query.data == "toggle_written":
+        PDF_WRITTEN_SHOW[user_id] = not PDF_WRITTEN_SHOW.get(user_id, True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=export_keyboard(user_id))
+        except Exception as e:
+            print("toggle_written refresh error:", e)
+
+    elif query.data == "new_session":
+        _reset_cardikal(user_id)
+        _reset_pdf_session(user_id)
+        AWAITING_NAME[user_id] = True
+        await query.message.reply_text(MSG_PDF_ASK_NAME, parse_mode=ParseMode.HTML)
 
     elif query.data == "clear_pdf":
         _reset_pdf_session(user_id)
         await query.message.reply_text(MSG_EXPORT_CLEARED_ALL)
 
 # ═══════════════════════════════════════════════════════════════
-# EXPORT — build+send PDF, then reset the session
+# EXPORT — build+send PDF/DOCX (the session is kept; 🆕 New session starts over)
 # ═══════════════════════════════════════════════════════════════
 async def _ask_ak_style(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
     """Step after background (font → background → answer-key style → nudge
@@ -4041,6 +4646,7 @@ def _reset_pdf_session(user_id: int) -> None:
     PDF_AK_UP_NUDGE_CM.pop(user_id, None)
     PDF_Q_GAP_CM.pop(user_id, None)
     PDF_OPT_GAP_CM.pop(user_id, None)
+    PDF_WRITTEN_SHOW.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     font_path = PDF_FONT_PATH.pop(user_id, None)
     # Only delete it if it's a per-user upload (under FONT_BASE_DIR) — never
@@ -4057,46 +4663,35 @@ def _reset_pdf_session(user_id: int) -> None:
     # across sessions (until /clear_cover, /clear_frame, or a bot restart).
 
 async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
-                               items: list, name: str) -> bool:
-    """Builds the PDF from items and sends TWO versions via
-    message.reply_document — one with correct options marked in green plus
-    the answer key, one with no options marked but still carrying the answer
-    key — then resets the session. Returns False (having already replied
+                               items: list, name: str, versions: tuple = (True, False)) -> bool:
+    """Builds the PDF from items and sends the requested version(s) via
+    message.reply_document — True = answered (correct options in green + answer
+    key), False = blank (nothing marked, answer key still there). The session is
+    KEPT, so you can export again (other version, DOCX…) or keep editing; use the
+    🆕 New session button to start over. Returns False (having already replied
     with the reason) if a build blew up."""
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
-    font_path      = PDF_FONT_PATH.get(session_id)
-    font_bold_path = PDF_FONT_BOLD_PATH.get(session_id)
-    bg_path        = PDF_FRAME_PATH.get(session_id)
-    ak_style       = PDF_AK_STYLE.get(session_id, "grouped")
-    ak_nudge_cm    = PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM)
-    font_size      = PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE)
-    top_margin_cm  = PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM)
-    ak_wall_gap_cm = PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM)
-    ak_up_nudge_cm = PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM)
-    cover_path     = PDF_COVER_PATH.get(session_id)
-    q_gap_cm       = PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM)
-    opt_gap_cm     = PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM)
-
+    kw = dict(
+        font_path=PDF_FONT_PATH.get(session_id),
+        font_bold_path=PDF_FONT_BOLD_PATH.get(session_id),
+        bg_image_path=PDF_FRAME_PATH.get(session_id),
+        ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
+        ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
+        font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
+        top_margin_cm=PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM),
+        ak_wall_gap_cm=PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM),
+        ak_up_nudge_cm=PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM),
+        cover_image_path=PDF_COVER_PATH.get(session_id),
+        q_gap_cm=PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM),
+        opt_gap_cm=PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM),
+        show_written_answers=PDF_WRITTEN_SHOW.get(session_id, True),
+    )
     import asyncio
+    built = []
     try:
-        answered_bytes = await asyncio.to_thread(
-            build_pdf, items, name, font_path=font_path,
-            font_bold_path=font_bold_path, bg_image_path=bg_path,
-            show_answers=True, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
-            font_size=font_size, top_margin_cm=top_margin_cm,
-            ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
-            cover_image_path=cover_path,
-            q_gap_cm=q_gap_cm, opt_gap_cm=opt_gap_cm,
-        )
-        blank_bytes = await asyncio.to_thread(
-            build_pdf, items, name, font_path=font_path,
-            font_bold_path=font_bold_path, bg_image_path=bg_path,
-            show_answers=False, ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
-            font_size=font_size, top_margin_cm=top_margin_cm,
-            ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
-            cover_image_path=cover_path,
-            q_gap_cm=q_gap_cm, opt_gap_cm=opt_gap_cm,
-        )
+        for show in versions:
+            data = await asyncio.to_thread(build_pdf, items, name, show_answers=show, **kw)
+            built.append((show, data))
     except Exception as e:
         print("PDF ERROR:", e)
         traceback.print_exc()
@@ -4105,20 +4700,82 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
             parse_mode=ParseMode.HTML,
         )
         return False
-    await message.reply_document(
-        document=answered_bytes, filename=f"{safe}_answered.pdf",
-        caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_ANSWERED,
-                                        quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-        parse_mode=ParseMode.HTML,
+    for show, data in built:
+        await message.reply_document(
+            document=data, filename=f"{safe}_{'answered' if show else 'blank'}.pdf",
+            caption=MSG_PDF_CAPTION.format(count=len(items), name=name,
+                                            label=LABEL_ANSWERED if show else LABEL_BLANK,
+                                            quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
+    return True
+
+async def _export_docx_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
+                                items: list, name: str, versions: tuple = (True, False)) -> bool:
+    """Builds editable Word (.docx) versions — answered and/or blank — and sends them.
+    Unlike the PDF export this does NOT reset the session, so you can still
+    export the PDF afterwards (or edit/add more). /pdf_clear or a PDF export ends it."""
+    safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
+    kw = dict(
+        font_path=PDF_FONT_PATH.get(session_id),
+        font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
+        cover_image_path=PDF_COVER_PATH.get(session_id),
+        bg_image_path=PDF_FRAME_PATH.get(session_id),
+        top_margin_cm=PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM),
+        q_gap_cm=PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM),
+        opt_gap_cm=PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM),
+        show_written_answers=PDF_WRITTEN_SHOW.get(session_id, True),
     )
-    await message.reply_document(
-        document=blank_bytes, filename=f"{safe}_blank.pdf",
-        caption=MSG_PDF_CAPTION.format(count=len(items), name=name, label=LABEL_BLANK,
-                                        quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
-        parse_mode=ParseMode.HTML,
+    ak_kw = dict(
+        ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
+        ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
+        ak_wall_gap_cm=PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM),
+        ak_up_nudge_cm=PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM),
     )
 
-    _reset_pdf_session(session_id)
+    def _page_map(show_answers: bool):
+        """Runs the PDF layout (same settings) just to learn which page each question
+        lands on, so the Word file can break pages + place the answer box the same way."""
+        pm = {}
+        try:
+            build_pdf(items, name, font_path=kw["font_path"], font_bold_path=PDF_FONT_BOLD_PATH.get(session_id),
+                      bg_image_path=kw["bg_image_path"], show_answers=show_answers,
+                      font_size=kw["font_size"], top_margin_cm=kw["top_margin_cm"],
+                      cover_image_path=kw["cover_image_path"], q_gap_cm=kw["q_gap_cm"],
+                      opt_gap_cm=kw["opt_gap_cm"], page_map_out=pm,
+                      show_written_answers=kw["show_written_answers"], **ak_kw)
+        except Exception as e:
+            print("DOCX page-map error:", e)
+            return None
+        return pm or None
+
+    def _make(show_answers: bool):
+        return build_docx(items, name, show_answers=show_answers,
+                          page_map=_page_map(show_answers), **ak_kw, **kw)
+
+    try:
+        built = []
+        for show in versions:
+            built.append((show, await asyncio.to_thread(_make, show)))
+    except ImportError:
+        await message.reply_text("❌ مكتبة python-docx مش متسطّبة على السيرفر. نزّلها بـ: pip install python-docx")
+        return False
+    except Exception as e:
+        print("DOCX ERROR:", e)
+        traceback.print_exc()
+        await message.reply_text(
+            f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{html.escape(str(e))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+    for show, data in built:
+        await message.reply_document(
+            document=data, filename=f"{safe}_{'answered' if show else 'blank'}.docx",
+            caption=MSG_DOCX_CAPTION.format(count=len(items), name=html.escape(name),
+                                             label=LABEL_ANSWERED if show else LABEL_BLANK,
+                                             quizzy_line=random.choice(QUIZZY_SUCCESS_LINES)),
+            parse_mode=ParseMode.HTML,
+        )
     return True
 
 # ═══════════════════════════════════════════════════════════════
@@ -4140,6 +4797,16 @@ async def pdf_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = PDF_NAMES.get(user_id, "questions")
     await update.message.reply_text(MSG_PDF_GENERATING.format(count=len(items)))
     await _export_pdf_session(context, update.message, user_id, items, name)
+
+async def docx_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    items   = PDF_BUFFER.get(user_id, [])
+    if not items:
+        await update.message.reply_text(MSG_PDF_EMPTY)
+        return
+    name = PDF_NAMES.get(user_id, "questions")
+    await update.message.reply_text(MSG_EXPORT_GENERATING.format(kind="DOCX", count=len(items)))
+    await _export_docx_session(context, update.message, user_id, items, name)
 
 async def pdf_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
@@ -4233,6 +4900,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cardikal_generate — exports the collected cards as an .apkg file",
         "/pdf_start — starts a session collecting questions for a PDF",
         "/pdf_generate — builds a PDF from what you've collected so far",
+        "/docx_generate — builds editable Word (.docx) files from what you've collected so far (session is kept)",
         "/pdf_clear — clears the current session",
         "/pdf_preview — sends a sample PDF (random short + long questions) using your current layout numbers",
         "/set_cover — set a cover page image (remembered until you change it or the bot restarts)",
@@ -4713,6 +5381,16 @@ app = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
     .rate_limiter(AIORateLimiter())
+    # Patient network settings: wait a long time before giving up on a request
+    # (big PDF/DOCX uploads on a slow link used to die with "Timed out").
+    .connect_timeout(30)
+    .read_timeout(180)
+    .write_timeout(180)
+    .pool_timeout(60)
+    .get_updates_connect_timeout(30)
+    .get_updates_read_timeout(60)
+    .get_updates_write_timeout(60)
+    .get_updates_pool_timeout(60)
     .build()
 )
 
@@ -4727,6 +5405,7 @@ app.add_handler(CommandHandler("start_cardikal",      cardikal_start))     # typ
 app.add_handler(CommandHandler("cardikal_generate",   cardikal_generate_cmd))
 app.add_handler(CommandHandler("pdf_start",    pdf_start))
 app.add_handler(CommandHandler("pdf_generate", pdf_generate))
+app.add_handler(CommandHandler("docx_generate", docx_generate))
 app.add_handler(CommandHandler("pdf_clear",    pdf_clear))
 app.add_handler(CommandHandler("pdf_preview",  pdf_preview_cmd))
 app.add_handler(CommandHandler("set_cover",    set_cover_cmd))
