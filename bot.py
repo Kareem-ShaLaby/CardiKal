@@ -2964,7 +2964,10 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     _ans = [(i, string.ascii_uppercase[it["correct"]]) for i, it in enumerate(items, 1)
             if it.get("type") == "mcq" and it.get("correct") is not None]
     AK_BOX_W = _clipboard_box_width(max([q for q, _ in _ans], default=1), [l for _, l in _ans], FONT_NAME_BOLD)
-    left_cm, right_cm, bottom_cm = LEFT_MARGIN_CM, 2.0, 3.6
+    # The PDF adds 6pt of frame padding and its text sits right at the card's edge; in Word that
+    # looked jammed against the left wall, so the DOCX gets extra room (1.2 + 0.8 = 2.0 cm, matching the right side).
+    DOCX_LEFT_EXTRA_CM = 0.8
+    left_cm, right_cm, bottom_cm = LEFT_MARGIN_CM + DOCX_LEFT_EXTRA_CM, 2.0, 3.6
     if ak_style == "column":
         PW = 21.0 * 28.3465
         box_left = PW - ak_wall_gap_cm * 28.3465 - ak_nudge_cm * 28.3465 - AK_BOX_W
