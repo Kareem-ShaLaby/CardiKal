@@ -470,7 +470,8 @@ PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/
 CASE_MIN_CHARS      = 40    # plain text at least this long (and not a question) is treated as a case study
 IMG_MAX_LINES       = 5     # an image may be at most this many lines of text tall (width follows the aspect ratio)
 OPT_SPACING         = 6     # points of space after each MCQ option (was 3)
-Q_NUM_COLOR         = "#90A4AE"   # colour of the inline "Q1" label
+Q_NUM_COLOR         = "#D4A017"   # colour of the inline "Q1" label (gold)
+AK_UPSIDE_DOWN      = True        # answer-key box is drawn rotated 180° (upside down)
 LEFT_MARGIN_CM      = 1.2   # where questions start from the page's left edge (was 2.0)
 AK_COLUMN_BOX_W     = 4.2 * cm   # width of the "column"-style answer-key box (single source of truth)
 TEXT_TO_BOX_GAP_CM  = 0.4   # breathing room between the end of the text lines and the answer-key box
@@ -1826,6 +1827,75 @@ HOW_TO_USE_TEXT = (
     "😴 /sleep — mute the bot until /start"
 )
 
+# ─── AUTO-STRIP OLD NUMBERING / OPTION LABELS ──────────────────────
+# Questions often arrive already numbered ("1.", "1)", "1]", "(1)", "Q1.") and
+# options already lettered ("A)", "a.", "A) A)"). The PDF/DOCX adds its own Q-number
+# and its own "A)", so any old ones are removed at render time (repeated, so
+# "A) A) text" and "1. 2) text" are both cleaned).
+_Q_NUM_STRIP_RE  = re.compile(r"^\s*[\(\[]?(?:[Qq]\s*)?\d{1,3}\s*[\.\)\]\-:]+\s+")
+_OPT_MARK_STRIP_RE = re.compile(r"^\s*[\(\[]?(?:[A-Ea-e\u0623\u0628\u062c\u062f\u0647]|\d{1,2})\s*(?:[\)\]]|[\.:\-](?=\s))\s*")
+
+def strip_q_number(text):
+    if not isinstance(text, str):
+        return text
+    prev = None
+    while prev != text:
+        prev = text
+        text = _Q_NUM_STRIP_RE.sub("", text, count=1)
+    return text
+
+def strip_option_markers(text):
+    if not isinstance(text, str):
+        return text
+    prev = None
+    while prev != text:
+        prev = text
+        new = _OPT_MARK_STRIP_RE.sub("", text, count=1)
+        if new.strip():           # never strip an option down to nothing
+            text = new
+    return text
+
+def normalize_items_for_render(items: list) -> list:
+    """Copies of the items with old question numbers / option letters removed;
+    options get exactly one fresh "A) " label each."""
+    out = []
+    for it in items:
+        it = dict(it)
+        t = it.get("type")
+        if t == "mcq":
+            it["q"] = strip_q_number(it.get("q", ""))
+            it["options"] = [f"{string.ascii_uppercase[i]}) {strip_option_markers(o)}"
+                             for i, o in enumerate(it.get("options", []))]
+        elif t == "written":
+            if it.get("title"):
+                it["title"] = strip_q_number(it["title"])
+        out.append(it)
+    return out
+
+class _DashedSeparator(Flowable):
+    """Thin dashed line between two questions (— — — — —). Skipped when it would
+    land at the very top of a page, so a page never starts with a stray line."""
+    def __init__(self, top_content_y, half_gap, color="#B0BEC5"):
+        super().__init__()
+        self._top, self._half, self._color = top_content_y, half_gap, color
+        self.width, self.height = 0, 2
+    def wrap(self, availWidth, availHeight):
+        self.width = availWidth
+        return availWidth, 2
+    def draw(self):
+        try:
+            if self.canv.absolutePosition(0, 0)[1] > self._top - self._half - 3:
+                return
+        except Exception:
+            pass
+        c = self.canv
+        c.saveState()
+        c.setStrokeColor(colors.HexColor(self._color))
+        c.setLineWidth(1)
+        c.setDash(7, 5)
+        c.line(0, 1, self.width, 1)
+        c.restoreState()
+
 class _PageRecorder(Flowable):
     """Zero-size flowable placed right after every item's content (inside
     the same KeepTogether block, so it always lands on that question's
@@ -1952,6 +2022,8 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         y       = 2.1 * cm + self._ak_up_nudge_cm * cm
 
         self.saveState()
+        if AK_UPSIDE_DOWN:
+            self.translate(x + w / 2, y + h / 2); self.rotate(180); self.translate(-(x + w / 2), -(y + h / 2))
         # board + paper
         self.setFillColor(P600);        self.roundRect(x, y, w, h, 7, stroke=0, fill=1)
         self.setFillColor(colors.white); self.roundRect(x + 5, y + 5, w - 10, h - 19, 3, stroke=0, fill=1)
@@ -2034,6 +2106,9 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             stroke_color = colors.HexColor("#90A4AE")
 
         self.saveState()
+        if AK_UPSIDE_DOWN:
+            cx_, cy_ = x_left + box_w / 2, y_bottom + box_h / 2
+            self.translate(cx_, cy_); self.rotate(180); self.translate(-cx_, -cy_)
         self.setFillColor(fill_color)
         self.setStrokeColor(stroke_color)
         self.setLineWidth(0.75)
@@ -2281,6 +2356,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
               page_map_out: dict = None,
               show_written_answers: bool = True) -> BytesIO:
+    items = normalize_items_for_render(items)
     buffer = BytesIO()
 
     # Custom font: registered under a name unique to this call so two users'
@@ -2434,7 +2510,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     )
     NUM_STYLE = ParagraphStyle(
         "NumStyle", fontName=font_name_bold, fontSize=9 * FSCALE,
-        textColor=colors.HexColor("#90A4AE"), spaceAfter=2,
+        textColor=colors.HexColor(Q_NUM_COLOR), spaceAfter=2,
     )
     IMG_CAPTION = ParagraphStyle(
         "ImgCaption", fontName=font_name, fontSize=9 * FSCALE, leading=12 * FSCALE,
@@ -2505,7 +2581,12 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # whether it's Q1 sitting right below the header, a question
             # opening a later page, or one flowing normally after another on
             # the same page.
-            block.append(Spacer(1, Q_GAP))
+            if idx > 1:
+                block.append(Spacer(1, Q_GAP / 2))
+                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2))
+                block.append(Spacer(1, Q_GAP / 2))
+            else:
+                block.append(Spacer(1, Q_GAP))
 
             q_num_label = f"~Q{idx}" if item.get("type") == "mcq" and item.get("correct") is None else f"Q{idx}"
             # The number sits INLINE, in front of the question text (same line),
@@ -2771,93 +2852,95 @@ def _dx_page_background(doc, sec, path, skip_first=False):
 _DX_TBLPR_ORDER = ["w:tblStyle", "w:tblpPr", "w:tblOverlap", "w:bidiVisual", "w:tblW", "w:tblBorders",
                    "w:tblLayout", "w:tblCellMar", "w:tblLook"]
 
-def _dx_clipboard_png(n_rows, w_pt, row_h_pt):
-    """The PDF's purple clipboard (board, paper, clip, ruled rows, tick boxes) as a PNG.
-    Returns (BytesIO, img_w_pt, img_h_pt, pad_top_pt, box_h_pt)."""
-    from PIL import Image as _I, ImageDraw
-    S, PAD = 5, 4                                   # 5 px per pt; 4 pt spare above for the clip
-    h = 22 + row_h_pt * n_rows + 10
-    W, H = int(round(w_pt * S)), int(round((h + PAD) * S))
-    im = _I.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    P600, P800, P500 = "#6D28D9", "#4C1D95", "#7C3AED"
-    P400, P300, P200 = "#A78BFA", "#C4B5FD", "#DDD6FE"
-    ty = lambda y: (PAD + h - y) * S                 # PDF y (bottom origin, box-local) -> pixel y
-    tx = lambda x: x * S
-    def rrect(x, y, w, hh, r, fill=None, outline=None, width=1):
-        d.rounded_rectangle((tx(x), ty(y + hh), tx(x + w), ty(y)), radius=r * S, fill=fill, outline=outline, width=int(width * S))
-    rrect(0, 0, w_pt, h, 7, fill=P600)                         # board
-    rrect(5, 5, w_pt - 10, h - 19, 3, fill="#FFFFFF")          # paper
-    cw = 38
-    rrect(w_pt / 2 - cw / 2, h - 13, cw, 15, 4, fill=P200)     # clip
-    rrect(w_pt / 2 - 9, h - 9, 18, 5, 2.5, fill=P800)
-    cx, cy, rr = tx(w_pt / 2), ty(h - 1.5), 2.2 * S
-    d.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), fill=P300)
-    top = h - 19
-    for i in range(n_rows):
-        base = top - row_h_pt * (i + 1) + 5
-        d.line((tx(11), ty(base - 4), tx(w_pt - 11), ty(base - 4)), fill=P200, width=max(1, int(0.7 * S)))
-        rrect(12, base - 1, 9, 9, 2, outline=P400, width=1)    # tick box
-        pts = [(tx(14), ty(base + 3.4)), (tx(16.2), ty(base + 1.3)), (tx(20.5), ty(base + 6.6))]
-        d.line(pts, fill=P600, width=int(1.4 * S), joint="curve")
-        for px, py in (pts[0], pts[-1]):
-            e = 0.7 * S
-            d.ellipse((px - e, py - e, px + e, py + e), fill=P600)
-    buf = BytesIO()
-    im.save(buf, "PNG")
-    buf.seek(0)
-    return buf, w_pt, h + PAD, PAD, h
+_DX_SHAPE_ID = itertools.count(5000)
 
-def _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font):
-    """Clipboard = PNG of the board (behind the text) + a transparent floating table on top
-    holding the editable "N.  Letter" text, row-aligned with the picture's ruled lines."""
-    from docx.shared import Pt
-    from docx.oxml.ns import qn as _qn
-    from reportlab.pdfbase import pdfmetrics as _pm
-    n = len(pairs)
-    stream, iw, ih, pad, box_h = _dx_clipboard_png(n, w, row_h)
-    _dx_picture_run(after_par, stream, iw, ih, x_left, y_top - pad, rel_height=50)
-    num_w = max(_pm.stringWidth(f"{q}.", FONT_NAME_BOLD, 13) for q, _ in pairs)
-    c1, c2 = num_w + 6, max(w - 28 - num_w - 6 - 8, 14)
+def _dx_shape(par, x_pt, y_pt, w_pt, h_pt, *, fill, line=None, line_w_pt=0.75, geom="roundRect",
+              radius_pt=0.0, paras_xml="", insets=(0, 0, 0, 0), rot=False, rel_height=10, name="AnswerKey"):
+    """Adds ONE real, editable Word shape (a text box when paras_xml is given) floating at (x, y)
+    points from the page's top-left corner. rot=True turns it 180° — Word rotates the text
+    along with the shape, so no picture is needed. paras_xml = <w:p> elements for the text."""
+    from docx.oxml import parse_xml
+    E = lambda pt: int(round(pt * 12700))
+    sid = next(_DX_SHAPE_ID)
+    adj = ""
+    if geom == "roundRect":
+        adj = f'<a:gd name="adj" fmla="val {int(min(50000, radius_pt / max(1e-6, min(w_pt, h_pt)) * 100000))}"/>'
+    ln = (f'<a:ln w="{E(line_w_pt)}"><a:solidFill><a:srgbClr val="{line}"/></a:solidFill></a:ln>'
+          if line else '<a:ln><a:noFill/></a:ln>')
+    body_l, body_t, body_r, body_b = (E(v) for v in insets)
+    txbx = (f'<wps:txbx><w:txbxContent>{paras_xml}</w:txbxContent></wps:txbx>' if paras_xml else "")
+    xml = (
+        '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:drawing>'
+        f'<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="{rel_height}" '
+        'behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
+        '<wp:simplePos x="0" y="0"/>'
+        f'<wp:positionH relativeFrom="page"><wp:posOffset>{E(x_pt)}</wp:posOffset></wp:positionH>'
+        f'<wp:positionV relativeFrom="page"><wp:posOffset>{E(y_pt)}</wp:posOffset></wp:positionV>'
+        f'<wp:extent cx="{E(w_pt)}" cy="{E(h_pt)}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>'
+        f'<wp:docPr id="{sid}" name="{name} {sid}"/><wp:cNvGraphicFramePr/>'
+        '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+        f'<wps:wsp><wps:cNvSpPr{" txBox=\"1\"" if paras_xml else ""}/>'
+        f'<wps:spPr><a:xfrm{" rot=\"10800000\"" if rot else ""}><a:off x="0" y="0"/><a:ext cx="{E(w_pt)}" cy="{E(h_pt)}"/></a:xfrm>'
+        f'<a:prstGeom prst="{geom}"><a:avLst>{adj}</a:avLst></a:prstGeom>'
+        f'<a:solidFill><a:srgbClr val="{fill}"/></a:solidFill>{ln}</wps:spPr>'
+        f'{txbx}'
+        f'<wps:bodyPr rot="0" vert="horz" wrap="none" lIns="{body_l}" tIns="{body_t}" rIns="{body_r}" bIns="{body_b}" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>'
+        '</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>'
+    )
+    par._p.append(parse_xml(xml))
+
+def _dx_p_xml(runs, *, font, size, line_pt, border_color=None, tab_pts=()):
+    """One <w:p> for a text box. runs = [(text, hex colour, bold), ...]; a text of '\\t' is a tab."""
     tw = lambda pt: int(round(pt * 20))
+    ppr = ""
+    if border_color:
+        ppr += f'<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="0" w:color="{border_color}"/></w:pBdr>'
+    if tab_pts:
+        ppr += "<w:tabs>" + "".join(f'<w:tab w:val="left" w:pos="{tw(t)}"/>' for t in tab_pts) + "</w:tabs>"
+    ppr += f'<w:spacing w:before="0" w:after="0" w:line="{tw(line_pt)}" w:lineRule="exact"/>'
+    out = [f"<w:p><w:pPr>{ppr}</w:pPr>"]
+    for run in runs:
+        text, col, bold = run[:3]
+        rsz = run[3] if len(run) > 3 else size
+        rpr = (f'<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:cs="{font}" w:eastAsia="{font}"/>'
+               + ("<w:b/><w:bCs/>" if bold else "") + f'<w:color w:val="{col}"/>'
+               + f'<w:sz w:val="{int(round(rsz * 2))}"/><w:szCs w:val="{int(round(rsz * 2))}"/>')
+        if text == "\t":
+            out.append(f"<w:r><w:rPr>{rpr}</w:rPr><w:tab/></w:r>")
+        else:
+            out.append(f'<w:r><w:rPr>{rpr}</w:rPr><w:t xml:space="preserve">{html.escape(text)}</w:t></w:r>')
+    out.append("</w:p>")
+    return "".join(out)
 
-    tbl = doc.add_table(rows=n, cols=2)
-    t = tbl._tbl
-    tp = t.tblPr
-    for ch in list(tp):
-        tp.remove(ch)
-    _dx_insert(tp, _dx_el("w:tblpPr", leftFromText=0, rightFromText=0, topFromText=0, bottomFromText=0,
-                          vertAnchor="page", horzAnchor="page",
-                          tblpX=tw(x_left + 28), tblpY=tw(y_top + 18)), _DX_TBLPR_ORDER)
-    _dx_insert(tp, _dx_el("w:tblOverlap", val="overlap"), _DX_TBLPR_ORDER)
-    _dx_insert(tp, _dx_el("w:bidiVisual", val="0"), _DX_TBLPR_ORDER)   # never inherit RTL from an Arabic neighbour
-    _dx_insert(tp, _dx_el("w:tblW", w=tw(c1 + c2), type="dxa"), _DX_TBLPR_ORDER)
-    _dx_insert(tp, _dx_el("w:tblLayout", type="fixed"), _DX_TBLPR_ORDER)
-    mar = _dx_el("w:tblCellMar")
-    for side in ("top", "left", "bottom", "right"):
-        mar.append(_dx_el("w:" + side, w=0, type="dxa"))
-    _dx_insert(tp, mar, _DX_TBLPR_ORDER)
-    for gc, wd in zip(t.tblGrid.findall(_qn("w:gridCol")), (c1, c2)):
-        gc.set(_qn("w:w"), str(tw(wd)))
-    for i, row in enumerate(tbl.rows):
-        row._tr.get_or_add_trPr().append(_dx_el("w:trHeight", val=tw(row_h), hRule="exact"))
-        q, letter = pairs[i]
-        for ci, (cell, wd, txt, col) in enumerate(((row.cells[0], c1, f"{q}.", "7C3AED"),
-                                                     (row.cells[1], c2, str(letter), "2E1065"))):
-            tcPr = cell._tc.get_or_add_tcPr()
-            for ch in list(tcPr):
-                tcPr.remove(ch)
-            tcPr.append(_dx_el("w:tcW", w=tw(wd), type="dxa"))
-            tcPr.append(_dx_el("w:vAlign", val="bottom"))
-            cp = cell.paragraphs[0]
-            cp.paragraph_format.space_before = Pt(0)
-            cp.paragraph_format.space_after = Pt(1)
-            rr = cp.add_run(txt)
-            _dx_set_run(rr, font=font, size=13, bold=True, color=col)
-    after_par._p.addnext(t)
-    return tbl
+def _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font, font_path=None):
+    """Purple clipboard built from real Word shapes (board, paper text box, clip) — the
+    answers are live, editable text. With AK_UPSIDE_DOWN every shape is turned 180° and
+    its position mirrored inside the box, so the whole clipboard (text included) is flipped."""
+    n = len(pairs)
+    h = 22 + row_h * n + 10
+    flip = AK_UPSIDE_DOWN
+    def put(l, t, ew, eh, **kw):
+        # (l, t) = offset of the shape's top-left inside the UNflipped box
+        px, py = (x_left + w - l - ew, y_top + h - t - eh) if flip else (x_left + l, y_top + t)
+        _dx_shape(after_par, px, py, ew, eh, rot=flip, **kw)
 
-def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri"):
+    num_w = max(pdfmetrics.stringWidth(f"{q}.", FONT_NAME_BOLD, 13) for q, _ in pairs)
+    tab1, tab2 = 16.0, 16.0 + num_w + 6
+    paras = "".join(
+        _dx_p_xml([("\u2713", "7C3AED", True, 10), ("\t", "000000", False), (f"{q}.", "7C3AED", True),
+                   ("\t", "000000", False), (str(l), "2E1065", True)],
+                  font=font, size=13, line_pt=row_h, border_color="DDD6FE", tab_pts=(tab1, tab2))
+        for q, l in pairs)
+    put(0, 0, w, h, fill="6D28D9", radius_pt=7, rel_height=10, name="AKBoard")
+    put(5, 14, w - 10, h - 19, fill="FFFFFF", radius_pt=3, rel_height=20, paras_xml=paras,
+        insets=(7, 5, 4, 0), name="AKPaper")
+    put(w / 2 - 19, -2, 38, 15, fill="DDD6FE", radius_pt=4, rel_height=30, name="AKClip")
+    put(w / 2 - 9, 2, 18, 5, fill="4C1D95", radius_pt=2.5, rel_height=40, name="AKClip2")
+
+def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri", font_path=None):
     """Floating table = the per-page answer key. Anchored to the paragraph it follows, so it
     lands on that paragraph's page, at the same spot as the PDF's box (measured from the
     page's right edge / bottom edge). Fully editable in Word."""
@@ -2881,57 +2964,13 @@ def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nu
     tw = lambda pt: int(round(pt * 20))
 
     if style == "column":
-        return _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font)
+        return _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font, font_path)
 
-    tbl = doc.add_table(rows=len(lines), cols=1)
-    t = tbl._tbl
-    pPr_old = t.tblPr
-    for ch in list(pPr_old):
-        pPr_old.remove(ch)
-    _dx_insert(pPr_old, _dx_el("w:tblpPr", leftFromText=170, rightFromText=170, topFromText=100,
-                               bottomFromText=100, vertAnchor="page", horzAnchor="page",
-                               tblpX=tw(x_left), tblpY=tw(y_top)), _DX_TBLPR_ORDER)
-    _dx_insert(pPr_old, _dx_el("w:tblOverlap", val="never"), _DX_TBLPR_ORDER)
-    _dx_insert(pPr_old, _dx_el("w:bidiVisual", val="0"), _DX_TBLPR_ORDER)
-    _dx_insert(pPr_old, _dx_el("w:tblW", w=tw(w), type="dxa"), _DX_TBLPR_ORDER)
-    b = _dx_el("w:tblBorders")
-    bsz = 36 if style == "column" else 6
-    for side in ("top", "left", "bottom", "right"):
-        b.append(_dx_el("w:" + side, val="single", sz=bsz, space=0, color=border))
-    if hline:
-        b.append(_dx_el("w:insideH", val="single", sz=4, space=0, color=hline))
-    _dx_insert(pPr_old, b, _DX_TBLPR_ORDER)
-    _dx_insert(pPr_old, _dx_el("w:tblLayout", type="fixed"), _DX_TBLPR_ORDER)
-    mar = _dx_el("w:tblCellMar")
-    for side, v in (("top", 30), ("left", 140), ("bottom", 30), ("right", 100)):
-        mar.append(_dx_el("w:" + side, w=v, type="dxa"))
-    _dx_insert(pPr_old, mar, _DX_TBLPR_ORDER)
-    from docx.oxml.ns import qn as _qn
-    for gc in t.tblGrid.findall(_qn("w:gridCol")):
-        gc.set(_qn("w:w"), str(tw(w)))
-
-    for i, row in enumerate(tbl.rows):
-        trPr = row._tr.get_or_add_trPr()
-        trPr.append(_dx_el("w:trHeight", val=tw(row_h), hRule="atLeast"))
-        cell = row.cells[0]
-        tcPr = cell._tc.get_or_add_tcPr()
-        for ch in list(tcPr):
-            tcPr.remove(ch)
-        tcPr.append(_dx_el("w:tcW", w=tw(w), type="dxa"))
-        tcPr.append(_dx_el("w:shd", val="clear", color="auto", fill=fill))
-        tcPr.append(_dx_el("w:vAlign", val="center"))
-        cp = cell.paragraphs[0]
-        cp.paragraph_format.space_before = cp.paragraph_format.space_after = Pt(0)
-        if style == "column":
-            q, letter = lines[i]
-            for txt, col, bold in (("✓  ", "6D28D9", True), (f"{q}.  ", "7C3AED", True), (str(letter), "2E1065", True)):
-                rr = cp.add_run(txt)
-                _dx_set_run(rr, font="Calibri", size=13, bold=bold, color=col)
-        else:
-            rr = cp.add_run(lines[i])
-            _dx_set_run(rr, font="Calibri", size=10, color="1A1A2E")
-    after_par._p.addnext(t)
-    return tbl
+    paras = "".join(_dx_p_xml([(ln, "1A1A2E", False)], font=font, size=10, line_pt=row_h) for ln in lines)
+    px, py = x_left, y_top
+    _dx_shape(after_par, px, py, w, h, fill="F5F7F8", line="90A4AE", radius_pt=4, paras_xml=paras,
+              insets=(0.3 * CM, 0.3 * CM, 4, 0), rot=AK_UPSIDE_DOWN, rel_height=10, name="AKBox")
+    return None
 
 def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                show_answers: bool = True, font_size: float = DEFAULT_FONT_SIZE,
@@ -2954,8 +2993,9 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     CM_PT = 28.3465
     Q_GAP, OPT_GAP = q_gap_cm * CM_PT, opt_gap_cm * CM_PT
     IMG_MAX_H = IMG_MAX_LINES * 15 * FS
-    DARK, GREEN, GREY, CASE_TXT, WR_TXT = "1A1A2E", "1B5E20", "90A4AE", "2D2A3E", "37474F"
+    DARK, GREEN, GREY, CASE_TXT, WR_TXT = "1A1A2E", "1B5E20", Q_NUM_COLOR.lstrip("#"), "2D2A3E", "37474F"
 
+    items = normalize_items_for_render(items)
     doc = Document()
     sec = doc.sections[0]
     sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
@@ -3013,7 +3053,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             p.alignment = align
         if pend["box"]:
             _dx_answer_box(doc, p, pend["box"], ak_style, wall_gap_cm=ak_wall_gap_cm,
-                           nudge_cm=ak_nudge_cm, up_nudge_cm=ak_up_nudge_cm, box_w_pt=AK_BOX_W, font=FONT)
+                           nudge_cm=ak_nudge_cm, up_nudge_cm=ak_up_nudge_cm, box_w_pt=AK_BOX_W, font=FONT, font_path=font_path)
             pend["box"] = None
         return p
 
@@ -3093,6 +3133,14 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             if pend["break"] and body_frame:
                 pend["frame"] = True                     # frame picture for this page
             pend["box"] = pairs_by_page.get(pg)          # this page's own answer box
+        _page_first = bool(page_map and page_map.get(idx) and first_on_page.get(page_map[idx]) == idx)
+        if idx > 1 and not _page_first:
+            sp = new_par(before=Q_GAP / 2, after=0)
+            _sp = sp._p.get_or_add_pPr()
+            _b = _dx_el("w:pBdr")
+            _b.append(_dx_el("w:bottom", val="dashed", sz=6, space=1, color="B0BEC5"))
+            _dx_insert(_sp, _b, _DX_PPR_ORDER)
+            sp.paragraph_format.space_after = Pt(Q_GAP / 2)
         unsure = kind == "mcq" and item.get("correct") is None
         q_label = f"~Q{idx}" if unsure else f"Q{idx}"
         first = True   # the first paragraph of each block carries the inter-question gap
