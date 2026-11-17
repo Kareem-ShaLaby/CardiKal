@@ -471,6 +471,7 @@ CASE_MIN_CHARS      = 40    # plain text at least this long (and not a question)
 IMG_MAX_LINES       = 5     # an image may be at most this many lines of text tall (width follows the aspect ratio)
 OPT_SPACING         = 6     # points of space after each MCQ option (was 3)
 Q_NUM_COLOR         = "#D4A017"   # colour of the inline "Q1" label (gold)
+Q_TEXT_COLOR        = "#6D28D9"   # colour of the question text itself (purple)
 AK_UPSIDE_DOWN      = True        # answer-key box is drawn rotated 180° (upside down)
 LEFT_MARGIN_CM      = 1.2   # where questions start from the page's left edge (was 2.0)
 AK_COLUMN_BOX_W     = 4.2 * cm   # width of the "column"-style answer-key box (single source of truth)
@@ -1875,9 +1876,10 @@ def normalize_items_for_render(items: list) -> list:
 class _DashedSeparator(Flowable):
     """Thin dashed line between two questions (— — — — —). Skipped when it would
     land at the very top of a page, so a page never starts with a stray line."""
-    def __init__(self, top_content_y, half_gap, color="#B0BEC5"):
+    def __init__(self, top_content_y, half_gap, frame_left, frame_right, color="#B0BEC5"):
         super().__init__()
         self._top, self._half, self._color = top_content_y, half_gap, color
+        self._fl, self._fr = frame_left, frame_right
         self.width, self.height = 0, 2
     def wrap(self, availWidth, availHeight):
         self.width = availWidth
@@ -1893,7 +1895,14 @@ class _DashedSeparator(Flowable):
         c.setStrokeColor(colors.HexColor(self._color))
         c.setLineWidth(1)
         c.setDash(7, 5)
-        c.line(0, 1, self.width, 1)
+        # centred on the PAGE (like the title), not on the text column, which sits off-centre
+        centre = A4[0] / 2
+        half = min(centre - self._fl, self._fr - centre)
+        if half < 3 * cm:
+            x0, x1 = 0, self.width
+        else:
+            x0, x1 = (centre - half) - self._fl, (centre + half) - self._fl
+        c.line(x0, 1, x1, 1)
         c.restoreState()
 
 class _PageRecorder(Flowable):
@@ -2483,7 +2492,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # Q_GAP, so shrinking it really does pull the questions closer together.
     Q_STYLE = ParagraphStyle(
         "QStyle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
-        textColor=colors.HexColor("#1A1A2E"), spaceAfter=6, spaceBefore=0,
+        textColor=colors.HexColor(Q_TEXT_COLOR), spaceAfter=6, spaceBefore=0,
     )
     OPT_STYLE = ParagraphStyle(
         "OptStyle", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
@@ -2495,7 +2504,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     )
     WRITTEN_TITLE = ParagraphStyle(
         "WTitle", fontName=font_name_bold, fontSize=12 * FSCALE, leading=16 * FSCALE,
-        textColor=colors.HexColor("#1A1A2E"), spaceAfter=4, spaceBefore=0,
+        textColor=colors.HexColor(Q_TEXT_COLOR), spaceAfter=4, spaceBefore=0,
     )
     WRITTEN_BODY = ParagraphStyle(
         "WBody", fontName=font_name, fontSize=11 * FSCALE, leading=15 * FSCALE,
@@ -2583,7 +2592,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # the same page.
             if idx > 1:
                 block.append(Spacer(1, Q_GAP / 2))
-                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2))
+                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2, FRAME_LEFT, FRAME_RIGHT))
                 block.append(Spacer(1, Q_GAP / 2))
             else:
                 block.append(Spacer(1, Q_GAP))
@@ -2873,7 +2882,9 @@ def _dx_shape(par, x_pt, y_pt, w_pt, h_pt, *, fill, line=None, line_w_pt=0.75, g
         '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
         'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
         'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
-        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:drawing>'
+        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
+        '<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>'
         f'<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="{rel_height}" '
         'behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
         '<wp:simplePos x="0" y="0"/>'
@@ -2888,7 +2899,7 @@ def _dx_shape(par, x_pt, y_pt, w_pt, h_pt, *, fill, line=None, line_w_pt=0.75, g
         f'<a:solidFill><a:srgbClr val="{fill}"/></a:solidFill>{ln}</wps:spPr>'
         f'{txbx}'
         f'<wps:bodyPr rot="0" vert="horz" wrap="none" lIns="{body_l}" tIns="{body_t}" rIns="{body_r}" bIns="{body_b}" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>'
-        '</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>'
+        '</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice></mc:AlternateContent></w:r>'
     )
     par._p.append(parse_xml(xml))
 
@@ -3141,6 +3152,11 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             _b.append(_dx_el("w:bottom", val="dashed", sz=6, space=1, color="B0BEC5"))
             _dx_insert(_sp, _b, _DX_PPR_ORDER)
             sp.paragraph_format.space_after = Pt(Q_GAP / 2)
+            _diff = (right_cm - left_cm) * 28.3465      # make the line symmetric about the page centre
+            if _diff > 0:
+                sp.paragraph_format.left_indent = Pt(_diff)
+            elif _diff < 0:
+                sp.paragraph_format.right_indent = Pt(-_diff)
         unsure = kind == "mcq" and item.get("correct") is None
         q_label = f"~Q{idx}" if unsure else f"Q{idx}"
         first = True   # the first paragraph of each block carries the inter-question gap
@@ -3171,7 +3187,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             qrtl = bool(_RTL_RE.search(q)) and _para_is_rtl(q)
             p = new_par(rtl=qrtl, before=gap(), after=6, keep_next=True)
             lead_runs(p, q_label, rtl=qrtl)
-            add_text(p, q, size=12 * FS, bold=True, rtl=qrtl)
+            add_text(p, q, size=12 * FS, bold=True, color=Q_TEXT_COLOR.lstrip("#"), rtl=qrtl)
 
             paths = ([item["image"]] if item.get("image") else []) + list(item.get("additional_images", []))
             for n, path in enumerate(paths):
@@ -3204,7 +3220,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             trtl = bool(_RTL_RE.search(title)) and _para_is_rtl(title)
             p = new_par(rtl=trtl, before=gap(), after=4, keep_next=True)
             lead_runs(p, q_label, rtl=trtl)
-            add_text(p, title, size=12 * FS, bold=True, rtl=trtl)
+            add_text(p, title, size=12 * FS, bold=True, color=Q_TEXT_COLOR.lstrip("#"), rtl=trtl)
             if item.get("image"):
                 add_image(item["image"], keep_next=True)
             if show_answers and show_written_answers:
