@@ -471,7 +471,7 @@ CASE_MIN_CHARS      = 40    # plain text at least this long (and not a question)
 IMG_MAX_LINES       = 5     # an image may be at most this many lines of text tall (width follows the aspect ratio)
 OPT_SPACING         = 6     # points of space after each MCQ option (was 3)
 Q_NUM_COLOR         = "#D4A017"   # colour of the inline "Q1" label (gold)
-Q_TEXT_COLOR        = "#6D28D9"   # colour of the question text itself (purple)
+Q_TEXT_COLOR        = "#5B21B6"   # colour of the question text itself (purple)
 AK_UPSIDE_DOWN      = True        # answer-key box is drawn rotated 180° (upside down)
 LEFT_MARGIN_CM      = 1.2   # where questions start from the page's left edge (was 2.0)
 AK_COLUMN_BOX_W     = 4.2 * cm   # width of the "column"-style answer-key box (single source of truth)
@@ -2861,95 +2861,65 @@ def _dx_page_background(doc, sec, path, skip_first=False):
 _DX_TBLPR_ORDER = ["w:tblStyle", "w:tblpPr", "w:tblOverlap", "w:bidiVisual", "w:tblW", "w:tblBorders",
                    "w:tblLayout", "w:tblCellMar", "w:tblLook"]
 
-_DX_SHAPE_ID = itertools.count(5000)
+# Word can't rotate table text, and floating shapes / text boxes don't show in every Word
+# app, so the upside-down answer box is built as an ordinary table that is ALREADY turned
+# around: row order reversed, column order reversed, right-aligned, and every character
+# replaced by its upside-down look-alike.
+_DX_FLIP = {"A": "\u2200", "B": "\u157A", "C": "\u0186", "D": "\u15E1", "E": "\u018E", "F": "\u2132",
+            "0": "0", "1": "\u0196", "2": "\u1105", "3": "\u0190", "4": "\u3123", "5": "\u03DB",
+            "6": "9", "7": "\u3125", "8": "8", "9": "6", ".": "\u02D9", "-": "-", " ": " "}
 
-def _dx_shape(par, x_pt, y_pt, w_pt, h_pt, *, fill, line=None, line_w_pt=0.75, geom="roundRect",
-              radius_pt=0.0, paras_xml="", insets=(0, 0, 0, 0), rot=False, rel_height=10, name="AnswerKey"):
-    """Adds ONE real, editable Word shape (a text box when paras_xml is given) floating at (x, y)
-    points from the page's top-left corner. rot=True turns it 180° — Word rotates the text
-    along with the shape, so no picture is needed. paras_xml = <w:p> elements for the text."""
-    from docx.oxml import parse_xml
-    E = lambda pt: int(round(pt * 12700))
-    sid = next(_DX_SHAPE_ID)
-    adj = ""
-    if geom == "roundRect":
-        adj = f'<a:gd name="adj" fmla="val {int(min(50000, radius_pt / max(1e-6, min(w_pt, h_pt)) * 100000))}"/>'
-    ln = (f'<a:ln w="{E(line_w_pt)}"><a:solidFill><a:srgbClr val="{line}"/></a:solidFill></a:ln>'
-          if line else '<a:ln><a:noFill/></a:ln>')
-    body_l, body_t, body_r, body_b = (E(v) for v in insets)
-    txbx = (f'<wps:txbx><w:txbxContent>{paras_xml}</w:txbxContent></wps:txbx>' if paras_xml else "")
-    xml = (
-        '<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
-        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
-        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
-        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
-        '<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>'
-        f'<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="{rel_height}" '
-        'behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
-        '<wp:simplePos x="0" y="0"/>'
-        f'<wp:positionH relativeFrom="page"><wp:posOffset>{E(x_pt)}</wp:posOffset></wp:positionH>'
-        f'<wp:positionV relativeFrom="page"><wp:posOffset>{E(y_pt)}</wp:posOffset></wp:positionV>'
-        f'<wp:extent cx="{E(w_pt)}" cy="{E(h_pt)}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>'
-        f'<wp:docPr id="{sid}" name="{name} {sid}"/><wp:cNvGraphicFramePr/>'
-        '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">'
-        f'<wps:wsp><wps:cNvSpPr{" txBox=\"1\"" if paras_xml else ""}/>'
-        f'<wps:spPr><a:xfrm{" rot=\"10800000\"" if rot else ""}><a:off x="0" y="0"/><a:ext cx="{E(w_pt)}" cy="{E(h_pt)}"/></a:xfrm>'
-        f'<a:prstGeom prst="{geom}"><a:avLst>{adj}</a:avLst></a:prstGeom>'
-        f'<a:solidFill><a:srgbClr val="{fill}"/></a:solidFill>{ln}</wps:spPr>'
-        f'{txbx}'
-        f'<wps:bodyPr rot="0" vert="horz" wrap="none" lIns="{body_l}" tIns="{body_t}" rIns="{body_r}" bIns="{body_b}" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr>'
-        '</wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice></mc:AlternateContent></w:r>'
-    )
-    par._p.append(parse_xml(xml))
+def _dx_rot180(text: str) -> str:
+    return "".join(_DX_FLIP.get(ch, ch) for ch in reversed(str(text)))
 
-def _dx_p_xml(runs, *, font, size, line_pt, border_color=None, tab_pts=()):
-    """One <w:p> for a text box. runs = [(text, hex colour, bold), ...]; a text of '\\t' is a tab."""
+def _dx_table_box(doc, after_par, rows, col_w, x_left, y_top, row_h, font, *, border, fill, hline, flip, bsz=24):
+    """Floating table (anchored to the page). rows = [[(text, colour, bold, size), ...], ...]
+    one tuple per column. With flip=True the cells are right-aligned (a 180° turn)."""
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn as _qn
     tw = lambda pt: int(round(pt * 20))
-    ppr = ""
-    if border_color:
-        ppr += f'<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="0" w:color="{border_color}"/></w:pBdr>'
-    if tab_pts:
-        ppr += "<w:tabs>" + "".join(f'<w:tab w:val="left" w:pos="{tw(t)}"/>' for t in tab_pts) + "</w:tabs>"
-    ppr += f'<w:spacing w:before="0" w:after="0" w:line="{tw(line_pt)}" w:lineRule="exact"/>'
-    out = [f"<w:p><w:pPr>{ppr}</w:pPr>"]
-    for run in runs:
-        text, col, bold = run[:3]
-        rsz = run[3] if len(run) > 3 else size
-        rpr = (f'<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:cs="{font}" w:eastAsia="{font}"/>'
-               + ("<w:b/><w:bCs/>" if bold else "") + f'<w:color w:val="{col}"/>'
-               + f'<w:sz w:val="{int(round(rsz * 2))}"/><w:szCs w:val="{int(round(rsz * 2))}"/>')
-        if text == "\t":
-            out.append(f"<w:r><w:rPr>{rpr}</w:rPr><w:tab/></w:r>")
-        else:
-            out.append(f'<w:r><w:rPr>{rpr}</w:rPr><w:t xml:space="preserve">{html.escape(text)}</w:t></w:r>')
-    out.append("</w:p>")
-    return "".join(out)
-
-def _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font, font_path=None):
-    """Purple clipboard built from real Word shapes (board, paper text box, clip) — the
-    answers are live, editable text. With AK_UPSIDE_DOWN every shape is turned 180° and
-    its position mirrored inside the box, so the whole clipboard (text included) is flipped."""
-    n = len(pairs)
-    h = 22 + row_h * n + 10
-    flip = AK_UPSIDE_DOWN
-    def put(l, t, ew, eh, **kw):
-        # (l, t) = offset of the shape's top-left inside the UNflipped box
-        px, py = (x_left + w - l - ew, y_top + h - t - eh) if flip else (x_left + l, y_top + t)
-        _dx_shape(after_par, px, py, ew, eh, rot=flip, **kw)
-
-    num_w = max(pdfmetrics.stringWidth(f"{q}.", FONT_NAME_BOLD, 13) for q, _ in pairs)
-    tab1, tab2 = 16.0, 16.0 + num_w + 6
-    paras = "".join(
-        _dx_p_xml([("\u2713", "7C3AED", True, 10), ("\t", "000000", False), (f"{q}.", "7C3AED", True),
-                   ("\t", "000000", False), (str(l), "2E1065", True)],
-                  font=font, size=13, line_pt=row_h, border_color="DDD6FE", tab_pts=(tab1, tab2))
-        for q, l in pairs)
-    put(0, 0, w, h, fill="6D28D9", radius_pt=7, rel_height=10, name="AKBoard")
-    put(5, 14, w - 10, h - 19, fill="FFFFFF", radius_pt=3, rel_height=20, paras_xml=paras,
-        insets=(7, 5, 4, 0), name="AKPaper")
-    put(w / 2 - 19, -2, 38, 15, fill="DDD6FE", radius_pt=4, rel_height=30, name="AKClip")
-    put(w / 2 - 9, 2, 18, 5, fill="4C1D95", radius_pt=2.5, rel_height=40, name="AKClip2")
+    n, ncols, w = len(rows), len(col_w), sum(col_w)
+    tbl = doc.add_table(rows=n, cols=ncols)
+    t = tbl._tbl
+    tp = t.tblPr
+    for ch in list(tp):
+        tp.remove(ch)
+    _dx_insert(tp, _dx_el("w:tblpPr", leftFromText=0, rightFromText=0, topFromText=0, bottomFromText=0,
+                          vertAnchor="page", horzAnchor="page", tblpX=tw(x_left), tblpY=tw(y_top)), _DX_TBLPR_ORDER)
+    _dx_insert(tp, _dx_el("w:tblOverlap", val="overlap"), _DX_TBLPR_ORDER)
+    _dx_insert(tp, _dx_el("w:bidiVisual", val="0"), _DX_TBLPR_ORDER)
+    _dx_insert(tp, _dx_el("w:tblW", w=tw(w), type="dxa"), _DX_TBLPR_ORDER)
+    bd = _dx_el("w:tblBorders")
+    for side in ("top", "left", "bottom", "right"):
+        bd.append(_dx_el("w:" + side, val="single", sz=bsz, space=0, color=border))
+    if hline:
+        bd.append(_dx_el("w:insideH", val="single", sz=4, space=0, color=hline))
+    _dx_insert(tp, bd, _DX_TBLPR_ORDER)
+    _dx_insert(tp, _dx_el("w:tblLayout", type="fixed"), _DX_TBLPR_ORDER)
+    mar = _dx_el("w:tblCellMar")
+    for side in ("top", "left", "bottom", "right"):
+        mar.append(_dx_el("w:" + side, w=100 if side in ("left", "right") else 0, type="dxa"))
+    _dx_insert(tp, mar, _DX_TBLPR_ORDER)
+    for gc, wd in zip(t.tblGrid.findall(_qn("w:gridCol")), col_w):
+        gc.set(_qn("w:w"), str(tw(wd)))
+    for i, row in enumerate(tbl.rows):
+        row._tr.get_or_add_trPr().append(_dx_el("w:trHeight", val=tw(row_h), hRule="exact"))
+        for ci, cell in enumerate(row.cells):
+            tcPr = cell._tc.get_or_add_tcPr()
+            for ch in list(tcPr):
+                tcPr.remove(ch)
+            tcPr.append(_dx_el("w:tcW", w=tw(col_w[ci]), type="dxa"))
+            tcPr.append(_dx_el("w:shd", val="clear", color="auto", fill=fill))
+            tcPr.append(_dx_el("w:vAlign", val="center"))
+            cp = cell.paragraphs[0]
+            cp.paragraph_format.space_before = cp.paragraph_format.space_after = Pt(0)
+            cp.alignment = WD_ALIGN_PARAGRAPH.RIGHT if flip else WD_ALIGN_PARAGRAPH.LEFT
+            text, col, bold, size = rows[i][ci]
+            if text:
+                _dx_set_run(cp.add_run(text), font=font, size=size, bold=bold, color=col)
+    after_par._p.addnext(t)
+    return tbl
 
 def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri", font_path=None):
     """Floating table = the per-page answer key. Anchored to the paragraph it follows, so it
@@ -2974,14 +2944,32 @@ def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nu
     y_top = PAGE_H - (2.1 * CM + up_nudge_cm * CM + h)
     tw = lambda pt: int(round(pt * 20))
 
+    flip = AK_UPSIDE_DOWN
     if style == "column":
-        return _dx_clipboard_box(doc, after_par, pairs, x_left, y_top, w, row_h, font, font_path)
+        from reportlab.pdfbase import pdfmetrics as _pm
+        num_w = max(_pm.stringWidth(f"{q}.", FONT_NAME_BOLD, 13) for q, _ in pairs) + 14
+        let_w = 28.0
+        pad_w = max(w - num_w - let_w, 12.0)
+        rows = []
+        for q, letter in pairs:
+            if flip:
+                rows.append([("", "000000", False, 13), (_dx_rot180(letter), "2E1065", True, 13),
+                             (_dx_rot180(f"{q}."), "7C3AED", True, 13)])
+            else:
+                rows.append([(f"{q}.", "7C3AED", True, 13), (str(letter), "2E1065", True, 13)])
+        if flip:
+            rows.reverse()
+            cols = [pad_w, let_w, num_w]
+        else:
+            cols = [num_w, let_w + pad_w]
+        return _dx_table_box(doc, after_par, rows, cols, x_left, y_top + 12, row_h, font,
+                             border="6D28D9", fill="FFFFFF", hline="C4B5FD", flip=flip, bsz=36)
 
-    paras = "".join(_dx_p_xml([(ln, "1A1A2E", False)], font=font, size=10, line_pt=row_h) for ln in lines)
-    px, py = x_left, y_top
-    _dx_shape(after_par, px, py, w, h, fill="F5F7F8", line="90A4AE", radius_pt=4, paras_xml=paras,
-              insets=(0.3 * CM, 0.3 * CM, 4, 0), rot=AK_UPSIDE_DOWN, rel_height=10, name="AKBox")
-    return None
+    rows = [[(_dx_rot180(ln) if flip else ln, "1A1A2E", False, 10)] for ln in lines]
+    if flip:
+        rows.reverse()
+    return _dx_table_box(doc, after_par, rows, [w], x_left, y_top, row_h, font,
+                         border="90A4AE", fill="F5F7F8", hline=None, flip=flip, bsz=6)
 
 def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                show_answers: bool = True, font_size: float = DEFAULT_FONT_SIZE,
