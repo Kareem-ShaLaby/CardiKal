@@ -437,6 +437,8 @@ AWAITING_FONT          = {}    # user_id -> True, while the /pdf_start setup flo
 PDF_AK_STYLE           = {}    # user_id -> "grouped" (default, rows of "1-A  2-D") or "column" (one "1. A" per line)
 PDF_AK_NUDGE_CM        = {}    # user_id -> float, how many cm to shift the answer-key box left of its default spot
 AWAITING_AK_STYLE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the answer-key style choice
+PDF_THEME              = {}    # user_id -> key of THEMES (colour theme); absent = DEFAULT_THEME
+AWAITING_THEME         = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the colour-theme choice
 
 # ─── LAYOUT SETTINGS — all asked for in one combined numeric prompt ─────
 PDF_FONT_SIZE          = {}    # user_id -> float, base question font size (other text scales with it)
@@ -473,6 +475,54 @@ OPT_SPACING         = 6     # points of space after each MCQ option (was 3)
 Q_NUM_COLOR         = "#D4A017"   # colour of the inline "Q1" label (gold)
 Q_TEXT_COLOR        = "#5B21B6"   # colour of the question text itself (purple)
 AK_UPSIDE_DOWN      = True        # answer-key box is drawn rotated 180° (upside down)
+
+# ─── COLOUR THEMES — picked in the /pdf_start setup (or with the 🎨 button) ────
+# A theme recolours: the question text, the Q-number label, the title letters,
+# the answer-key clipboard, the case-study box and the dashed separators.
+# (The correct answer stays green everywhere so it always reads as "correct".)
+# `s` = the 7 shades of one hue, darkest → lightest: 900, 800, 600, 500, 400, 300, 200.
+def _theme(label, q_text, title, s, case, q_num="#D4A017", sep=None, gk=None):
+    p900, p800, p600, p500, p400, p300, p200 = s
+    return {
+        "label": label, "q_text": q_text, "q_num": q_num, "title": title,
+        "ak": {"P900": p900, "P800": p800, "P600": p600, "P500": p500,
+               "P400": p400, "P300": p300, "P200": p200},
+        "case_back": case[0], "case_border": case[1],
+        "sep": sep or p300,
+        "gk_fill": gk[0] if gk else case[0], "gk_stroke": gk[1] if gk else p400,
+    }
+
+DEFAULT_THEME = "purple"
+THEMES = {
+    "purple": _theme("💜 بنفسجي", Q_TEXT_COLOR, "#8A2BE2",
+                     ("#2E1065", "#4C1D95", "#6D28D9", "#7C3AED", "#A78BFA", "#C4B5FD", "#DDD6FE"),
+                     ("#F5F1FB", "#C9B8E8"), sep="#B0BEC5", gk=("#F5F7F8", "#90A4AE")),
+    "blue":   _theme("💙 أزرق", "#1E40AF", "#2563EB",
+                     ("#1E3A8A", "#1E40AF", "#2563EB", "#3B82F6", "#60A5FA", "#93C5FD", "#BFDBFE"),
+                     ("#EFF6FF", "#BFDBFE")),
+    "teal":   _theme("🩵 تركواز", "#0F766E", "#0D9488",
+                     ("#134E4A", "#115E59", "#0D9488", "#14B8A6", "#2DD4BF", "#5EEAD4", "#99F6E4"),
+                     ("#F0FDFA", "#99F6E4")),
+    "green":  _theme("💚 أخضر", "#15803D", "#16A34A",
+                     ("#14532D", "#166534", "#16A34A", "#22C55E", "#4ADE80", "#86EFAC", "#BBF7D0"),
+                     ("#F0FDF4", "#BBF7D0"), q_num="#B45309"),
+    "red":    _theme("❤️ أحمر", "#B91C1C", "#DC2626",
+                     ("#7F1D1D", "#991B1B", "#DC2626", "#EF4444", "#F87171", "#FCA5A5", "#FECACA"),
+                     ("#FEF2F2", "#FECACA")),
+    "orange": _theme("🧡 برتقالي", "#C2410C", "#EA580C",
+                     ("#7C2D12", "#9A3412", "#EA580C", "#F97316", "#FB923C", "#FDBA74", "#FED7AA"),
+                     ("#FFF7ED", "#FED7AA"), q_num="#0369A1"),
+    "pink":   _theme("🩷 وردي", "#BE185D", "#DB2777",
+                     ("#831843", "#9D174D", "#DB2777", "#EC4899", "#F472B6", "#F9A8D4", "#FBCFE8"),
+                     ("#FDF2F8", "#FBCFE8")),
+    "slate":  _theme("🖤 رمادي", "#1E293B", "#334155",
+                     ("#0F172A", "#1E293B", "#475569", "#64748B", "#94A3B8", "#CBD5E1", "#E2E8F0"),
+                     ("#F8FAFC", "#CBD5E1")),
+}
+
+def get_theme(key):
+    """Theme dict for a key, falling back to the default for anything unknown."""
+    return THEMES.get(key) or THEMES[DEFAULT_THEME]
 LEFT_MARGIN_CM      = 1.2   # where questions start from the page's left edge (was 2.0)
 AK_COLUMN_BOX_W     = 4.2 * cm   # width of the "column"-style answer-key box (single source of truth)
 TEXT_TO_BOX_GAP_CM  = 0.4   # breathing room between the end of the text lines and the answer-key box
@@ -1746,9 +1796,24 @@ def export_keyboard(user_id: int = None):
                               callback_data="toggle_written")],
         [InlineKeyboardButton("👁 Preview", callback_data="preview_pdf"),
          InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
+        [InlineKeyboardButton("🎨 Theme: " + get_theme(PDF_THEME.get(user_id)).get("label", ""),
+                              callback_data="theme_pick")],
         [InlineKeyboardButton("🆕 New session", callback_data="new_session"),
          InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
+
+def theme_keyboard(user_id: int = None, back: bool = False) -> InlineKeyboardMarkup:
+    """One button per colour theme (two per row); the current one gets a ✔.
+    back=True (used mid-session) adds a Back button that restores the progress message."""
+    current = PDF_THEME.get(user_id, DEFAULT_THEME) if user_id is not None else DEFAULT_THEME
+    buttons = [
+        InlineKeyboardButton(("✔ " if key == current else "") + t["label"], callback_data=f"theme:{key}")
+        for key, t in THEMES.items()
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if back:
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="edit_pick_back")])
+    return InlineKeyboardMarkup(rows)
 
 def _item_preview_label(item: dict, max_len: int = 40) -> str:
     """First few words of a buffered item, for the edit-picker list."""
@@ -1793,7 +1858,7 @@ def font_prompt_keyboard() -> InlineKeyboardMarkup:
 HOW_TO_USE_TEXT = (
     "📄 <b>How To Use — Quizician PDF Bot</b>\n\n"
     "<b>1) Start a session</b>\n"
-    "/pdf_start — pick a name, a font, a cover page (first page of every PDF) and a page frame, then start sending content.\n"
+    "/pdf_start — pick a name, a font, a cover page (first page of every PDF), a page frame, the answer-key style and a 🎨 colour theme, then start sending content. (The theme can be changed any time with the 🎨 button on the progress message.)\n"
      "The cover and frame are remembered for every future PDF until the bot restarts (/set_cover, /clear_cover, /set_frame, /clear_frame to change them).\n\n"
     "<b>2) Normal MCQ</b>\n"
     "<code>Question?\n"
@@ -1951,9 +2016,14 @@ class _AnswerKeyCanvas(_canvas.Canvas):
                  font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD,
                  ak_style="grouped", ak_nudge_cm=0.0,
                  ak_right_margin=2*cm, ak_top_margin=2.5*cm,
-                 ak_wall_gap_cm=0.5, ak_up_nudge_cm=4.0, ak_box_w=None, **kwargs):
+                 ak_wall_gap_cm=0.5, ak_up_nudge_cm=4.0, ak_box_w=None,
+                 ak_content_box=None, ak_theme=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self._ak_theme = ak_theme or THEMES[DEFAULT_THEME]   # colour palette of the answer-key box
         self._ak_box_w       = ak_box_w   # fitted width of the clipboard box (same on every page)
+        # (x0, y_bottom, x1, y_top) of the frame's white area, or None — the
+        # answer-key box is kept fully inside it.
+        self._ak_content_box = ak_content_box
         self._ak_pages       = []
         self._answer_pairs   = answer_pairs or []
         self._page_of_idx    = page_of_idx if page_of_idx is not None else {}
@@ -1968,6 +2038,17 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         # to know where that edge actually is.
         self._ak_right_margin = ak_right_margin
         self._ak_top_margin   = ak_top_margin
+
+    def _clamp_to_content(self, x, y, w, h):
+        """Moves a box (lower-left x, y, size w x h) so it lies fully inside the
+        frame's white area. No frame → unchanged."""
+        cb = self._ak_content_box
+        if not cb:
+            return x, y
+        m = 0.15 * cm
+        x = max(cb[0] + m, min(x, cb[2] - m - w))
+        y = max(cb[1] + m, min(y, cb[3] - m - h))
+        return x, y
 
     def showPage(self):
         self._ak_pages.append(dict(self.__dict__))
@@ -2019,9 +2100,10 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         board, white paper, metal clip, ruled rows with a tick box in front of
         each "N. Letter". The width is fitted to the content (see
         _clipboard_box_width) instead of a fixed 4.2 cm."""
-        P600, P800 = colors.HexColor("#6D28D9"), colors.HexColor("#4C1D95")
-        P500, P400, P300 = colors.HexColor("#7C3AED"), colors.HexColor("#A78BFA"), colors.HexColor("#C4B5FD")
-        P200, P900 = colors.HexColor("#DDD6FE"), colors.HexColor("#2E1065")
+        _ak = self._ak_theme["ak"]
+        P600, P800 = colors.HexColor(_ak["P600"]), colors.HexColor(_ak["P800"])
+        P500, P400, P300 = colors.HexColor(_ak["P500"]), colors.HexColor(_ak["P400"]), colors.HexColor(_ak["P300"])
+        P200, P900 = colors.HexColor(_ak["P200"]), colors.HexColor(_ak["P900"])
         LINE_H, FS = 0.65 * cm, 13
         n   = len(pairs)
         w   = self._ak_box_w or _clipboard_box_width(max(q for q, _ in pairs), [l for _, l in pairs], self._ak_font_bold)
@@ -2029,6 +2111,7 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         x_right = A4[0] - self._ak_wall_gap_cm * cm - self._ak_nudge_cm * cm
         x       = x_right - w
         y       = 2.1 * cm + self._ak_up_nudge_cm * cm
+        x, y    = self._clamp_to_content(x, y, w, h)
 
         self.saveState()
         if AK_UPSIDE_DOWN:
@@ -2111,8 +2194,10 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             x_left   = x_right - box_w
             y_bottom = 2.1 * cm + AK_UP_NUDGE
 
-            fill_color   = colors.HexColor("#F5F7F8")
-            stroke_color = colors.HexColor("#90A4AE")
+            fill_color   = colors.HexColor(self._ak_theme["gk_fill"])
+            stroke_color = colors.HexColor(self._ak_theme["gk_stroke"])
+
+        x_left, y_bottom = self._clamp_to_content(x_left, y_bottom, box_w, box_h)
 
         self.saveState()
         if AK_UPSIDE_DOWN:
@@ -2147,8 +2232,9 @@ class _OutlinedTitle(Flowable):
     MIN_SIZE  = 8
     MAX_LINES = 3
 
-    def __init__(self, text, base_size=30.0):
+    def __init__(self, text, base_size=30.0, fill=None):
         super().__init__()
+        self.fill = colors.HexColor(fill) if fill else TITLE_FILL_COLOR   # letter colour (theme)
         try:
             self.text = normalize_text(text, shape_rtl=True).strip()
         except Exception:
@@ -2283,11 +2369,89 @@ class _OutlinedTitle(Flowable):
             self._draw_line(c, x, y, line, 1)
             c.restoreState()
             c.saveState()                        # 3) violet letters on top
-            c.setFillColor(TITLE_FILL_COLOR)
+            c.setFillColor(self.fill)
             self._draw_line(c, x, y, line, 0)
             c.restoreState()
             y -= self.leading
         c.restoreState()
+
+# ═══════════════════════════════════════════════════════════════
+# FRAME WHITE-AREA DETECTION — the frame image is stretched over every
+# page, and its white "card" can sit anywhere. Instead of assuming fixed
+# margins, we look for the largest empty white rectangle inside the frame
+# and let the content (title, questions, answer-key box) live inside it,
+# so nothing ever runs over the coloured border or the side label.
+# ═══════════════════════════════════════════════════════════════
+FRAME_FIT_PAD_CM   = 0.4     # breathing room kept between the content and the white area's edge
+FRAME_FIT_MIN_AREA = 0.20    # a "white area" smaller than this share of the page isn't a real card → ignore
+FRAME_WHITE_MIN    = 238     # every colour channel at/above this counts as white
+FRAME_GRID_W       = 200     # analysis resolution (columns); rows follow the A4 ratio
+_FRAME_BOX_CACHE: dict = {}
+
+def _largest_true_rect(grid, W, H):
+    """Largest all-1 axis-aligned rectangle in a 0/1 grid (histogram + stack, O(W*H)).
+    Returns (area, x0, y0, x1, y1) with x1/y1 exclusive."""
+    heights = [0] * W
+    best = (0, 0, 0, 0, 0)
+    for y in range(H):
+        row = grid[y]
+        for x in range(W):
+            heights[x] = heights[x] + 1 if row[x] else 0
+        stack = []                                   # (start_x, height)
+        for x in range(W + 1):
+            h = heights[x] if x < W else 0
+            start = x
+            while stack and stack[-1][1] >= h:
+                sx, sh = stack.pop()
+                area = sh * (x - sx)
+                if area > best[0]:
+                    best = (area, sx, y - sh + 1, x, y + 1)
+                start = sx
+            stack.append((start, h))
+    return best
+
+def detect_frame_content_box(path):
+    """The largest empty white rectangle inside the frame image, as
+    (x0, y_bottom, x1, y_top) in PDF points (origin bottom-left, A4 page), or
+    None when there is no frame / no sizeable white area (the normal fixed
+    margins are then used). The frame is drawn stretched to A4, so the image
+    is analysed on an A4-shaped grid. Cached per file + modification time."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        key = (path, os.path.getmtime(path))
+        if key in _FRAME_BOX_CACHE:
+            return _FRAME_BOX_CACHE[key]
+        from PIL import Image
+        with Image.open(path) as im:
+            im.load()
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                rgba = im.convert("RGBA")
+                flat = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("RGB")
+            else:
+                flat = im.convert("RGB")
+        GW = FRAME_GRID_W
+        GH = int(round(GW * A4[1] / A4[0]))
+        box_filter = getattr(getattr(Image, "Resampling", Image), "BOX")
+        px = list(flat.resize((GW, GH), box_filter).getdata())
+        grid = [[1 if min(px[y * GW + x][:3]) >= FRAME_WHITE_MIN else 0 for x in range(GW)] for y in range(GH)]
+        area, gx0, gy0, gx1, gy1 = _largest_true_rect(grid, GW, GH)
+        result = None
+        if area / float(GW * GH) >= FRAME_FIT_MIN_AREA:
+            result = (
+                gx0 / GW * A4[0],
+                A4[1] - gy1 / GH * A4[1],     # bottom edge (PDF y grows upward)
+                gx1 / GW * A4[0],
+                A4[1] - gy0 / GH * A4[1],     # top edge
+            )
+            print("Frame white area (pt): left=%.0f bottom=%.0f right=%.0f top=%.0f" % result)
+        else:
+            print("Frame has no sizeable white area — using the default margins.")
+        _FRAME_BOX_CACHE[key] = result
+        return result
+    except Exception as e:
+        print(f"Frame detection error: {e} — using the default margins.")
+        return None
 
 def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT):
     """Loads an image as an RLImage, scaled DOWN (never up) to fit within
@@ -2364,9 +2528,12 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               q_gap_cm: float = DEFAULT_Q_GAP_CM,
               opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
               page_map_out: dict = None,
-              show_written_answers: bool = True) -> BytesIO:
+              show_written_answers: bool = True,
+              theme: str = DEFAULT_THEME) -> BytesIO:
     items = normalize_items_for_render(items)
     buffer = BytesIO()
+    T = get_theme(theme)          # colour theme: question/number/title/answer-key/case/separator colours
+    Q_NUM_COLOR, Q_TEXT_COLOR = T["q_num"], T["q_text"]   # local — shadow the module defaults for this build
 
     # Custom font: registered under a name unique to this call so two users'
     # uploaded fonts (built around the same time) can never clobber each
@@ -2429,8 +2596,20 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 print(f"PDF cover image draw error: {e}")
         canvas.restoreState()
 
-    TOP_MARGIN    = top_margin_cm * cm
-    LEFT_MARGIN   = LEFT_MARGIN_CM * cm
+    # The largest empty white area inside the frame (None without a frame).
+    # Content must stay inside it: each margin is never smaller than the
+    # distance to that area's edge (+ a little padding), so a frame whose
+    # card sits further in simply pushes the content in with it.
+    FRAME_BOX = detect_frame_content_box(bg_image_path)
+    _PAD      = FRAME_FIT_PAD_CM * cm
+    FIT_TOP    = (A4[1] - FRAME_BOX[3] + _PAD) if FRAME_BOX else 0
+    FIT_LEFT   = (FRAME_BOX[0] + _PAD)         if FRAME_BOX else 0
+    FIT_RIGHT  = (A4[0] - FRAME_BOX[2] + _PAD) if FRAME_BOX else 0
+    FIT_BOTTOM = (FRAME_BOX[1] + _PAD)         if FRAME_BOX else 0
+    AK_X_RIGHT_MAX = (FRAME_BOX[2] - 0.15 * cm) if FRAME_BOX else A4[0]   # answer-key box can't cross the white area's right edge
+
+    TOP_MARGIN    = max(top_margin_cm * cm, FIT_TOP)
+    LEFT_MARGIN   = max(LEFT_MARGIN_CM * cm, FIT_LEFT)
 
     # Every text size below is defined relative to DEFAULT_FONT_SIZE and
     # scaled by this ratio, so a single "font size" number moves the whole
@@ -2452,25 +2631,25 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         # uses to place the box — so lines run right up to it instead of
         # stopping at a fixed reserve. If the box is pushed mostly off the
         # page (negative shift), the text simply extends further right.
-        box_left_x   = A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm - AK_BOX_W
+        box_left_x   = min(A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm, AK_X_RIGHT_MAX) - AK_BOX_W
         right_margin = A4[0] - box_left_x + TEXT_TO_BOX_GAP_CM * cm
-        right_margin = max(MIN_RIGHT_MARGIN_CM * cm, right_margin)
+        right_margin = max(MIN_RIGHT_MARGIN_CM * cm, right_margin, FIT_RIGHT)
         right_margin = min(right_margin, A4[0] - LEFT_MARGIN - MIN_TEXT_WIDTH_CM * cm)
         _DOC_MARGINS = dict(
             leftMargin=LEFT_MARGIN,
             rightMargin=right_margin,
             topMargin=TOP_MARGIN,
-            bottomMargin=2*cm,
+            bottomMargin=max(2*cm, FIT_BOTTOM),
         )
     else:
         _DOC_MARGINS = dict(
-            leftMargin=LEFT_MARGIN, rightMargin=2*cm,
+            leftMargin=LEFT_MARGIN, rightMargin=max(2*cm, FIT_RIGHT),
             topMargin=TOP_MARGIN,
             # Extra bottom margin (vs. the plain 2cm content uses elsewhere)
             # reserves room for the per-page answer-key box so normal flowing
             # text doesn't get laid out underneath where that box will later
             # be stamped on top of it.
-            bottomMargin=3.6*cm,
+            bottomMargin=max(3.6*cm, FIT_BOTTOM),
         )
 
     # Left/right edges of the text column, used to centre the title and the
@@ -2531,7 +2710,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     CASE_STYLE = ParagraphStyle(
         "CaseStyle", fontName=font_name, fontSize=10.5 * FSCALE, leading=15 * FSCALE,
         textColor=colors.HexColor("#2D2A3E"),
-        backColor=colors.HexColor("#F5F1FB"), borderColor=colors.HexColor("#C9B8E8"),
+        backColor=colors.HexColor(T["case_back"]), borderColor=colors.HexColor(T["case_border"]),
         borderWidth=0.8, borderPadding=7, borderRadius=4,
         spaceBefore=8, spaceAfter=6,
     )
@@ -2592,7 +2771,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # the same page.
             if idx > 1:
                 block.append(Spacer(1, Q_GAP / 2))
-                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2, FRAME_LEFT, FRAME_RIGHT))
+                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2, FRAME_LEFT, FRAME_RIGHT, color=T["sep"]))
                 block.append(Spacer(1, Q_GAP / 2))
             else:
                 block.append(Spacer(1, Q_GAP))
@@ -2690,7 +2869,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # cover, the PageBreak inserted below goes in front of this, so the title
     # lands on page 2 — the first page that actually carries content.
     if doc_title and str(doc_title).strip():
-        story[0:0] = [_PageCentered(_OutlinedTitle(doc_title, base_size=30 * FSCALE), FRAME_LEFT, FRAME_RIGHT), Spacer(1, 4)]
+        story[0:0] = [_PageCentered(_OutlinedTitle(doc_title, base_size=30 * FSCALE, fill=T["title"]), FRAME_LEFT, FRAME_RIGHT), Spacer(1, 4)]
 
     have_cover = bool(cover_image_path and os.path.exists(cover_image_path))
     if have_cover:
@@ -2710,6 +2889,8 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             ak_right_margin=_DOC_MARGINS["rightMargin"], ak_top_margin=_DOC_MARGINS["topMargin"],
             ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
             ak_box_w=AK_BOX_W,
+            ak_content_box=FRAME_BOX,
+            ak_theme=T,
             **kwargs,
         )
 
@@ -2921,7 +3102,8 @@ def _dx_table_box(doc, after_par, rows, col_w, x_left, y_top, row_h, font, *, bo
     after_par._p.addnext(t)
     return tbl
 
-def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri", font_path=None):
+def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri", font_path=None,
+                   content_box=None, theme=None):
     """Floating table = the per-page answer key. Anchored to the paragraph it follows, so it
     lands on that paragraph's page, at the same spot as the PDF's box (measured from the
     page's right edge / bottom edge). Fully editable in Word."""
@@ -2929,19 +3111,27 @@ def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nu
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     CM = 28.3465
     PAGE_W, PAGE_H = 21.0 * CM, 29.7 * CM
+    _T = theme or THEMES[DEFAULT_THEME]
+    _hx = lambda c: c.lstrip("#")                       # docx colours are bare hex, no '#'
+    _ak = {k: _hx(v) for k, v in _T["ak"].items()}
     if style == "column":
         lines = [(q, letter) for q, letter in pairs]
         row_h, w = 0.65 * CM, box_w_pt
         h = 22 + row_h * len(lines) + 10
-        border, fill, hline = "6D28D9", "FFFFFF", "C4B5FD"
+        border, fill, hline = _ak["P600"], "FFFFFF", _ak["P300"]
     else:
         per_row = 4
         lines = ["   ".join(f"{n}-{l}" for n, l in pairs[i:i + per_row]) for i in range(0, len(pairs), per_row)]
         row_h, w = 0.48 * CM + 6, 6.6 * CM
         h = row_h * len(lines) + 0.6 * CM
-        border, fill, hline = "90A4AE", "F5F7F8", None
+        border, fill, hline = _hx(_T["gk_stroke"]), _hx(_T["gk_fill"]), None
     x_left = PAGE_W - wall_gap_cm * CM - nudge_cm * CM - w
-    y_top = PAGE_H - (2.1 * CM + up_nudge_cm * CM + h)
+    box_bottom = 2.1 * CM + up_nudge_cm * CM          # distance of the box's lower edge from the page bottom
+    if content_box:                                    # keep the box fully inside the frame's white area
+        m = 0.15 * CM
+        x_left = max(content_box[0] + m, min(x_left, content_box[2] - m - w))
+        box_bottom = max(content_box[1] + m, min(box_bottom, content_box[3] - m - h))
+    y_top = PAGE_H - (box_bottom + h)
     tw = lambda pt: int(round(pt * 20))
 
     flip = AK_UPSIDE_DOWN
@@ -2953,17 +3143,17 @@ def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nu
         rows = []
         for q, letter in pairs:
             if flip:
-                rows.append([("", "000000", False, 13), (_dx_rot180(letter), "2E1065", True, 13),
-                             (_dx_rot180(f"{q}."), "7C3AED", True, 13)])
+                rows.append([("", "000000", False, 13), (_dx_rot180(letter), _ak["P900"], True, 13),
+                             (_dx_rot180(f"{q}."), _ak["P500"], True, 13)])
             else:
-                rows.append([(f"{q}.", "7C3AED", True, 13), (str(letter), "2E1065", True, 13)])
+                rows.append([(f"{q}.", _ak["P500"], True, 13), (str(letter), _ak["P900"], True, 13)])
         if flip:
             rows.reverse()
             cols = [pad_w, let_w, num_w]
         else:
             cols = [num_w, let_w + pad_w]
         return _dx_table_box(doc, after_par, rows, cols, x_left, y_top + 12, row_h, font,
-                             border="6D28D9", fill="FFFFFF", hline="C4B5FD", flip=flip, bsz=36)
+                             border=_ak["P600"], fill="FFFFFF", hline=_ak["P300"], flip=flip, bsz=36)
 
     rows = [[(_dx_rot180(ln) if flip else ln, "1A1A2E", False, 10)] for ln in lines]
     if flip:
@@ -2981,6 +3171,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                q_gap_cm: float = DEFAULT_Q_GAP_CM,
                opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
                show_written_answers: bool = True,
+               theme: str = DEFAULT_THEME,
                **_ignored) -> BytesIO:
     from docx import Document
     from docx.shared import Pt, Cm, RGBColor
@@ -2992,6 +3183,8 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     CM_PT = 28.3465
     Q_GAP, OPT_GAP = q_gap_cm * CM_PT, opt_gap_cm * CM_PT
     IMG_MAX_H = IMG_MAX_LINES * 15 * FS
+    T = get_theme(theme)                                     # colour theme (same one the PDF uses)
+    Q_NUM_COLOR, Q_TEXT_COLOR = T["q_num"], T["q_text"]      # local — shadow the module defaults for this build
     DARK, GREEN, GREY, CASE_TXT, WR_TXT = "1A1A2E", "1B5E20", Q_NUM_COLOR.lstrip("#"), "2D2A3E", "37474F"
 
     items = normalize_items_for_render(items)
@@ -3007,12 +3200,21 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     # looked jammed against the left wall, so the DOCX gets extra room (1.2 + 0.8 = 2.0 cm, matching the right side).
     DOCX_LEFT_EXTRA_CM = 0.8
     left_cm, right_cm, bottom_cm = LEFT_MARGIN_CM + DOCX_LEFT_EXTRA_CM, 2.0, 3.6
+    # White area of the frame image (None without a frame): content stays inside it, like in the PDF.
+    fbox = detect_frame_content_box(bg_image_path)
+    _P = 28.3465
     if ak_style == "column":
-        PW = 21.0 * 28.3465
-        box_left = PW - ak_wall_gap_cm * 28.3465 - ak_nudge_cm * 28.3465 - AK_BOX_W
-        rm = max(MIN_RIGHT_MARGIN_CM * 28.3465, PW - box_left + TEXT_TO_BOX_GAP_CM * 28.3465)
-        rm = min(rm, PW - left_cm * 28.3465 - MIN_TEXT_WIDTH_CM * 28.3465)
-        right_cm, bottom_cm = rm / 28.3465, 2.0
+        PW = 21.0 * _P
+        box_left = min(PW - ak_wall_gap_cm * _P - ak_nudge_cm * _P, (fbox[2] - 0.15 * _P) if fbox else PW) - AK_BOX_W
+        rm = max(MIN_RIGHT_MARGIN_CM * _P, PW - box_left + TEXT_TO_BOX_GAP_CM * _P)
+        rm = min(rm, PW - left_cm * _P - MIN_TEXT_WIDTH_CM * _P)
+        right_cm, bottom_cm = rm / _P, 2.0
+    if fbox:
+        pad = FRAME_FIT_PAD_CM
+        left_cm    = max(left_cm,       fbox[0] / _P + pad)
+        right_cm   = max(right_cm,      (A4[0] - fbox[2]) / _P + pad)
+        top_margin_cm = max(top_margin_cm, (A4[1] - fbox[3]) / _P + pad)
+        bottom_cm  = max(bottom_cm,     fbox[1] / _P + pad)
     sec.left_margin, sec.right_margin = Cm(left_cm), Cm(right_cm)
     sec.top_margin, sec.bottom_margin = Cm(top_margin_cm), Cm(bottom_cm)
     doc.core_properties.title = str(doc_title or "questions")
@@ -3052,7 +3254,8 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             p.alignment = align
         if pend["box"]:
             _dx_answer_box(doc, p, pend["box"], ak_style, wall_gap_cm=ak_wall_gap_cm,
-                           nudge_cm=ak_nudge_cm, up_nudge_cm=ak_up_nudge_cm, box_w_pt=AK_BOX_W, font=FONT, font_path=font_path)
+                           nudge_cm=ak_nudge_cm, up_nudge_cm=ak_up_nudge_cm, box_w_pt=AK_BOX_W, font=FONT, font_path=font_path,
+                           content_box=fbox, theme=T)
             pend["box"] = None
         return p
 
@@ -3102,7 +3305,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
         t = _dx_clean(doc_title).strip()
         p = new_par(rtl=bool(_RTL_RE.search(t)) and _para_is_rtl(t), after=10,
                     align=WD_ALIGN_PARAGRAPH.CENTER)
-        add_text(p, t, size=26 * FS, bold=True, color="8A2BE2", rtl=bool(_RTL_RE.search(t)))
+        add_text(p, t, size=26 * FS, bold=True, color=T["title"].lstrip("#"), rtl=bool(_RTL_RE.search(t)))
 
     # ── page frame: full-page picture anchored behind the text, in the header
     #    (shows on every page; the cover page, if any, is left clear like the PDF) ──
@@ -3137,7 +3340,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             sp = new_par(before=Q_GAP / 2, after=0)
             _sp = sp._p.get_or_add_pPr()
             _b = _dx_el("w:pBdr")
-            _b.append(_dx_el("w:bottom", val="dashed", sz=6, space=1, color="B0BEC5"))
+            _b.append(_dx_el("w:bottom", val="dashed", sz=6, space=1, color=T["sep"].lstrip("#")))
             _dx_insert(_sp, _b, _DX_PPR_ORDER)
             sp.paragraph_format.space_after = Pt(Q_GAP / 2)
             _diff = (right_cm - left_cm) * 28.3465      # make the line symmetric about the page centre
@@ -3164,9 +3367,9 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                 pPr = p._p.get_or_add_pPr()
                 bdr = _dx_el("w:pBdr")
                 for side in ("top", "left", "bottom", "right"):
-                    bdr.append(_dx_el("w:" + side, val="single", sz=6, space=4, color="C9B8E8"))
+                    bdr.append(_dx_el("w:" + side, val="single", sz=6, space=4, color=T["case_border"].lstrip("#")))
                 _dx_insert(pPr, bdr, _DX_PPR_ORDER)
-                _dx_insert(pPr, _dx_el("w:shd", val="clear", color="auto", fill="F5F1FB"), _DX_PPR_ORDER)
+                _dx_insert(pPr, _dx_el("w:shd", val="clear", color="auto", fill=T["case_back"].lstrip("#")), _DX_PPR_ORDER)
                 p.paragraph_format.left_indent = Pt(6)
                 p.paragraph_format.right_indent = Pt(6)
                 add_text(p, case, size=10.5 * FS, color=CASE_TXT, rtl=crtl)
@@ -3240,7 +3443,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     if answer_pairs and not page_map:
         p = new_par(before=20, after=6, keep_next=True)
         p.paragraph_format.page_break_before = False
-        add_text(p, "Answer Key", size=14 * FS, bold=True, color="8A2BE2")
+        add_text(p, "Answer Key", size=14 * FS, bold=True, color=T["title"].lstrip("#"))
         COLS = 8
         rows = (len(answer_pairs) + COLS - 1) // COLS
         tbl = doc.add_table(rows=rows, cols=COLS)
@@ -3464,6 +3667,7 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
             bg_image_path=PDF_FRAME_PATH.get(user_id),
             show_answers=True,
             ak_style=PDF_AK_STYLE.get(user_id, "grouped"),
+            theme=PDF_THEME.get(user_id, DEFAULT_THEME),
             ak_nudge_cm=ak_nudge_cm, font_size=font_size,
             top_margin_cm=top_margin_cm, ak_wall_gap_cm=ak_wall_gap_cm,
             ak_up_nudge_cm=ak_up_nudge_cm,
@@ -4196,6 +4400,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── AWAITING COLOUR THEME (reminder only — real handling is the theme buttons) ──
+    if AWAITING_THEME.get(user_id):
+        await update.message.reply_text(
+            "⚠️ اختار ألوان الـ PDF من الأزرار فوق.",
+        )
+        return
+
     # ── AWAITING COMBINED LAYOUT NUMBERS ─────────────────────────────
     if AWAITING_LAYOUT.get(user_id):
         stripped = text.strip()
@@ -4585,8 +4796,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         PDF_AK_STYLE[user_id] = style
         del AWAITING_AK_STYLE[user_id]
-        AWAITING_LAYOUT[user_id] = True
-        await query.edit_message_text(LAYOUT_PROMPT_TEXT, parse_mode=ParseMode.HTML)
+        await _ask_theme(context, user_id, query.message, edit=True)
+        return
+
+    # ── COLOUR THEME: the 🎨 button on the progress message opens the picker ──
+    if query.data == "theme_pick":
+        if user_id not in PDF_BUFFER:
+            return
+        await query.edit_message_text(
+            "🎨 <b>اختار ألوان الـ PDF / DOCX:</b>", parse_mode=ParseMode.HTML,
+            reply_markup=theme_keyboard(user_id, back=True),
+        )
+        return
+
+    # ── COLOUR THEME: a theme was picked (setup flow, or mid-session) ──
+    if query.data.startswith("theme:"):
+        key = query.data.split(":", 1)[1]
+        if key not in THEMES:
+            return
+        if AWAITING_THEME.get(user_id):                      # setup flow → continue to the layout numbers
+            PDF_THEME[user_id] = key
+            del AWAITING_THEME[user_id]
+            AWAITING_LAYOUT[user_id] = True
+            await query.edit_message_text(
+                f"✅ 🎨 {THEMES[key]['label']}\n\n" + LAYOUT_PROMPT_TEXT, parse_mode=ParseMode.HTML,
+            )
+        elif user_id in PDF_BUFFER:                          # mid-session → apply and go back to the progress message
+            PDF_THEME[user_id] = key
+            await query.edit_message_text(
+                build_progress_text(PDF_BUFFER.get(user_id, []), pending=_pending_summary(user_id)),
+                parse_mode=ParseMode.HTML, reply_markup=export_keyboard(user_id),
+            )
         return
 
     # ── PREVIEW BUTTON ──────────────────────────────────────────
@@ -4638,6 +4878,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 # EXPORT — build+send PDF/DOCX (the session is kept; 🆕 New session starts over)
 # ═══════════════════════════════════════════════════════════════
+async def _ask_theme(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
+    """Step after the answer-key style (… → answer-key style → COLOUR THEME →
+    layout numbers → finish) — pick the colour theme of the whole PDF/DOCX."""
+    AWAITING_THEME[user_id] = True
+    text = (
+        "🎨 <b>اختار ألوان الـ PDF</b>\n"
+        "بتغيّر لون السؤال والرقم والعنوان وصندوق الإجابات وصندوق الحالة. "
+        "(الإجابة الصح فاضلة خضرا دايمًا.)"
+    )
+    send = reply_target.edit_text if edit else reply_target.reply_text
+    await send(text, parse_mode=ParseMode.HTML, reply_markup=theme_keyboard(user_id))
+
 async def _ask_ak_style(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
     """Step after background (font → background → answer-key style → nudge
     → finish) — asks whether the per-page answer key should be laid out
@@ -4692,7 +4944,9 @@ def _reset_pdf_session(user_id: int) -> None:
     AWAITING_FRAME.pop(user_id, None)
     AWAITING_COVER.pop(user_id, None)
     AWAITING_AK_STYLE.pop(user_id, None)
+    AWAITING_THEME.pop(user_id, None)
     AWAITING_LAYOUT.pop(user_id, None)
+    PDF_THEME.pop(user_id, None)
     PDF_AK_STYLE.pop(user_id, None)
     PDF_AK_NUDGE_CM.pop(user_id, None)
     PDF_FONT_SIZE.pop(user_id, None)
@@ -4731,6 +4985,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
         font_bold_path=PDF_FONT_BOLD_PATH.get(session_id),
         bg_image_path=PDF_FRAME_PATH.get(session_id),
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME),
         ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
         font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
         top_margin_cm=PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM),
@@ -4780,6 +5035,7 @@ async def _export_docx_session(context: ContextTypes.DEFAULT_TYPE, message, sess
         q_gap_cm=PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM),
         opt_gap_cm=PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM),
         show_written_answers=PDF_WRITTEN_SHOW.get(session_id, True),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME),
     )
     ak_kw = dict(
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
@@ -4921,7 +5177,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
         or AWAITING_FONT.get(user_id) or AWAITING_FRAME.get(user_id) or AWAITING_COVER.get(user_id)
-        or AWAITING_AK_STYLE.get(user_id) or AWAITING_LAYOUT.get(user_id)
+        or AWAITING_AK_STYLE.get(user_id) or AWAITING_THEME.get(user_id) or AWAITING_LAYOUT.get(user_id)
         or PENDING_IMAGE.get(user_id) or PENDING_CASE.get(user_id)
         or CARDIKAL.get(user_id)
     )
