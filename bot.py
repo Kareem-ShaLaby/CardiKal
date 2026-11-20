@@ -61,7 +61,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether, Flowable, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether, Flowable, PageBreak, Frame
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT
 from reportlab.lib.units import cm
@@ -470,7 +470,7 @@ PENDING_EDIT           = {}    # user_id -> {"index": int, "field": "q"/"title"/
 
 # ─── PAGE-MARGIN TUNING ─────────────────────────────────────────
 CASE_MIN_CHARS      = 40    # plain text at least this long (and not a question) is treated as a case study
-IMG_MAX_LINES       = 5     # an image may be at most this many lines of text tall (width follows the aspect ratio)
+IMG_MAX_LINES       = 8     # an image may be at most this many lines of text tall (width follows the aspect ratio)
 OPT_SPACING         = 6     # points of space after each MCQ option (was 3)
 Q_NUM_COLOR         = "#D4A017"   # colour of the inline "Q1" label (gold)
 Q_TEXT_COLOR        = "#5B21B6"   # colour of the question text itself (purple)
@@ -1941,17 +1941,22 @@ def normalize_items_for_render(items: list) -> list:
 class _DashedSeparator(Flowable):
     """Thin dashed line between two questions (— — — — —). Skipped when it would
     land at the very top of a page, so a page never starts with a stray line."""
-    def __init__(self, top_content_y, half_gap, frame_left, frame_right, color="#B0BEC5"):
+    def __init__(self, top_content_y, half_gap, frame_left, frame_right, color="#B0BEC5", frame_tops=None):
         super().__init__()
         self._top, self._half, self._color = top_content_y, half_gap, color
         self._fl, self._fr = frame_left, frame_right
+        self._tops = frame_tops        # shared {page_no: [content-top y of each frame on that page]}
         self.width, self.height = 0, 2
     def wrap(self, availWidth, availHeight):
         self.width = availWidth
         return availWidth, 2
     def draw(self):
         try:
-            if self.canv.absolutePosition(0, 0)[1] > self._top - self._half - 3:
+            y   = self.canv.absolutePosition(0, 0)[1]
+            pg  = self.canv.getPageNumber()
+            tops = (self._tops or {}).get(pg) or [self._top]
+            # at the very top of ANY frame on this page (not just the page's top)?
+            if any(t - self._half - 3 < y <= t + 2 for t in tops):
                 return
         except Exception:
             pass
@@ -1963,7 +1968,8 @@ class _DashedSeparator(Flowable):
         # centred on the PAGE (like the title), not on the text column, which sits off-centre
         centre = A4[0] / 2
         half = min(centre - self._fl, self._fr - centre)
-        if half < 3 * cm:
+        full_w = (self._fr - self._fl) - 12            # inner width of a full-width frame
+        if half < 3 * cm or self.width < full_w - 1:   # narrow frame (beside the answer box): just span it
             x0, x1 = 0, self.width
         else:
             x0, x1 = (centre - half) - self._fl, (centre + half) - self._fl
@@ -2010,6 +2016,27 @@ def _clipboard_box_width(max_num: int, letters: list, font_bold: str, fs: float 
     num_w = pdfmetrics.stringWidth("8" * len(str(max(1, int(max_num)))) + ".", font_bold, fs)
     let_w = max((pdfmetrics.stringWidth(str(l), font_bold, fs) for l in (letters or ["A"])), default=fs * 0.7)
     return max(60.0, 28 + num_w + 6 + let_w + 13)
+
+def _ak_box_rect(style, n, clip_w, wall_gap_cm, nudge_cm, up_nudge_cm, content_box=None):
+    """(x_left, y_bottom, width, height) of the per-page answer-key box that
+    holds `n` answers. The ONE place this geometry lives: the canvas draws the
+    box from it and the page layout reserves the very same rectangle (plus a
+    gap) so text can never run under it. `clip_w` = fitted width of the
+    clipboard ("column" style); the "grouped" style has a fixed 6.6 cm width."""
+    n = max(1, int(n))
+    if style == "column":
+        w = clip_w
+        h = 22 + 0.65 * cm * n + 10
+    else:
+        w = 6.6 * cm
+        h = 0.3 * cm * 2 + 0.48 * cm * ((n + 3) // 4)
+    x = A4[0] - wall_gap_cm * cm - nudge_cm * cm - w
+    y = 2.1 * cm + up_nudge_cm * cm
+    if content_box:                                # keep the box fully inside the frame's white area
+        m = 0.15 * cm
+        x = max(content_box[0] + m, min(x, content_box[2] - m - w))
+        y = max(content_box[1] + m, min(y, content_box[3] - m - h))
+    return x, y, w, h
 
 class _AnswerKeyCanvas(_canvas.Canvas):
     def __init__(self, *args, answer_pairs=None, page_of_idx=None,
@@ -2106,12 +2133,9 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         P200, P900 = colors.HexColor(_ak["P200"]), colors.HexColor(_ak["P900"])
         LINE_H, FS = 0.65 * cm, 13
         n   = len(pairs)
-        w   = self._ak_box_w or _clipboard_box_width(max(q for q, _ in pairs), [l for _, l in pairs], self._ak_font_bold)
-        h   = 22 + LINE_H * n + 10
-        x_right = A4[0] - self._ak_wall_gap_cm * cm - self._ak_nudge_cm * cm
-        x       = x_right - w
-        y       = 2.1 * cm + self._ak_up_nudge_cm * cm
-        x, y    = self._clamp_to_content(x, y, w, h)
+        w0  = self._ak_box_w or _clipboard_box_width(max(q for q, _ in pairs), [l for _, l in pairs], self._ak_font_bold)
+        x, y, w, h = _ak_box_rect("column", n, w0, self._ak_wall_gap_cm, self._ak_nudge_cm,
+                                  self._ak_up_nudge_cm, self._ak_content_box)
 
         self.saveState()
         if AK_UPSIDE_DOWN:
@@ -2187,17 +2211,15 @@ class _AnswerKeyCanvas(_canvas.Canvas):
                 "   ".join(f"{n}-{letter}" for n, letter in pairs[i:i + per_row])
                 for i in range(0, len(pairs), per_row)
             ]
-            box_w = 6.6 * cm
-            box_h = pad * 2 + line_h * len(lines)
-
-            x_right  = A4[0] - AK_WALL_GAP - self._ak_nudge_cm * cm
-            x_left   = x_right - box_w
-            y_bottom = 2.1 * cm + AK_UP_NUDGE
+            x_left, y_bottom, box_w, box_h = _ak_box_rect(
+                "grouped", len(pairs), None, self._ak_wall_gap_cm, self._ak_nudge_cm,
+                self._ak_up_nudge_cm, self._ak_content_box)
 
             fill_color   = colors.HexColor(self._ak_theme["gk_fill"])
             stroke_color = colors.HexColor(self._ak_theme["gk_stroke"])
 
-        x_left, y_bottom = self._clamp_to_content(x_left, y_bottom, box_w, box_h)
+        if self._ak_style == "column":      # (legacy branch above, never reached — kept for safety)
+            x_left, y_bottom = self._clamp_to_content(x_left, y_bottom, box_w, box_h)
 
         self.saveState()
         if AK_UPSIDE_DOWN:
@@ -2453,16 +2475,98 @@ def detect_frame_content_box(path):
         print(f"Frame detection error: {e} — using the default margins.")
         return None
 
+class _SideBySide(Flowable):
+    """A question (text flowables) on the LEFT with its picture(s) on the RIGHT.
+    The picture column takes at most `frac` of the frame width, the text gets the
+    rest, and both are laid out for the frame the block actually lands in — so in
+    the narrower frame beside the answer-key box it simply gets narrower too and
+    never reaches under the box. Too tall for the space → falls back to stacking
+    the text and then the pictures, which can split across pages."""
+    def __init__(self, left, right, frac=0.42, gap=14, max_h=None):
+        super().__init__()
+        self.max_h = max_h          # height above which the block may be broken up instead of moved whole
+        self.left, self.right, self.frac, self.gap = list(left), list(right), frac, gap
+        self._lw = self._rw = 0
+        self._lh = []; self._rh = []
+
+    def _stack(self, items, w):
+        hs = []
+        for f in items:
+            _, h = f.wrap(w, 10 ** 6)
+            hs.append(h + (f.getSpaceAfter() or 0))
+        return hs
+
+    def wrap(self, availWidth, availHeight):
+        nat = max([getattr(f, "_base_size", (0, 0))[0] for f in self.right] or [0])
+        self._rw = min(nat, availWidth * self.frac)
+        self._lw = availWidth - self._rw - self.gap
+        self._lh = self._stack(self.left, self._lw)
+        self._rh = self._stack(self.right, self._rw)
+        self.width = availWidth
+        self.height = max(sum(self._lh), sum(self._rh))
+        return availWidth, self.height
+
+    def split(self, availWidth, availHeight):
+        # Not enough room in THIS frame. Normally just move the whole block to the next
+        # frame/page ([] = "can't split"); only a block too tall to ever fit gets broken
+        # up into its stacked parts.
+        self.wrap(availWidth, availHeight)
+        info = self.max_h if isinstance(self.max_h, dict) else {}
+        limit = info.get('_maxh') or (self.max_h if not isinstance(self.max_h, dict) else 0) or 0
+        fr = getattr(self, '_frame', None)
+        last_frame = (fr is None) or (getattr(fr, 'id', None) == info.get('_last'))
+        # break it up when it can never fit (taller than any frame here) or when this is the
+        # page's last frame — otherwise move it whole to the next frame / page
+        too_tall = bool(limit) and self.height > limit - 12
+        if not last_frame and not too_tall:
+            return []                         # move the whole block to the next frame
+        at_top = bool(getattr(fr, '_atTop', False))
+        if not too_tall and not at_top and not getattr(self, '_moved', False):
+            self._moved = True                # try once on a fresh page, still side by side
+            return [PageBreak(), self]
+        parts = list(self.left) + list(self.right)
+        try:
+            first_h = parts[0].wrap(availWidth, 10 ** 6)[1]
+        except Exception:
+            first_h = 0
+        if first_h > availHeight and not at_top:
+            return [PageBreak()] + parts
+        return parts
+
+    def draw(self):
+        c = self.canv
+        y = self.height
+        for f, h in zip(self.left, self._lh):
+            fh = h - (f.getSpaceAfter() or 0)
+            f.drawOn(c, 0, y - fh)
+            y -= h
+        y = self.height
+        x = self.width - self._rw
+        for f, h in zip(self.right, self._rh):
+            fh = h - (f.getSpaceAfter() or 0)
+            f.drawOn(c, x, y - fh)
+            y -= h
+
+class _FitImage(RLImage):
+    """An image that shrinks (never grows) to the frame it lands in, so one that fits
+    the full text width still fits the narrower frame beside the answer-key box."""
+    def wrap(self, availWidth, availHeight):
+        bw, bh = self._base_size
+        k = min(1.0, availWidth / float(bw)) if bw else 1.0
+        self.drawWidth, self.drawHeight = bw * k, bh * k
+        return self.drawWidth, self.drawHeight
+
 def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT):
     """Loads an image as an RLImage, scaled DOWN (never up) to fit within
     max_w x max_h while keeping its aspect ratio — so a wide screenshot or
     a tall portrait photo both come out compressed to a sane on-page size
-    instead of one dimension ballooning to fill the page."""
-    img   = RLImage(path)
+    instead of one dimension ballooning to fill the page. It also adapts to
+    the width of whichever frame it ends up in."""
+    img   = _FitImage(path)
     scale = min(max_w / img.imageWidth, max_h / img.imageHeight, 1.0)
-    if scale < 1.0:
-        img.drawWidth  = img.imageWidth * scale
-        img.drawHeight = img.imageHeight * scale
+    img.drawWidth  = img.imageWidth * scale
+    img.drawHeight = img.imageHeight * scale
+    img._base_size = (img.drawWidth, img.drawHeight)
     return img
 
 # ═══════════════════════════════════════════════════════════════
@@ -2489,6 +2593,8 @@ class _PageCentered(Flowable):
         half = min(centre - self.frame_left, self.frame_right - centre)
         if half < self.MIN_HALF_W:                 # can't centre sensibly → keep it in the column
             return 0, availWidth
+        if availWidth < (self.frame_right - self.frame_left - 12) - 1:
+            return 0, availWidth - 2 * self.pad    # a narrower frame (beside the answer box): stay inside it
         return (centre - half) - self.frame_left, 2 * (half - self.pad)
 
     def wrap(self, availWidth, availHeight):
@@ -2516,6 +2622,68 @@ class _PageCentered(Flowable):
         c.translate(self._x0, 0)
         self.inner.drawOn(c, 0, 0)
         c.restoreState()
+
+class _AdaptivePara(Paragraph):
+    """A Paragraph whose markup is re-built for the width it is actually given.
+    Arabic/Hebrew text is line-wrapped by us (in logical order) rather than by
+    reportlab, so the lines must be re-wrapped whenever the paragraph lands in
+    a frame of a different width (full width above the answer box, narrower
+    beside it). Pieces created by Paragraph.split() carry no builder and behave
+    like a normal Paragraph."""
+    def __init__(self, text, style=None, bulletText=None, frags=None, caseSensitive=1, encoding='utf8', builder=None):
+        Paragraph.__init__(self, text, style, bulletText, frags, caseSensitive, encoding)
+        self._builder = builder
+        self._built_w = None
+
+    def wrap(self, availWidth, availHeight):
+        if self._builder is not None and self._built_w != availWidth:
+            markup = self._builder(availWidth)
+            Paragraph.__init__(self, markup, self.style)
+            self._built_w = availWidth
+        return Paragraph.wrap(self, availWidth, availHeight)
+
+class _ZonedDoc(SimpleDocTemplate):
+    """SimpleDocTemplate that can reserve a no-text zone on a page — the spot
+    where the answer-key box will be stamped. A page with a zone gets up to
+    three frames, filled in this order:
+        A  above the zone      — the FULL text width
+        B  beside the zone     — narrower, ends before the box
+        C  below the zone      — full width again (only when there is room)
+    A page without a zone has the usual single full-size frame.
+    zone_for_page(page_no) -> None | {"top", "bottom", "narrow_right"} (page coordinates, points).
+    `frame_tops` is filled with {page_no: [content-top y of every frame]} so the
+    dashed separators know when they sit at the very top of a frame."""
+    MIN_A_H = 1.2 * cm       # a top frame thinner than this is dropped
+    MIN_C_H = 3.0 * cm       # a bottom frame shorter than this is dropped
+
+    def __init__(self, *args, zone_for_page=None, frame_tops=None, **kwargs):
+        SimpleDocTemplate.__init__(self, *args, **kwargs)
+        self._zone_for_page = zone_for_page
+        self.frame_tops = frame_tops if frame_tops is not None else {}
+
+    def beforePage(self):
+        SimpleDocTemplate.beforePage(self)
+        L, B, W, H = self.leftMargin, self.bottomMargin, self.width, self.height
+        top = B + H
+        z = self._zone_for_page(self.page) if self._zone_for_page else None
+        if not z:
+            frames = [Frame(L, B, W, H, id="normal")]
+        else:
+            zone_top    = min(z["top"], top)
+            zone_bottom = max(z["bottom"], B)
+            narrow_w    = max(z["narrow_right"] - L, 5 * cm)
+            frames = []
+            if top - zone_top >= self.MIN_A_H:
+                frames.append(Frame(L, zone_top, W, top - zone_top, id="above"))
+            frames.append(Frame(L, zone_bottom, narrow_w, max(zone_top - zone_bottom, 1), id="beside"))
+            if zone_bottom - B >= self.MIN_C_H:
+                frames.append(Frame(L, B, W, zone_bottom - B, id="below"))
+        self.pageTemplate.frames[:] = frames
+        for f in frames:
+            f._reset()
+        self.frame_tops[self.page] = [f._y1 + f._height - f._topPadding for f in frames]
+        self.frame_tops['_last'] = frames[-1].id
+        self.frame_tops['_maxh'] = max(f._height - f._topPadding - f._bottomPadding for f in frames)   # tallest frame on this page
 
 def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               font_bold_path: str = None, bg_image_path: str = None,
@@ -2626,14 +2794,10 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     )
 
     if ak_style == "column":
-        # The text column ends just before the answer-key box's ACTUAL left
-        # edge — computed from the same wall-gap / shift numbers the canvas
-        # uses to place the box — so lines run right up to it instead of
-        # stopping at a fixed reserve. If the box is pushed mostly off the
-        # page (negative shift), the text simply extends further right.
-        box_left_x   = min(A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm, AK_X_RIGHT_MAX) - AK_BOX_W
-        right_margin = A4[0] - box_left_x + TEXT_TO_BOX_GAP_CM * cm
-        right_margin = max(MIN_RIGHT_MARGIN_CM * cm, right_margin, FIT_RIGHT)
+        # Text spans the FULL width of the white area. The clipboard's spot is
+        # carved out per page by _ZonedDoc (full width above it, narrower only
+        # beside it), so nothing is reserved on the right here.
+        right_margin = max(MIN_RIGHT_MARGIN_CM * cm, FIT_RIGHT)
         right_margin = min(right_margin, A4[0] - LEFT_MARGIN - MIN_TEXT_WIDTH_CM * cm)
         _DOC_MARGINS = dict(
             leftMargin=LEFT_MARGIN,
@@ -2649,7 +2813,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # reserves room for the per-page answer-key box so normal flowing
             # text doesn't get laid out underneath where that box will later
             # be stamped on top of it.
-            bottomMargin=max(3.6*cm, FIT_BOTTOM),
+            bottomMargin=max(2*cm, FIT_BOTTOM),   # the box's spot is carved out per page by _ZonedDoc
         )
 
     # Left/right edges of the text column, used to centre the title and the
@@ -2663,6 +2827,9 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # Images are capped at IMG_MAX_LINES lines of option text (same line height
     # the options use), so they follow the font-size setting and stay small.
     IMG_MAX_H = IMG_MAX_LINES * 15 * FSCALE
+    IMG_SIDE_MAX_H = 11 * 15 * FSCALE      # pictures beside a question can be taller (≈ 5.8 cm)
+    IMG_SIDE_MAX_W = 9 * cm
+    IMG_BLOCK_MAX_H = A4[1] - _DOC_MARGINS['topMargin'] - _DOC_MARGINS['bottomMargin']
 
     Q_GAP   = q_gap_cm * cm      # space between questions (a Spacer at the top of each block)
     OPT_GAP = opt_gap_cm * cm    # space after each option / answer line
@@ -2728,32 +2895,37 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
 
     def mk_para(text, style, *, bold, lead=(), ltr_pad="", label=False, avail=None, br=False, ar="md"):
         """Arabic weight: ar="xb" (Ramis ExtraBold) for questions, "md" (Ramis Medium) for
-        choices and everything else. Applies to Arabic characters only."""
-        _AR_TLS.weight = ar
-        try:
-            return _mk_para_inner(text, style, bold=bold, lead=lead, ltr_pad=ltr_pad,
-                                  label=label, avail=avail, br=br)
-        finally:
-            _AR_TLS.weight = "md"
+        choices and everything else. Applies to Arabic characters only. The returned
+        paragraph re-builds its (Arabic) line breaks for whatever frame width it lands in."""
+        def builder(avail_w):
+            _AR_TLS.weight = ar
+            try:
+                return _mk_markup(text, style, bold, lead, ltr_pad, label, avail_w, br)
+            finally:
+                _AR_TLS.weight = "md"
+        markup, st = builder(FRAME_AW if avail is None else avail)
+        return _AdaptivePara(markup, st, builder=lambda w: builder(w)[0])
 
-    def _mk_para_inner(text, style, *, bold, lead=(), ltr_pad="", label=False, avail=None, br=False):
-        """One Paragraph for any piece of text. Text containing Arabic/Hebrew goes through
-        the Ramis engine: wrapped in logical order, every line reordered, right-aligned
-        when the paragraph is mostly RTL (question number / ✓ / "A)" on the right).
-        Everything else is built EXACTLY as before. `lead` = [(plain, markup), …] pieces
-        that start the paragraph; `ltr_pad` = indent markup for left-to-right paragraphs;
-        `label` peels an "A) " option label; `br` keeps line breaks (case box)."""
-        width = (FRAME_AW if avail is None else avail) - style.leftIndent - style.rightIndent
+    def _mk_markup(text, style, bold, lead, ltr_pad, label, avail_w, br):
+        """(markup, style) for any piece of text at frame width `avail_w`. Text containing
+        Arabic/Hebrew goes through the Ramis engine: wrapped in logical order, every line
+        reordered, right-aligned when mostly RTL. Everything else is built EXACTLY as before.
+        `lead` = [(plain, markup), …] pieces that start the paragraph; `ltr_pad` = indent
+        markup for left-to-right paragraphs; `label` peels an "A) " option label; `br` keeps
+        line breaks (case box)."""
+        width = avail_w - style.leftIndent - style.rightIndent
         res = rtl_para_markup(text, style.fontName, bold, style.fontSize, width,
                               lead=lead, ltr_pad=ltr_pad, extract_label=label)
         if res is not None:
             markup, is_rtl = res
-            return Paragraph(markup, _rtl_style(style) if is_rtl else style)
+            return markup, (_rtl_style(style) if is_rtl else style)
         if br:
             body = "<br/>".join(pdf_safe_markup(ln, style.fontName, bold=bold) for ln in str(text).split("\n"))
         else:
             body = pdf_safe_markup(text, style.fontName, bold=bold)
-        return Paragraph(ltr_pad + "".join(h for _, h in lead) + body, style)
+        return ltr_pad + "".join(h for _, h in lead) + body, style
+
+    frame_tops = {}   # {page: [content-top y of each frame]} — filled by _ZonedDoc, read by the dashed separators
 
     def _build_story(page_of_idx):
         """Builds the flowables for the document. `page_of_idx` is a dict
@@ -2771,7 +2943,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # the same page.
             if idx > 1:
                 block.append(Spacer(1, Q_GAP / 2))
-                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2, FRAME_LEFT, FRAME_RIGHT, color=T["sep"]))
+                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2, FRAME_LEFT, FRAME_RIGHT, color=T["sep"], frame_tops=frame_tops))
                 block.append(Spacer(1, Q_GAP / 2))
             else:
                 block.append(Spacer(1, Q_GAP))
@@ -2790,41 +2962,44 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 if item.get("case"):
                     # Per-line markup so the case keeps its line breaks and each
                     # character still gets a font that can draw it.
-                    case_w = _PageCentered(None, FRAME_LEFT, FRAME_RIGHT, pad=8)._geometry(FRAME_AW)[1]
-                    block.append(_PageCentered(mk_para(item["case"], CASE_STYLE, bold=False, avail=case_w, br=True),
+                    block.append(_PageCentered(mk_para(item["case"], CASE_STYLE, bold=False, br=True),
                                                FRAME_LEFT, FRAME_RIGHT, pad=8))
                     block.append(Spacer(1, 12))
-                block.append(mk_para(item["q"], Q_STYLE, bold=True, lead=q_lead, ar="xb"))
+                left = [mk_para(item["q"], Q_STYLE, bold=True, lead=q_lead, ar="xb")]
                 image_paths = ([item["image"]] if item.get("image") else [])
                 image_paths.extend(item.get("additional_images", []))
+                right = []
                 for image_index, image_path in enumerate(image_paths):
                     try:
-                        img = _fit_image(image_path, max_h=IMG_MAX_H)
-                        block.append(Spacer(1, 6))
-                        block.append(img)
+                        img = _fit_image(image_path, max_w=IMG_SIDE_MAX_W, max_h=IMG_SIDE_MAX_H)
+                        img.spaceAfter = 6
+                        right.append(img)
                         if image_index == 0 and item.get("image_caption"):
-                            block.append(mk_para(item["image_caption"], IMG_CAPTION, bold=False))
-                        else:
-                            block.append(Spacer(1, 6))
+                            right.append(mk_para(item["image_caption"], IMG_CAPTION, bold=False))
                     except Exception as e:
-                        block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
+                        left.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
                 for i, opt in enumerate(item["options"]):
                     if show_answers and i == item["correct"]:
-                        block.append(mk_para(opt, OPT_CORRECT, bold=True, lead=ok_lead, label=True))
+                        left.append(mk_para(opt, OPT_CORRECT, bold=True, lead=ok_lead, label=True))
                     else:
-                        block.append(mk_para(opt, OPT_STYLE, bold=False, ltr_pad="     ", label=True))
+                        left.append(mk_para(opt, OPT_STYLE, bold=False, ltr_pad="     ", label=True))
+                if right:
+                    block.append(_SideBySide(left, right, max_h=frame_tops))
+                else:
+                    block.extend(left)
                 if item.get("correct") is not None:
                     answer_pairs.append((idx, string.ascii_uppercase[item["correct"]]))
 
             elif item["type"] == "written":
-                block.append(mk_para(item.get("title") or "", WRITTEN_TITLE, bold=True, lead=q_lead, ar="xb"))
-                if item.get("image"):                      # picture that belongs to the QUESTION
+                w_title = mk_para(item.get("title") or "", WRITTEN_TITLE, bold=True, lead=q_lead, ar="xb")
+                if item.get("image"):                      # picture that belongs to the QUESTION (to the right of it)
                     try:
-                        block.append(Spacer(1, 6))
-                        block.append(_fit_image(item["image"], max_h=IMG_MAX_H))
-                        block.append(Spacer(1, 6))
+                        block.append(_SideBySide([w_title], [_fit_image(item["image"], max_w=IMG_SIDE_MAX_W, max_h=IMG_SIDE_MAX_H)], max_h=frame_tops))
                     except Exception as e:
+                        block.append(w_title)
                         block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
+                else:
+                    block.append(w_title)
                 if show_answers and show_written_answers:
                     if item.get("content"):
                         block.append(mk_para(item["content"], WRITTEN_ANSWER, bold=True, lead=ok_lead))
@@ -2862,44 +3037,87 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
 
         return story, answer_pairs
 
-    page_of_idx  = {}
-    story, answer_pairs = _build_story(page_of_idx=page_of_idx)
-
-    # Title (= the file name) at the top of the first content page. With a
-    # cover, the PageBreak inserted below goes in front of this, so the title
-    # lands on page 2 — the first page that actually carries content.
-    if doc_title and str(doc_title).strip():
-        story[0:0] = [_PageCentered(_OutlinedTitle(doc_title, base_size=30 * FSCALE, fill=T["title"]), FRAME_LEFT, FRAME_RIGHT), Spacer(1, 4)]
-
     have_cover = bool(cover_image_path and os.path.exists(cover_image_path))
-    if have_cover:
-        # Page 1 is drawn entirely by draw_cover() below (a full-bleed
-        # image, via onFirstPage) — this PageBreak means no flowable
-        # content/frame/header ever lands on it, and the first real
-        # question starts fresh on page 2.
-        story.insert(0, PageBreak())
 
-    doc = SimpleDocTemplate(buffer, pagesize=A4, **_DOC_MARGINS)
+    def _make_story(page_of_idx):
+        story, answer_pairs = _build_story(page_of_idx=page_of_idx)
+        # Title (= the file name) at the top of the first content page. With a
+        # cover, the PageBreak inserted below goes in front of this, so the title
+        # lands on page 2 — the first page that actually carries content.
+        if doc_title and str(doc_title).strip():
+            story[0:0] = [_PageCentered(_OutlinedTitle(doc_title, base_size=30 * FSCALE, fill=T["title"]), FRAME_LEFT, FRAME_RIGHT), Spacer(1, 4)]
+        if have_cover:
+            # Page 1 is drawn entirely by draw_cover() (a full-bleed image) — this
+            # PageBreak keeps all flowable content off it.
+            story.insert(0, PageBreak())
+        return story, answer_pairs
 
-    def _make_canvas(*args, **kwargs):
-        return _AnswerKeyCanvas(
-            *args, answer_pairs=answer_pairs, page_of_idx=page_of_idx,
-            font_name=font_name, font_name_bold=font_name_bold,
-            ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
-            ak_right_margin=_DOC_MARGINS["rightMargin"], ak_top_margin=_DOC_MARGINS["topMargin"],
-            ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
-            ak_box_w=AK_BOX_W,
-            ak_content_box=FRAME_BOX,
-            ak_theme=T,
-            **kwargs,
-        )
+    def _zones_from(page_of_idx, answer_pairs):
+        """{page: zone} — where each page's answer box will be stamped, as a no-text
+        zone for _ZonedDoc (both box styles)."""
+        zones = {}
+        counts = {}
+        for q_num, _letter in answer_pairs:
+            pg = page_of_idx.get(q_num)
+            if pg:
+                counts[pg] = counts.get(pg, 0) + 1
+        gap = 0.25 * cm
+        for pg, n in counts.items():
+            x, y, w, h = _ak_box_rect(ak_style, n, AK_BOX_W, ak_wall_gap_cm, ak_nudge_cm, ak_up_nudge_cm, FRAME_BOX)
+            zones[pg] = dict(top=y + h + gap, bottom=y - gap,
+                             narrow_right=x - TEXT_TO_BOX_GAP_CM * cm + 6)   # +6: the frame's own padding
+        return zones
 
-    doc.build(
-        story,
-        onFirstPage=draw_cover if have_cover else draw_header,
-        onLaterPages=draw_header,
-        canvasmaker=_make_canvas,
-    )
+    def _run_pass(zones, margins):
+        """One full layout. Returns (buffer, page_of_idx, answer_pairs)."""
+        poi = {}
+        story, pairs = _make_story(poi)
+        buf = BytesIO()
+        tops = frame_tops
+        tops.clear()
+        zdoc = _ZonedDoc(buf, pagesize=A4, zone_for_page=(lambda p: zones.get(p)), frame_tops=tops, **margins)
+
+        def _canvas_factory(*args, **kwargs):
+            return _AnswerKeyCanvas(
+                *args, answer_pairs=pairs, page_of_idx=poi,
+                font_name=font_name, font_name_bold=font_name_bold,
+                ak_style=ak_style, ak_nudge_cm=ak_nudge_cm,
+                ak_right_margin=margins["rightMargin"], ak_top_margin=margins["topMargin"],
+                ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
+                ak_box_w=AK_BOX_W,
+                ak_content_box=FRAME_BOX,
+                ak_theme=T,
+                **kwargs,
+            )
+        zdoc.build(story,
+                   onFirstPage=draw_cover if have_cover else draw_header,
+                   onLaterPages=draw_header,
+                   canvasmaker=_canvas_factory)
+        return buf, poi, pairs
+
+    # The box's spot depends on how many answers a page holds, which depends on
+    # where the pages break, which depends on the spot — so lay out repeatedly
+    # until the page assignment stops changing (normally 2-3 passes).
+    buffer, page_of_idx, _pairs = _run_pass({}, _DOC_MARGINS)
+    if True:
+        stable = False
+        for _ in range(6):
+            zones = _zones_from(page_of_idx, _pairs)
+            buf2, poi2, pairs2 = _run_pass(zones, _DOC_MARGINS)
+            same = (poi2 == page_of_idx)
+            buffer, page_of_idx, _pairs = buf2, poi2, pairs2
+            if same:
+                stable = True
+                break
+        if not stable:
+            # Never settled (rare): fall back to the classic layout that reserves the
+            # box's width on the right of EVERY page, so text still cannot touch it.
+            box_left_x = min(A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm, AK_X_RIGHT_MAX) - AK_BOX_W
+            rm = max(MIN_RIGHT_MARGIN_CM * cm, A4[0] - box_left_x + TEXT_TO_BOX_GAP_CM * cm, FIT_RIGHT)
+            rm = min(rm, A4[0] - LEFT_MARGIN - MIN_TEXT_WIDTH_CM * cm)
+            legacy = dict(_DOC_MARGINS, rightMargin=rm if ak_style == "column" else _DOC_MARGINS["rightMargin"],
+                          bottomMargin=max(2*cm if ak_style == "column" else 3.6*cm, FIT_BOTTOM))
+            buffer, page_of_idx, _pairs = _run_pass({}, legacy)
     if page_map_out is not None:
         page_map_out.update(page_of_idx)
     buffer.seek(0)
