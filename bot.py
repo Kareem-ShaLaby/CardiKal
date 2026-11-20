@@ -2475,6 +2475,9 @@ def detect_frame_content_box(path):
         print(f"Frame detection error: {e} — using the default margins.")
         return None
 
+from reportlab.platypus.doctemplate import FrameBreak
+from reportlab.platypus.flowables import CondPageBreak
+
 class _SideBySide(Flowable):
     """A question (text flowables) on the LEFT with its picture(s) on the RIGHT.
     The picture column takes at most `frac` of the frame width, the text gets the
@@ -2518,9 +2521,11 @@ class _SideBySide(Flowable):
         # break it up when it can never fit (taller than any frame here) or when this is the
         # page's last frame — otherwise move it whole to the next frame / page
         too_tall = bool(limit) and self.height > limit - 12
-        if not last_frame and not too_tall:
-            return []                         # move the whole block to the next frame
         at_top = bool(getattr(fr, '_atTop', False))
+        if not last_frame and not too_tall:
+            # move the whole block to the next frame (reportlab refuses a plain "can't split"
+            # when this frame is still empty, so ask for the frame break explicitly)
+            return [FrameBreak(), self] if at_top else []
         if not too_tall and not at_top and not getattr(self, '_moved', False):
             self._moved = True                # try once on a fresh page, still side by side
             return [PageBreak(), self]
@@ -2529,8 +2534,8 @@ class _SideBySide(Flowable):
             first_h = parts[0].wrap(availWidth, 10 ** 6)[1]
         except Exception:
             first_h = 0
-        if first_h > availHeight and not at_top:
-            return [PageBreak()] + parts
+        if first_h > availHeight:
+            return [CondPageBreak(first_h)] + parts      # S[0] must fit — this moves on to the next frame first
         return parts
 
     def draw(self):
@@ -2547,22 +2552,61 @@ class _SideBySide(Flowable):
             f.drawOn(c, x, y - fh)
             y -= h
 
+class _KeepOnPage(KeepTogether):
+    """KeepTogether that only insists on staying together across PAGES. When the
+    page has another frame still to come (the narrower one beside the answer box),
+    a question that doesn't fit the space left simply carries on there instead of
+    jumping to the next page and leaving a hole above the box."""
+    def __init__(self, content, info=None, **kw):
+        KeepTogether.__init__(self, content, **kw)
+        self._info = info if info is not None else {}
+
+    def split(self, aW, aH):
+        fr = getattr(self, '_frame', None)
+        if fr is not None and getattr(fr, 'id', None) != self._info.get('_last') and self._info.get('_last'):
+            if aH < 2.0 * cm:                  # too little room left to start here: next frame
+                return [FrameBreak(), self] if getattr(fr, '_atTop', False) else []
+            return list(self._content)
+        return KeepTogether.split(self, aW, aH)
+
 class _FitImage(RLImage):
     """An image that shrinks (never grows) to the frame it lands in, so one that fits
-    the full text width still fits the narrower frame beside the answer-key box."""
+    the full text width still fits the narrower frame beside the answer-key box. If it
+    can't fit the space left it moves to the next frame/page; if it is the only thing
+    on the page's last frame and still doesn't fit, it is scaled down to fit."""
+    _info = None
+    _cap_h = None
+
     def wrap(self, availWidth, availHeight):
         bw, bh = self._base_size
         k = min(1.0, availWidth / float(bw)) if bw else 1.0
+        if self._cap_h and bh:
+            k = min(k, self._cap_h / float(bh))
         self.drawWidth, self.drawHeight = bw * k, bh * k
         return self.drawWidth, self.drawHeight
 
-def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT):
+    def split(self, availWidth, availHeight):
+        info = self._info if isinstance(self._info, dict) else {}
+        fr = getattr(self, '_frame', None)
+        at_top = bool(getattr(fr, '_atTop', False))
+        last = (fr is None) or getattr(fr, 'id', None) == info.get('_last')
+        if not last:
+            return [FrameBreak(), self] if at_top else []
+        if not at_top:
+            return []                                   # next page
+        if availHeight < 3 * cm:
+            return [PageBreak(), self]
+        self._cap_h = availHeight - 4                   # nowhere else to go: scale it down
+        return [self]
+
+def _fit_image(path, max_w=PDF_MAX_IMG_WIDTH, max_h=PDF_MAX_IMG_HEIGHT, info=None):
     """Loads an image as an RLImage, scaled DOWN (never up) to fit within
     max_w x max_h while keeping its aspect ratio — so a wide screenshot or
     a tall portrait photo both come out compressed to a sane on-page size
     instead of one dimension ballooning to fill the page. It also adapts to
     the width of whichever frame it ends up in."""
     img   = _FitImage(path)
+    img._info = info
     scale = min(max_w / img.imageWidth, max_h / img.imageHeight, 1.0)
     img.drawWidth  = img.imageWidth * scale
     img.drawHeight = img.imageHeight * scale
@@ -2672,12 +2716,17 @@ class _ZonedDoc(SimpleDocTemplate):
             zone_top    = min(z["top"], top)
             zone_bottom = max(z["bottom"], B)
             narrow_w    = max(z["narrow_right"] - L, 5 * cm)
+            has_a = top - zone_top >= self.MIN_A_H
+            has_c = zone_bottom - B >= self.MIN_C_H
             frames = []
-            if top - zone_top >= self.MIN_A_H:
-                frames.append(Frame(L, zone_top, W, top - zone_top, id="above"))
-            frames.append(Frame(L, zone_bottom, narrow_w, max(zone_top - zone_bottom, 1), id="beside"))
-            if zone_bottom - B >= self.MIN_C_H:
-                frames.append(Frame(L, B, W, zone_bottom - B, id="below"))
+            # no padding where two frames meet, so a question that runs from one into the
+            # next doesn't show a gap at the seam
+            if has_a:
+                frames.append(Frame(L, zone_top, W, top - zone_top, id="above", bottomPadding=0))
+            frames.append(Frame(L, zone_bottom, narrow_w, max(zone_top - zone_bottom, 1), id="beside",
+                                topPadding=0 if has_a else 6, bottomPadding=0 if has_c else 6))
+            if has_c:
+                frames.append(Frame(L, B, W, zone_bottom - B, id="below", topPadding=0))
         self.pageTemplate.frames[:] = frames
         for f in frames:
             f._reset()
@@ -2925,6 +2974,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             body = pdf_safe_markup(text, style.fontName, bold=bold)
         return ltr_pad + "".join(h for _, h in lead) + body, style
 
+    fit_image = lambda p, **kw: _fit_image(p, info=frame_tops, **kw)
     frame_tops = {}   # {page: [content-top y of each frame]} — filled by _ZonedDoc, read by the dashed separators
 
     def _build_story(page_of_idx):
@@ -2971,7 +3021,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 right = []
                 for image_index, image_path in enumerate(image_paths):
                     try:
-                        img = _fit_image(image_path, max_w=IMG_SIDE_MAX_W, max_h=IMG_SIDE_MAX_H)
+                        img = fit_image(image_path, max_w=IMG_SIDE_MAX_W, max_h=IMG_SIDE_MAX_H)
                         img.spaceAfter = 6
                         right.append(img)
                         if image_index == 0 and item.get("image_caption"):
@@ -2994,7 +3044,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 w_title = mk_para(item.get("title") or "", WRITTEN_TITLE, bold=True, lead=q_lead, ar="xb")
                 if item.get("image"):                      # picture that belongs to the QUESTION (to the right of it)
                     try:
-                        block.append(_SideBySide([w_title], [_fit_image(item["image"], max_w=IMG_SIDE_MAX_W, max_h=IMG_SIDE_MAX_H)], max_h=frame_tops))
+                        block.append(_SideBySide([w_title], [fit_image(item["image"], max_w=IMG_SIDE_MAX_W, max_h=IMG_SIDE_MAX_H)], max_h=frame_tops))
                     except Exception as e:
                         block.append(w_title)
                         block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
@@ -3006,7 +3056,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     if item.get("answer_image"):           # spoilered picture = the ANSWER (answered PDF only)
                         try:
                             block.append(Spacer(1, 4))
-                            block.append(_fit_image(item["answer_image"], max_h=IMG_MAX_H))
+                            block.append(fit_image(item["answer_image"], max_h=IMG_MAX_H))
                             block.append(Spacer(1, 4))
                         except Exception as e:
                             block.append(Paragraph(f"[Image error: {pdf_safe_markup(str(e), font_name)}]", WRITTEN_BODY))
@@ -3019,7 +3069,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 block.append(Paragraph(q_num_label, NUM_STYLE))
                 img_path = item["path"]
                 try:
-                    img = _fit_image(img_path, max_h=IMG_MAX_H)
+                    img = fit_image(img_path, max_h=IMG_MAX_H)
                     block.append(Spacer(1, 8))
                     block.append(img)
                     if item.get("caption"):
@@ -3033,7 +3083,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # scored MCQs — needed to compute top/bottom separators below.
             block.append(_PageRecorder(page_of_idx, idx))
 
-            story.append(KeepTogether(block))
+            story.append(_KeepOnPage(block, frame_tops))
 
         return story, answer_pairs
 
@@ -3052,15 +3102,18 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             story.insert(0, PageBreak())
         return story, answer_pairs
 
-    def _zones_from(page_of_idx, answer_pairs):
-        """{page: zone} — where each page's answer box will be stamped, as a no-text
-        zone for _ZonedDoc (both box styles)."""
-        zones = {}
+    def _counts_of(page_of_idx, answer_pairs):
         counts = {}
         for q_num, _letter in answer_pairs:
             pg = page_of_idx.get(q_num)
             if pg:
                 counts[pg] = counts.get(pg, 0) + 1
+        return counts
+
+    def _zones_from(counts):
+        """{page: zone} — where each page's answer box will be stamped, as a no-text
+        zone for _ZonedDoc (both box styles). `counts` = {page: answers on that page}."""
+        zones = {}
         gap = 0.25 * cm
         for pg, n in counts.items():
             x, y, w, h = _ak_box_rect(ak_style, n, AK_BOX_W, ak_wall_gap_cm, ak_nudge_cm, ak_up_nudge_cm, FRAME_BOX)
@@ -3096,28 +3149,32 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         return buf, poi, pairs
 
     # The box's spot depends on how many answers a page holds, which depends on
-    # where the pages break, which depends on the spot — so lay out repeatedly
-    # until the page assignment stops changing (normally 2-3 passes).
+    # where the pages break, which depends on the spot. So: lay out, reserve a zone
+    # per page for the answers that landed there, lay out again, and keep going until
+    # every page's zone is at least as big as the box it actually receives. Zones only
+    # ever grow between passes, so this always settles; a zone that is a little bigger
+    # than its box just leaves a bit more room, it can never let text touch the box.
     buffer, page_of_idx, _pairs = _run_pass({}, _DOC_MARGINS)
-    if True:
-        stable = False
-        for _ in range(6):
-            zones = _zones_from(page_of_idx, _pairs)
-            buf2, poi2, pairs2 = _run_pass(zones, _DOC_MARGINS)
-            same = (poi2 == page_of_idx)
-            buffer, page_of_idx, _pairs = buf2, poi2, pairs2
-            if same:
-                stable = True
-                break
-        if not stable:
-            # Never settled (rare): fall back to the classic layout that reserves the
-            # box's width on the right of EVERY page, so text still cannot touch it.
-            box_left_x = min(A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm, AK_X_RIGHT_MAX) - AK_BOX_W
-            rm = max(MIN_RIGHT_MARGIN_CM * cm, A4[0] - box_left_x + TEXT_TO_BOX_GAP_CM * cm, FIT_RIGHT)
-            rm = min(rm, A4[0] - LEFT_MARGIN - MIN_TEXT_WIDTH_CM * cm)
-            legacy = dict(_DOC_MARGINS, rightMargin=rm if ak_style == "column" else _DOC_MARGINS["rightMargin"],
-                          bottomMargin=max(2*cm if ak_style == "column" else 3.6*cm, FIT_BOTTOM))
-            buffer, page_of_idx, _pairs = _run_pass({}, legacy)
+    zone_n = {}
+    settled = False
+    for _ in range(12):
+        for pg, n in _counts_of(page_of_idx, _pairs).items():
+            zone_n[pg] = max(zone_n.get(pg, 0), n)
+        buf2, poi2, pairs2 = _run_pass(_zones_from(zone_n), _DOC_MARGINS)
+        buffer, page_of_idx, _pairs = buf2, poi2, pairs2
+        if all(n <= zone_n.get(pg, 0) for pg, n in _counts_of(page_of_idx, _pairs).items()):
+            settled = True
+            break
+    if not settled:
+        # Never settled (very unlikely): the classic layout that reserves the box's
+        # width / height on EVERY page, so text still cannot touch it.
+        box_left_x = min(A4[0] - ak_wall_gap_cm * cm - ak_nudge_cm * cm, AK_X_RIGHT_MAX) - AK_BOX_W
+        rm = max(MIN_RIGHT_MARGIN_CM * cm, A4[0] - box_left_x + TEXT_TO_BOX_GAP_CM * cm, FIT_RIGHT)
+        rm = min(rm, A4[0] - LEFT_MARGIN - MIN_TEXT_WIDTH_CM * cm)
+        legacy = dict(_DOC_MARGINS, rightMargin=rm if ak_style == "column" else _DOC_MARGINS["rightMargin"],
+                      bottomMargin=max(2*cm if ak_style == "column" else 3.6*cm, FIT_BOTTOM))
+        buffer, page_of_idx, _pairs = _run_pass({}, legacy)
+        print("PDF layout: answer-box zones did not settle — used the reserved-margin layout")
     if page_map_out is not None:
         page_map_out.update(page_of_idx)
     buffer.seek(0)
