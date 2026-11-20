@@ -1660,6 +1660,41 @@ def _add_pending_case(user_id: int, text: str):
     prev = PENDING_CASE.get(user_id)
     PENDING_CASE[user_id] = f"{prev}\n\n{text}" if prev else text
 
+_LETTER_ONLY_OPT_RE = re.compile(r"^\s*\(?[A-Ea-e1-5]\)?[.):]?\s*$")
+_TEXT_OPT_RE = re.compile(r"^\s*\(?([A-Ea-e])[).:]\s*(.*\S)?\s*$")
+
+def _poll_is_letters_only(poll) -> bool:
+    """True for a quiz poll whose options are just bare letters (A, B, C, D) and
+    whose 'question' is a stub (a dot / empty): the real question and choices were sent as
+    a separate text message right before it, and the poll only carries the answer."""
+    try:
+        opts = [o.text for o in poll.options]
+    except Exception:
+        return False
+    if len(opts) < 2 or not all(_LETTER_ONLY_OPT_RE.match(o or "") for o in opts):
+        return False
+    return len((poll.question or "").strip(" .·-—_")) <= 3
+
+def _parse_text_question(text: str):
+    """(question, [option texts]) from a plain text message that holds a question followed
+    by lettered choices (A) … B) … — blank lines between them are fine, and a choice may
+    wrap onto following lines. None when it doesn't look like that (needs ≥2 choices
+    starting at A)."""
+    q_lines, opts = [], []
+    for ln in (text or "").splitlines():
+        if not ln.strip():
+            continue
+        m = _TEXT_OPT_RE.match(ln)
+        if m and (opts or m.group(1).upper() == "A"):
+            opts.append((m.group(2) or "").strip())
+        elif opts:
+            opts[-1] = (opts[-1] + " " + ln.strip()).strip()
+        else:
+            q_lines.append(ln.strip())
+    if len(opts) < 2 or not q_lines or not all(opts):
+        return None
+    return " ".join(q_lines), opts
+
 def _block_looks_like_mcq(block: str, lines: list) -> bool:
     """True when the block looks like someone TRYING to write an MCQ (so the
     'wrong format' warnings are the right reply) rather than plain prose such
@@ -2478,6 +2513,64 @@ def detect_frame_content_box(path):
 from reportlab.platypus.doctemplate import FrameBreak
 from reportlab.platypus.flowables import CondPageBreak
 
+def _atomic_split(block, availWidth, availHeight, parts, info):
+    """Shared split() for blocks that must stay in one piece (a question with its picture or
+    case box). Not enough room in THIS frame → move the whole block to the next frame, or
+    page. Only a block taller than any frame on the page, or one that can't fit even on a
+    fresh page, is broken up into `parts` (stacked, full width)."""
+    limit = info.get('_fullh') or info.get('_maxh') or 0   # taller than a whole empty page = can never fit
+    fr = getattr(block, '_frame', None)
+    last_frame = (fr is None) or (getattr(fr, 'id', None) == info.get('_last'))
+    too_tall = bool(limit) and block.height > limit - 12
+    at_top = bool(getattr(fr, '_atTop', False))
+    if not last_frame and not too_tall:
+        # reportlab refuses a plain "can't split" while this frame is still empty,
+        # so ask for the frame break explicitly there
+        return [FrameBreak(), block] if at_top else []
+    if not too_tall and not at_top and getattr(block, '_moves', 0) < 4:
+        block._moves = getattr(block, '_moves', 0) + 1   # try the next page(s), still in one piece
+        return [PageBreak(), block]
+    try:
+        first_h = parts[0].wrap(availWidth, 10 ** 6)[1]
+    except Exception:
+        first_h = 0
+    if first_h > availHeight:
+        return [CondPageBreak(first_h)] + parts      # S[0] must fit — moves on to the next frame first
+    return parts
+
+class _WholeBlock(Flowable):
+    """A list of flowables laid out one under another that is kept in ONE piece — the
+    frame-aware counterpart of KeepTogether (which loses its grip once the page has several
+    frames). Used for any question that has a picture or a case box, so such a question is
+    never cut in two: if it doesn't fit it moves whole, and the page simply ends early."""
+    def __init__(self, content, info):
+        super().__init__()
+        self.content, self.max_h = list(content), info
+        self._hs = []
+
+    def wrap(self, availWidth, availHeight):
+        self._hs = []
+        total = 0
+        for f in self.content:
+            _, h = f.wrap(availWidth, 10 ** 6)
+            h += (f.getSpaceBefore() or 0) + (f.getSpaceAfter() or 0)
+            self._hs.append(h)
+            total += h
+        self.width, self.height = availWidth, total
+        return availWidth, total
+
+    def split(self, availWidth, availHeight):
+        self.wrap(availWidth, availHeight)
+        return _atomic_split(self, availWidth, availHeight, list(self.content), self.max_h)
+
+    def draw(self):
+        c = self.canv
+        y = self.height
+        for f, h in zip(self.content, self._hs):
+            sb, sa = (f.getSpaceBefore() or 0), (f.getSpaceAfter() or 0)
+            f.drawOn(c, 0, y - h + sa)
+            y -= h
+
 class _SideBySide(Flowable):
     """A question (text flowables) on the LEFT with its picture(s) on the RIGHT.
     The picture column takes at most `frac` of the frame width, the text gets the
@@ -2514,29 +2607,8 @@ class _SideBySide(Flowable):
         # frame/page ([] = "can't split"); only a block too tall to ever fit gets broken
         # up into its stacked parts.
         self.wrap(availWidth, availHeight)
-        info = self.max_h if isinstance(self.max_h, dict) else {}
-        limit = info.get('_maxh') or (self.max_h if not isinstance(self.max_h, dict) else 0) or 0
-        fr = getattr(self, '_frame', None)
-        last_frame = (fr is None) or (getattr(fr, 'id', None) == info.get('_last'))
-        # break it up when it can never fit (taller than any frame here) or when this is the
-        # page's last frame — otherwise move it whole to the next frame / page
-        too_tall = bool(limit) and self.height > limit - 12
-        at_top = bool(getattr(fr, '_atTop', False))
-        if not last_frame and not too_tall:
-            # move the whole block to the next frame (reportlab refuses a plain "can't split"
-            # when this frame is still empty, so ask for the frame break explicitly)
-            return [FrameBreak(), self] if at_top else []
-        if not too_tall and not at_top and not getattr(self, '_moved', False):
-            self._moved = True                # try once on a fresh page, still side by side
-            return [PageBreak(), self]
-        parts = list(self.left) + list(self.right)
-        try:
-            first_h = parts[0].wrap(availWidth, 10 ** 6)[1]
-        except Exception:
-            first_h = 0
-        if first_h > availHeight:
-            return [CondPageBreak(first_h)] + parts      # S[0] must fit — this moves on to the next frame first
-        return parts
+        return _atomic_split(self, availWidth, availHeight, list(self.left) + list(self.right),
+                             self.max_h if isinstance(self.max_h, dict) else {})
 
     def draw(self):
         c = self.canv
@@ -2732,6 +2804,7 @@ class _ZonedDoc(SimpleDocTemplate):
             f._reset()
         self.frame_tops[self.page] = [f._y1 + f._height - f._topPadding for f in frames]
         self.frame_tops['_last'] = frames[-1].id
+        self.frame_tops['_fullh'] = H - 12      # height of an unzoned page's frame
         self.frame_tops['_maxh'] = max(f._height - f._topPadding - f._bottomPadding for f in frames)   # tallest frame on this page
 
 def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
@@ -3083,7 +3156,12 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # scored MCQs — needed to compute top/bottom separators below.
             block.append(_PageRecorder(page_of_idx, idx))
 
-            story.append(_KeepOnPage(block, frame_tops))
+            # A question with a picture or a case box is never broken up: if it doesn't fit
+            # the space left it moves whole to the next frame, or to the next page (so the
+            # page ends early). Plain-text questions may flow on into the frame beside the box.
+            has_visual = bool(item.get("image") or item.get("additional_images") or item.get("case")
+                              or item.get("answer_image") or item.get("type") == "image")
+            story.append(_WholeBlock(block, frame_tops) if has_visual else _KeepOnPage(block, frame_tops))
 
         return story, answer_pairs
 
@@ -4015,6 +4093,14 @@ async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in PDF_BUFFER:
         await update.message.reply_text(MSG_NOT_IN_SESSION)
         return
+
+    # A bare-letters quiz poll right after a text message that already holds the question and
+    # its choices: the TEXT is the question (not a "case"), the poll only supplies the answer.
+    if _poll_is_letters_only(poll) and PENDING_CASE.get(user_id):
+        parsed = _parse_text_question(PENDING_CASE[user_id])
+        if parsed and len(parsed[1]) == len(raw_options):
+            question, raw_options = parsed
+            PENDING_CASE.pop(user_id, None)
 
     labeled_options = [
         f"{string.ascii_uppercase[i]}) {opt}" for i, opt in enumerate(raw_options)
