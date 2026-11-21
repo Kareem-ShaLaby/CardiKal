@@ -437,6 +437,7 @@ AWAITING_FONT          = {}    # user_id -> True, while the /pdf_start setup flo
 PDF_AK_STYLE           = {}    # user_id -> "grouped" (default, rows of "1-A  2-D") or "column" (one "1. A" per line)
 PDF_AK_NUDGE_CM        = {}    # user_id -> float, how many cm to shift the answer-key box left of its default spot
 AWAITING_AK_STYLE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the answer-key style choice
+PDF_ZIKR               = {}    # user_id -> bool, print the dhikr above the answer box (absent = on)
 PDF_THEME              = {}    # user_id -> key of THEMES (colour theme); absent = DEFAULT_THEME
 AWAITING_THEME         = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the colour-theme choice
 
@@ -1827,12 +1828,16 @@ def export_keyboard(user_id: int = None):
          InlineKeyboardButton("📄 PDF · ⬜ Blank",    callback_data="gen_pdf_b")],
         [InlineKeyboardButton("📝 DOCX · ✅ Answered", callback_data="gen_docx_a"),
          InlineKeyboardButton("📝 DOCX · ⬜ Blank",    callback_data="gen_docx_b")],
+        [InlineKeyboardButton("📊 PPTX · ✅ Answered", callback_data="gen_pptx_a"),
+         InlineKeyboardButton("📊 PPTX · ⬜ Blank",    callback_data="gen_pptx_b")],
         [InlineKeyboardButton("✍️ Written answers: " + ("✅ shown" if written_on else "🙈 hidden"),
                               callback_data="toggle_written")],
         [InlineKeyboardButton("👁 Preview", callback_data="preview_pdf"),
          InlineKeyboardButton("✏️ Edit a Question", callback_data="edit_pick")],
         [InlineKeyboardButton("🎨 Theme: " + get_theme(PDF_THEME.get(user_id)).get("label", ""),
-                              callback_data="theme_pick")],
+                              callback_data="theme_pick"),
+         InlineKeyboardButton("🕋 Zikr: " + ("✅ on" if PDF_ZIKR.get(user_id, True) else "⬜ off"),
+                              callback_data="toggle_zikr")],
         [InlineKeyboardButton("🆕 New session", callback_data="new_session"),
          InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
@@ -2052,7 +2057,12 @@ def _clipboard_box_width(max_num: int, letters: list, font_bold: str, fs: float 
     let_w = max((pdfmetrics.stringWidth(str(l), font_bold, fs) for l in (letters or ["A"])), default=fs * 0.7)
     return max(60.0, 28 + num_w + 6 + let_w + 13)
 
-def _ak_box_rect(style, n, clip_w, wall_gap_cm, nudge_cm, up_nudge_cm, content_box=None):
+AK_ZIKR_LINES = ("سبحان اللّٰه وبحمده", "سبحان اللّٰه العظيم")   # printed above the answer box
+AK_ZIKR_FS    = 12
+AK_ZIKR_LEAD  = 1.3
+AK_ZIKR_H     = len(AK_ZIKR_LINES) * AK_ZIKR_FS * AK_ZIKR_LEAD + 6   # height reserved above the box (pt)
+
+def _ak_box_rect(style, n, clip_w, wall_gap_cm, nudge_cm, up_nudge_cm, content_box=None, extra_top=AK_ZIKR_H):
     """(x_left, y_bottom, width, height) of the per-page answer-key box that
     holds `n` answers. The ONE place this geometry lives: the canvas draws the
     box from it and the page layout reserves the very same rectangle (plus a
@@ -2064,13 +2074,13 @@ def _ak_box_rect(style, n, clip_w, wall_gap_cm, nudge_cm, up_nudge_cm, content_b
         h = 22 + 0.65 * cm * n + 10
     else:
         w = 6.6 * cm
-        h = 0.3 * cm * 2 + 0.48 * cm * ((n + 3) // 4)
+        h = 22 + 0.62 * cm * ((n + 3) // 4) + 10      # clipboard: board + clip + ruled rows of 4
     x = A4[0] - wall_gap_cm * cm - nudge_cm * cm - w
     y = 2.1 * cm + up_nudge_cm * cm
     if content_box:                                # keep the box fully inside the frame's white area
         m = 0.15 * cm
         x = max(content_box[0] + m, min(x, content_box[2] - m - w))
-        y = max(content_box[1] + m, min(y, content_box[3] - m - h))
+        y = max(content_box[1] + m, min(y, content_box[3] - m - h - extra_top))
     return x, y, w, h
 
 class _AnswerKeyCanvas(_canvas.Canvas):
@@ -2079,8 +2089,9 @@ class _AnswerKeyCanvas(_canvas.Canvas):
                  ak_style="grouped", ak_nudge_cm=0.0,
                  ak_right_margin=2*cm, ak_top_margin=2.5*cm,
                  ak_wall_gap_cm=0.5, ak_up_nudge_cm=4.0, ak_box_w=None,
-                 ak_content_box=None, ak_theme=None, **kwargs):
+                 ak_content_box=None, ak_theme=None, ak_zikr=True, **kwargs):
         super().__init__(*args, **kwargs)
+        self._ak_zikr = bool(ak_zikr)                       # print the dhikr above the box?
         self._ak_theme = ak_theme or THEMES[DEFAULT_THEME]   # colour palette of the answer-key box
         self._ak_box_w       = ak_box_w   # fitted width of the clipboard box (same on every page)
         # (x0, y_bottom, x1, y_top) of the frame's white area, or None — the
@@ -2157,6 +2168,43 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             except Exception:
                 cur_x += size * 0.5
 
+    def _draw_zikr(self, x, y, w, h):
+        """The two-line dhikr, in Ramis Arabic, centred above the answer box (x, y, w, h) and
+        sized to roughly its width. Never rotated, even when the box itself is."""
+        if not self._ak_zikr:
+            return
+        lines = []
+        _AR_TLS.weight = "xb"
+        try:
+            for ln in AK_ZIKR_LINES:
+                try:
+                    lines.append(_rtl_visual_line(ln))
+                except Exception:
+                    lines.append(ln)
+            widest = max(_visual_width(t, self._ak_font_bold, True, 1.0) for t in lines) or 1.0
+            fs = max(6.0, min(AK_ZIKR_FS + 2, (w - 6) / widest))
+            col = colors.HexColor(self._ak_theme["ak"]["P600"])
+            self.saveState()
+            self.setFillColor(col)
+            base = y + h + 4 + (len(lines) - 1) * fs * AK_ZIKR_LEAD
+            for t in lines:
+                tw = _visual_width(t, self._ak_font_bold, True, fs)
+                cx = x + w / 2 - tw / 2
+                for ch in t:
+                    f = _pick_font(ch, self._ak_font_bold, True)
+                    if f is None:
+                        ch, f = _last_resort_char(self._ak_font_bold, True), self._ak_font_bold
+                    self.setFont(f, fs)
+                    self.drawString(cx, base, ch)
+                    try:
+                        cx += pdfmetrics.stringWidth(ch, f, fs)
+                    except Exception:
+                        cx += fs * 0.5
+                base -= fs * AK_ZIKR_LEAD
+            self.restoreState()
+        finally:
+            _AR_TLS.weight = "md"
+
     def _draw_clipboard_key(self, pairs):
         """Column-style answer box, drawn as a purple medical CLIPBOARD: purple
         board, white paper, metal clip, ruled rows with a tick box in front of
@@ -2170,7 +2218,8 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         n   = len(pairs)
         w0  = self._ak_box_w or _clipboard_box_width(max(q for q, _ in pairs), [l for _, l in pairs], self._ak_font_bold)
         x, y, w, h = _ak_box_rect("column", n, w0, self._ak_wall_gap_cm, self._ak_nudge_cm,
-                                  self._ak_up_nudge_cm, self._ak_content_box)
+                                  self._ak_up_nudge_cm, self._ak_content_box,
+                                  extra_top=AK_ZIKR_H if self._ak_zikr else 0)
 
         self.saveState()
         if AK_UPSIDE_DOWN:
@@ -2204,11 +2253,57 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             self.setFillColor(P900)
             self._draw_safe_string(x_let, base, str(letter), self._ak_font_bold, FS, bold=True)
         self.restoreState()
+        self._draw_zikr(x, y, w, h)
+
+    def _draw_clipboard_grouped(self, pairs):
+        """The horizontal ("grouped") answer box, drawn as the same purple CLIPBOARD as the
+        column style — board, white paper, metal clip, ruled rows — but with four
+        "N. Letter" entries per row instead of one per line."""
+        _ak = self._ak_theme["ak"]
+        P600, P800 = colors.HexColor(_ak["P600"]), colors.HexColor(_ak["P800"])
+        P500, P300 = colors.HexColor(_ak["P500"]), colors.HexColor(_ak["P300"])
+        P200, P900 = colors.HexColor(_ak["P200"]), colors.HexColor(_ak["P900"])
+        ROW_H, FS, PER_ROW = 0.62 * cm, 11.5, 4
+        n = len(pairs)
+        x, y, w, h = _ak_box_rect("grouped", n, None, self._ak_wall_gap_cm, self._ak_nudge_cm,
+                                  self._ak_up_nudge_cm, self._ak_content_box,
+                                  extra_top=AK_ZIKR_H if self._ak_zikr else 0)
+        self.saveState()
+        if AK_UPSIDE_DOWN:
+            self.translate(x + w / 2, y + h / 2); self.rotate(180); self.translate(-(x + w / 2), -(y + h / 2))
+        self.setFillColor(P600);         self.roundRect(x, y, w, h, 7, stroke=0, fill=1)
+        self.setFillColor(colors.white); self.roundRect(x + 5, y + 5, w - 10, h - 19, 3, stroke=0, fill=1)
+        cw = 38
+        self.setFillColor(P200); self.roundRect(x + w / 2 - cw / 2, y + h - 13, cw, 15, 4, stroke=0, fill=1)
+        self.setFillColor(P800); self.roundRect(x + w / 2 - 9, y + h - 9, 18, 5, 2.5, stroke=0, fill=1)
+        self.setFillColor(P300); self.circle(x + w / 2, y + h - 1.5, 2.2, stroke=0, fill=1)
+        top = y + h - 19
+        cell_w = (w - 22) / PER_ROW
+        for r in range((n + PER_ROW - 1) // PER_ROW):
+            base = top - ROW_H * (r + 1) + 5
+            self.setStrokeColor(P200); self.setLineWidth(0.7)
+            self.line(x + 11, base - 4, x + w - 11, base - 4)
+            for c in range(PER_ROW):
+                k = r * PER_ROW + c
+                if k >= n:
+                    break
+                q, letter = pairs[k]
+                cx = x + 11 + c * cell_w + 3
+                num = f"{q}."
+                self.setFillColor(P500)
+                self._draw_safe_string(cx, base, num, self._ak_font_bold, FS, bold=True)
+                nw = pdfmetrics.stringWidth(num, self._ak_font_bold, FS)
+                self.setFillColor(P900)
+                self._draw_safe_string(cx + nw + 3, base, str(letter), self._ak_font_bold, FS, bold=True)
+        self.restoreState()
+        self._draw_zikr(x, y, w, h)
 
     def _draw_answer_key(self, pairs):
         if self._ak_style == "column":
             self._draw_clipboard_key(pairs)
             return
+        self._draw_clipboard_grouped(pairs)
+        return
         pad = 0.3 * cm
 
         # Distance kept from the true physical right edge of the page (the
@@ -2248,7 +2343,8 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             ]
             x_left, y_bottom, box_w, box_h = _ak_box_rect(
                 "grouped", len(pairs), None, self._ak_wall_gap_cm, self._ak_nudge_cm,
-                self._ak_up_nudge_cm, self._ak_content_box)
+                self._ak_up_nudge_cm, self._ak_content_box,
+                extra_top=AK_ZIKR_H if self._ak_zikr else 0)
 
             fill_color   = colors.HexColor(self._ak_theme["gk_fill"])
             stroke_color = colors.HexColor(self._ak_theme["gk_stroke"])
@@ -2272,6 +2368,7 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             y -= line_h
 
         self.restoreState()
+        self._draw_zikr(x_left, y_bottom, box_w, box_h)
 
 TITLE_FILL_COLOR       = colors.HexColor("#8A2BE2")   # violet letters
 TITLE_INNER_LINE_COLOR = colors.white                 # first line around the letters
@@ -2819,6 +2916,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
               page_map_out: dict = None,
               show_written_answers: bool = True,
+              zikr: bool = True,
               theme: str = DEFAULT_THEME) -> BytesIO:
     items = normalize_items_for_render(items)
     buffer = BytesIO()
@@ -3065,9 +3163,11 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
             # opening a later page, or one flowing normally after another on
             # the same page.
             if idx > 1:
-                block.append(Spacer(1, Q_GAP / 2))
-                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2, FRAME_LEFT, FRAME_RIGHT, color=T["sep"], frame_tops=frame_tops))
-                block.append(Spacer(1, Q_GAP / 2))
+                # written questions get one extra line of space around the separator
+                _extra = (15 * FSCALE) if item.get("type") == "written" else 0
+                block.append(Spacer(1, Q_GAP / 2 + _extra / 2))
+                block.append(_DashedSeparator(A4[1] - TOP_MARGIN - 6, Q_GAP / 2 + _extra / 2, FRAME_LEFT, FRAME_RIGHT, color=T["sep"], frame_tops=frame_tops))
+                block.append(Spacer(1, Q_GAP / 2 + _extra / 2))
             else:
                 block.append(Spacer(1, Q_GAP))
 
@@ -3125,7 +3225,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     block.append(w_title)
                 if show_answers and show_written_answers:
                     if item.get("content"):
-                        block.append(mk_para(item["content"], WRITTEN_ANSWER, bold=True, lead=ok_lead))
+                        block.append(mk_para(item["content"], WRITTEN_ANSWER, bold=True, lead=ok_lead, br=True))
                     if item.get("answer_image"):           # spoilered picture = the ANSWER (answered PDF only)
                         try:
                             block.append(Spacer(1, 4))
@@ -3194,8 +3294,9 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         zones = {}
         gap = 0.25 * cm
         for pg, n in counts.items():
-            x, y, w, h = _ak_box_rect(ak_style, n, AK_BOX_W, ak_wall_gap_cm, ak_nudge_cm, ak_up_nudge_cm, FRAME_BOX)
-            zones[pg] = dict(top=y + h + gap, bottom=y - gap,
+            zk = AK_ZIKR_H if zikr else 0
+            x, y, w, h = _ak_box_rect(ak_style, n, AK_BOX_W, ak_wall_gap_cm, ak_nudge_cm, ak_up_nudge_cm, FRAME_BOX, extra_top=zk)
+            zones[pg] = dict(top=y + h + zk + gap, bottom=y - gap,
                              narrow_right=x - TEXT_TO_BOX_GAP_CM * cm + 6)   # +6: the frame's own padding
         return zones
 
@@ -3217,7 +3318,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
                 ak_box_w=AK_BOX_W,
                 ak_content_box=FRAME_BOX,
-                ak_theme=T,
+                ak_theme=T, ak_zikr=zikr,
                 **kwargs,
             )
         zdoc.build(story,
@@ -3455,13 +3556,68 @@ def _dx_table_box(doc, after_par, rows, col_w, x_left, y_top, row_h, font, *, bo
     after_par._p.addnext(t)
     return tbl
 
+def _dx_box_image(pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, content_box, theme, zikr=True):
+    """The per-page answer box (with its zikr) as a transparent PNG, drawn by the very same code
+    as the PDF's box. Returns (png_stream, x_pt, y_top_pt, w_pt, h_pt) — position measured from the
+    page's top-left corner — or None when it can't be rendered."""
+    from PIL import Image as _PILImage
+    try:
+        A4W, A4H = A4
+        n = len(pairs)
+        zk = AK_ZIKR_H if zikr else 0
+        x, y, w, h = _ak_box_rect(style, n, box_w_pt, wall_gap_cm, nudge_cm, up_nudge_cm, content_box, extra_top=zk)
+        tmp = BytesIO()
+        c = _AnswerKeyCanvas(tmp, pagesize=A4, answer_pairs=list(pairs),
+                             page_of_idx={q: 1 for q, _ in pairs},
+                             font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD,
+                             ak_style=style, ak_nudge_cm=nudge_cm, ak_wall_gap_cm=wall_gap_cm,
+                             ak_up_nudge_cm=up_nudge_cm, ak_box_w=box_w_pt,
+                             ak_content_box=content_box, ak_theme=theme, ak_zikr=zikr)
+        c.showPage()
+        c.save()
+        SC = 4.0                                            # ≈ 290 dpi — crisp when printed
+        img = None
+        try:
+            import pypdfium2 as pdfium
+            pdf = pdfium.PdfDocument(tmp.getvalue())
+            try:
+                img = pdf[0].render(scale=SC, fill_color=(255, 255, 255, 0)).to_pil().convert("RGBA")
+            finally:
+                pdf.close()
+        except Exception:
+            import fitz
+            d = fitz.open(stream=tmp.getvalue(), filetype="pdf")
+            try:
+                pix = d[0].get_pixmap(matrix=fitz.Matrix(SC, SC), alpha=True)
+                img = _PILImage.frombytes("RGBA", (pix.width, pix.height), pix.samples)
+            finally:
+                d.close()
+        pad = 5.0
+        left, right = max(x - pad, 0), min(x + w + pad, A4W)
+        top_pt, bot_pt = max(A4H - (y + h + zk + pad), 0), min(A4H - y + pad, A4H)
+        crop = img.crop((int(left * SC), int(top_pt * SC), int(right * SC), int(bot_pt * SC)))
+        out = BytesIO()
+        crop.save(out, "PNG", optimize=True)
+        out.seek(0)
+        return out, left, top_pt, right - left, bot_pt - top_pt
+    except Exception as e:
+        print(f"DOCX answer-box image failed ({e}) — using the table box instead")
+        return None
+
 def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri", font_path=None,
-                   content_box=None, theme=None):
+                   content_box=None, theme=None, zikr=True):
     """Floating table = the per-page answer key. Anchored to the paragraph it follows, so it
     lands on that paragraph's page, at the same spot as the PDF's box (measured from the
     page's right edge / bottom edge). Fully editable in Word."""
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    # Preferred: the box as a picture (looks exactly like the PDF's, can't be mangled by Word).
+    pic = _dx_box_image(pairs, style, wall_gap_cm=wall_gap_cm, nudge_cm=nudge_cm, up_nudge_cm=up_nudge_cm,
+                        box_w_pt=box_w_pt, content_box=content_box, theme=theme or THEMES[DEFAULT_THEME], zikr=zikr)
+    if pic:
+        stream, px, py, pw, ph = pic
+        _dx_picture_run(after_par, stream, pw, ph, px, py, behind=False, rel_height=50)
+        return None
     CM = 28.3465
     PAGE_W, PAGE_H = 21.0 * CM, 29.7 * CM
     _T = theme or THEMES[DEFAULT_THEME]
@@ -3524,6 +3680,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                q_gap_cm: float = DEFAULT_Q_GAP_CM,
                opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
                show_written_answers: bool = True,
+               zikr: bool = True,
                theme: str = DEFAULT_THEME,
                **_ignored) -> BytesIO:
     from docx import Document
@@ -3608,7 +3765,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
         if pend["box"]:
             _dx_answer_box(doc, p, pend["box"], ak_style, wall_gap_cm=ak_wall_gap_cm,
                            nudge_cm=ak_nudge_cm, up_nudge_cm=ak_up_nudge_cm, box_w_pt=AK_BOX_W, font=FONT, font_path=font_path,
-                           content_box=fbox, theme=T)
+                           content_box=fbox, theme=T, zikr=zikr)
             pend["box"] = None
         return p
 
@@ -3690,12 +3847,13 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
             pend["box"] = pairs_by_page.get(pg)          # this page's own answer box
         _page_first = bool(page_map and page_map.get(idx) and first_on_page.get(page_map[idx]) == idx)
         if idx > 1 and not _page_first:
-            sp = new_par(before=Q_GAP / 2, after=0)
+            _extra = (15 * FS) if kind == "written" else 0      # one extra line between written questions
+            sp = new_par(before=Q_GAP / 2 + _extra / 2, after=0)
             _sp = sp._p.get_or_add_pPr()
             _b = _dx_el("w:pBdr")
             _b.append(_dx_el("w:bottom", val="dashed", sz=6, space=1, color=T["sep"].lstrip("#")))
             _dx_insert(_sp, _b, _DX_PPR_ORDER)
-            sp.paragraph_format.space_after = Pt(Q_GAP / 2)
+            sp.paragraph_format.space_after = Pt(Q_GAP / 2 + _extra / 2)
             _diff = (right_cm - left_cm) * 28.3465      # make the line symmetric about the page centre
             if _diff > 0:
                 sp.paragraph_format.left_indent = Pt(_diff)
@@ -4020,7 +4178,7 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
             bg_image_path=PDF_FRAME_PATH.get(user_id),
             show_answers=True,
             ak_style=PDF_AK_STYLE.get(user_id, "grouped"),
-            theme=PDF_THEME.get(user_id, DEFAULT_THEME),
+            theme=PDF_THEME.get(user_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(user_id, True),
             ak_nudge_cm=ak_nudge_cm, font_size=font_size,
             top_margin_cm=top_margin_cm, ak_wall_gap_cm=ak_wall_gap_cm,
             ak_up_nudge_cm=ak_up_nudge_cm,
@@ -4400,6 +4558,8 @@ async def _apply_pdf_template(context: ContextTypes.DEFAULT_TYPE, update: Update
     a4_ratio = A4[0] / A4[1]
     if any(abs((w / h) - a4_ratio) > 0.02 for w, h in sizes):
         msg += "\n⚠️ حجم الصفحة مش A4 — هيتمط ليناسب A4."
+    if user_id in PDF_BUFFER:
+        msg += "\n🔄 السيشن شغالة — الغلاف والفريم الجداد هيتطبقوا على الـ PDF ده (المعاينة والتصدير)."
     msg += "\nهيفضلوا متسجلين لحد ما تغيّرهم أو تشيلهم بـ /clear_cover و /clear_frame أو البوت يعمل restart."
     await wait.edit_text(msg, parse_mode=ParseMode.HTML)
 
@@ -5206,6 +5366,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "gen_pdf_a":  ("PDF",  (True,)),   "gen_pdf_b":  ("PDF",  (False,)),
         "gen_docx_a": ("DOCX", (True,)),   "gen_docx_b": ("DOCX", (False,)),
         "gen_pdf":    ("PDF",  (True, False)), "gen_docx": ("DOCX", (True, False)),
+        "gen_pptx_a": ("PPTX", (True,)),   "gen_pptx_b": ("PPTX", (False,)),
     }
     if query.data in _EXPORTS:
         kind, versions = _EXPORTS[query.data]
@@ -5216,6 +5377,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(MSG_EXPORT_GENERATING.format(kind=kind + label, count=len(items)))
         if kind == "PDF":
             await _export_pdf_session(context, query.message, user_id, items, name, versions)
+        elif kind == "PPTX":
+            await _export_pptx_session(context, query.message, user_id, items, name, versions)
         else:
             await _export_docx_session(context, query.message, user_id, items, name, versions)
 
@@ -5226,6 +5389,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print("toggle_written refresh error:", e)
 
+    elif query.data == "toggle_zikr":
+        PDF_ZIKR[user_id] = not PDF_ZIKR.get(user_id, True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=export_keyboard(user_id))
+        except Exception as e:
+            print("toggle_zikr refresh error:", e)
+
     elif query.data == "new_session":
         _reset_cardikal(user_id)
         _reset_pdf_session(user_id)
@@ -5235,6 +5405,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "clear_pdf":
         _reset_pdf_session(user_id)
         await query.message.reply_text(MSG_EXPORT_CLEARED_ALL)
+
+# ═══════════════════════════════════════════════════════════════
+# PPTX EXPORT — the PDF, page for page (A4 portrait slides)
+# ═══════════════════════════════════════════════════════════════
+PPTX_RENDER_SCALE = 2.2     # ≈ 160 dpi per slide: sharp on screen, keeps the file light
+
+def build_pptx(items: list, doc_title: str = "questions", show_answers: bool = True, **pdf_kwargs) -> BytesIO:
+    """PowerPoint file that looks exactly like the PDF: every PDF page (cover, frame, questions,
+    answer box, zikr…) becomes one A4-portrait slide. Takes the same keyword arguments as
+    build_pdf, builds that PDF first and puts each page on a slide as a picture."""
+    from pptx import Presentation
+    from pptx.util import Emu
+    from PIL import Image as _PILImage
+
+    pdf_bytes = build_pdf(items, doc_title, show_answers=show_answers, **pdf_kwargs).getvalue()
+    pages = []
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        try:
+            for i in range(len(pdf)):
+                pages.append(pdf[i].render(scale=PPTX_RENDER_SCALE).to_pil().convert("RGB"))
+        finally:
+            pdf.close()
+    except ImportError:
+        import fitz
+        d = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            for pg in d:
+                pix = pg.get_pixmap(matrix=fitz.Matrix(PPTX_RENDER_SCALE, PPTX_RENDER_SCALE), alpha=False)
+                pages.append(_PILImage.frombytes("RGB", (pix.width, pix.height), pix.samples))
+        finally:
+            d.close()
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(int(21.0 / 2.54 * 914400)), Emu(int(29.7 / 2.54 * 914400))
+    blank = prs.slide_layouts[6]
+    for img in pages:
+        sl = prs.slides.add_slide(blank)
+        buf = BytesIO()
+        img.save(buf, "JPEG", quality=92, optimize=True)
+        buf.seek(0)
+        sl.shapes.add_picture(buf, 0, 0, prs.slide_width, prs.slide_height)
+    prs.core_properties.title = str(doc_title or "questions")
+    out = BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return out
 
 # ═══════════════════════════════════════════════════════════════
 # EXPORT — build+send PDF/DOCX (the session is kept; 🆕 New session starts over)
@@ -5308,6 +5526,7 @@ def _reset_pdf_session(user_id: int) -> None:
     AWAITING_THEME.pop(user_id, None)
     AWAITING_LAYOUT.pop(user_id, None)
     PDF_THEME.pop(user_id, None)
+    PDF_ZIKR.pop(user_id, None)
     PDF_AK_STYLE.pop(user_id, None)
     PDF_AK_NUDGE_CM.pop(user_id, None)
     PDF_FONT_SIZE.pop(user_id, None)
@@ -5346,7 +5565,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
         font_bold_path=PDF_FONT_BOLD_PATH.get(session_id),
         bg_image_path=PDF_FRAME_PATH.get(session_id),
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
-        theme=PDF_THEME.get(session_id, DEFAULT_THEME),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
         ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
         font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
         top_margin_cm=PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM),
@@ -5381,6 +5600,50 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
         )
     return True
 
+async def _export_pptx_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
+                               items: list, name: str, versions: tuple = (True, False)) -> bool:
+    """Builds PowerPoint (.pptx) versions — answered and/or blank — one slide per question,
+    and sends them. The session is kept, exactly like the DOCX export."""
+    safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
+    kw = dict(
+        font_path=PDF_FONT_PATH.get(session_id),
+        font_bold_path=PDF_FONT_BOLD_PATH.get(session_id),
+        bg_image_path=PDF_FRAME_PATH.get(session_id),
+        ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
+        ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
+        font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
+        top_margin_cm=PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM),
+        ak_wall_gap_cm=PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM),
+        ak_up_nudge_cm=PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM),
+        cover_image_path=PDF_COVER_PATH.get(session_id),
+        q_gap_cm=PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM),
+        opt_gap_cm=PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM),
+        show_written_answers=PDF_WRITTEN_SHOW.get(session_id, True),
+    )
+    try:
+        built = []
+        for show in versions:
+            built.append((show, await asyncio.to_thread(build_pptx, items, name, show_answers=show, **kw)))
+    except ImportError:
+        await message.reply_text("❌ مكتبة python-pptx مش متسطّبة على السيرفر. نزّلها بـ: pip install python-pptx")
+        return False
+    except Exception as e:
+        print("PPTX ERROR:", e)
+        traceback.print_exc()
+        await message.reply_text(
+            f"{quizzy_block(QUIZZY_OOPS_ART, random.choice(QUIZZY_ERROR_LINES))}\n\n<code>{html.escape(str(e))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+    for show, data in built:
+        await message.reply_document(
+            document=data, filename=f"{safe}_{'answered' if show else 'blank'}.pptx",
+            caption=f"📊 <b>{html.escape(name)}</b> · {len(items)} · {LABEL_ANSWERED if show else LABEL_BLANK}",
+            parse_mode=ParseMode.HTML,
+        )
+    return True
+
 async def _export_docx_session(context: ContextTypes.DEFAULT_TYPE, message, session_id: int,
                                 items: list, name: str, versions: tuple = (True, False)) -> bool:
     """Builds editable Word (.docx) versions — answered and/or blank — and sends them.
@@ -5396,7 +5659,7 @@ async def _export_docx_session(context: ContextTypes.DEFAULT_TYPE, message, sess
         q_gap_cm=PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM),
         opt_gap_cm=PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM),
         show_written_answers=PDF_WRITTEN_SHOW.get(session_id, True),
-        theme=PDF_THEME.get(session_id, DEFAULT_THEME),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
     )
     ak_kw = dict(
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
