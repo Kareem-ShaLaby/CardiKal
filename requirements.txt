@@ -8,3 +8,4 @@ genanki
 pypdfium2
 pymupdf
 python-docx
+python-pptx
