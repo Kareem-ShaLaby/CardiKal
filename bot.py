@@ -48,7 +48,8 @@ from io import BytesIO
 # 1570   MAIN
 # ═══════════════════════════════════════════════════════════════
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MessageEntity
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, MessageEntity,
+                      BotCommand, MenuButtonCommands, ReplyKeyboardMarkup, KeyboardButton)
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -401,18 +402,19 @@ MSG_CANCEL_NOTHING = "بتلغيني أنا يعني ولا أي🤨"
 MSG_NOT_IN_SESSION = "📄 ابدأ الأول بـ /pdf_start عشان تبدأ تجمع الأسئلة."
 
 LAYOUT_PROMPT_TEXT = (
-    "📐 <b>ظبط الشكل</b> — ابعت <u>لحد 7 أرقام</u> في رسالة واحدة، مفصولين بمسافة أو فاصلة، بالترتيب ده:\n\n"
-    "1️⃣ حجم خط السؤال (الافتراضي 12)\n"
-    "2️⃣ المسافة من فوق للسؤال الأول، بالسنتيمتر (الافتراضي 2.5)\n"
-    "3️⃣ إزاحة صندوق الإجابات، بالسنتيمتر — رقم موجب يزحزحه لليسار، وسالب يزحزحه لليمين (الافتراضي 0)\n"
-    "4️⃣ مسافة صندوق الإجابات من الحافة اليمين، بالسنتيمتر (الافتراضي 0.5)\n"
-    "5️⃣ رفع صندوق الإجابات، بالسنتيمتر — رقم موجب يرفعه لفوق، وسالب ينزله لتحت (الافتراضي 4)\n"
-    "6️⃣ المسافة بين كل سؤال والسؤال اللي بعده، بالسنتيمتر (الافتراضي 1.1) — قلّلها عشان الأسئلة تتقارب\n"
-    "7️⃣ المسافة بين الاختيارات (A B C D)، بالسنتيمتر (الافتراضي 0.2)\n\n"
-    "مثال: <code>12 2.5 0 0.5 4 0.7 0.1</code>\n"
-    "لو بعت 5 أرقام بس، الـ6 و7 بياخدوا الافتراضي.\n"
+    "📐 <b>ظبط الشكل</b> — ابعت <u>لحد 8 أرقام</u> في رسالة واحدة، مفصولين بمسافة أو فاصلة، بالترتيب ده:\n\n"
+    "1️⃣ حجم خط السؤال (المقترح 14)\n"
+    "2️⃣ المسافة من فوق للسؤال الأول، بالسنتيمتر (المقترح 3)\n"
+    "3️⃣ إزاحة صندوق الإجابات، بالسنتيمتر — رقم موجب يزحزحه لليسار، وسالب يزحزحه لليمين (المقترح 1)\n"
+    "4️⃣ مسافة صندوق الإجابات من الحافة اليمين، بالسنتيمتر (المقترح 0.5)\n"
+    "5️⃣ رفع صندوق الإجابات، بالسنتيمتر — رقم موجب يرفعه لفوق، وسالب ينزله لتحت (المقترح 0.5)\n"
+    "6️⃣ المسافة بين كل سؤال والسؤال اللي بعده، بالسنتيمتر (المقترح 0.2) — قلّلها عشان الأسئلة تتقارب\n"
+    "7️⃣ المسافة بين الاختيارات (A B C D)، بالسنتيمتر (المقترح 0.01)\n"
+    "8️⃣ حجم صندوق الإجابات وكتابته مع بعض (المقترح 1) — 1 = عادي، 1.3 = أكبر، 0.8 = أصغر\n\n"
+    "المقترح: <code>14 3 1 0.5 0.5 0.2 0.01 1</code>\n"
+    "لو بعت أرقام أقل، الباقي بياخد القيمة المقترحة.\n"
     "لو عايز رقم معين يفضل زي ما هو، اكتب مكانه <code>-</code>.\n"
-    "أو ابعت <code>-</code> لوحدها عشان تاخد كل الإعدادات الافتراضية."
+    "أو ابعت <code>-</code> لوحدها عشان تاخد كل القيم المقترحة."
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -451,14 +453,20 @@ PDF_WRITTEN_SHOW       = {}    # user_id -> bool, show written-question answers 
 PDF_OPT_GAP_CM         = {}    # user_id -> float, space between the options (A/B/C/D) of a question, in cm
 AWAITING_LAYOUT        = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the combined layout numbers
 
-# Defaults used for any layout value the user leaves blank/"-"
-DEFAULT_FONT_SIZE      = 12.0
-DEFAULT_TOP_MARGIN_CM  = 2.5
-DEFAULT_AK_NUDGE_CM    = 0.0
+PDF_AK_SCALE           = {}    # user_id -> float, size of the whole answer-key box (1 = normal)
+PDF_AK_TEXT_SCALE      = {}    # user_id -> float, size of the text inside the box (1 = normal)
+
+# Defaults used for any layout value the user leaves blank/"-"  (= the suggested "14 3 1 0.5 0.5 0.2 0.01 1 1")
+BASE_FONT_SIZE         = 12.0   # the size every text size in the layout code is defined against (NOT a setting)
+DEFAULT_FONT_SIZE      = 14.0
+DEFAULT_TOP_MARGIN_CM  = 3.0
+DEFAULT_AK_NUDGE_CM    = 1.0
 DEFAULT_AK_WALL_GAP_CM = 0.5
-DEFAULT_AK_UP_NUDGE_CM = 4.0
-DEFAULT_Q_GAP_CM       = 1.1    # ≈ the old fixed spacing between questions
-DEFAULT_OPT_GAP_CM     = 0.2    # ≈ the old fixed spacing between options
+DEFAULT_AK_UP_NUDGE_CM = 0.5
+DEFAULT_Q_GAP_CM       = 0.2
+DEFAULT_OPT_GAP_CM     = 0.01
+DEFAULT_AK_SCALE       = 1.0
+DEFAULT_AK_TEXT_SCALE  = 1.0
 SLEEPING               = set()
 PROGRESS_MSG_ID        = {}    # user_id -> message_id of the live progress message
 PENDING_IMAGE          = {}    # user_id -> local path of an image waiting to attach to the NEXT poll/question
@@ -1995,8 +2003,11 @@ class _DashedSeparator(Flowable):
             y   = self.canv.absolutePosition(0, 0)[1]
             pg  = self.canv.getPageNumber()
             tops = (self._tops or {}).get(pg) or [self._top]
-            # at the very top of ANY frame on this page (not just the page's top)?
-            if any(t - self._half - 3 < y <= t + 2 for t in tops):
+            # only at the very top of the PAGE's first frame: at the seam between two frames
+            # (full-width area → the narrower one beside the answer box) the previous question
+            # is still right above, so the line is needed there
+            t0 = tops[0]
+            if t0 - self._half - 3 < y <= t0 + 2:
                 return
         except Exception:
             pass
@@ -2062,7 +2073,7 @@ AK_ZIKR_FS    = 12
 AK_ZIKR_LEAD  = 1.3
 AK_ZIKR_H     = len(AK_ZIKR_LINES) * AK_ZIKR_FS * AK_ZIKR_LEAD + 6   # height reserved above the box (pt)
 
-def _ak_box_rect(style, n, clip_w, wall_gap_cm, nudge_cm, up_nudge_cm, content_box=None, extra_top=AK_ZIKR_H):
+def _ak_box_rect(style, n, clip_w, wall_gap_cm, nudge_cm, up_nudge_cm, content_box=None, extra_top=AK_ZIKR_H, scale=1.0):
     """(x_left, y_bottom, width, height) of the per-page answer-key box that
     holds `n` answers. The ONE place this geometry lives: the canvas draws the
     box from it and the page layout reserves the very same rectangle (plus a
@@ -2075,6 +2086,7 @@ def _ak_box_rect(style, n, clip_w, wall_gap_cm, nudge_cm, up_nudge_cm, content_b
     else:
         w = 6.6 * cm
         h = 22 + 0.62 * cm * ((n + 3) // 4) + 10      # clipboard: board + clip + ruled rows of 4
+    w, h = w * scale, h * scale                          # the user's box-size setting
     x = A4[0] - wall_gap_cm * cm - nudge_cm * cm - w
     y = 2.1 * cm + up_nudge_cm * cm
     if content_box:                                # keep the box fully inside the frame's white area
@@ -2089,9 +2101,11 @@ class _AnswerKeyCanvas(_canvas.Canvas):
                  ak_style="grouped", ak_nudge_cm=0.0,
                  ak_right_margin=2*cm, ak_top_margin=2.5*cm,
                  ak_wall_gap_cm=0.5, ak_up_nudge_cm=4.0, ak_box_w=None,
-                 ak_content_box=None, ak_theme=None, ak_zikr=True, **kwargs):
+                 ak_content_box=None, ak_theme=None, ak_zikr=True, ak_scale=1.0, ak_text_scale=1.0, **kwargs):
         super().__init__(*args, **kwargs)
         self._ak_zikr = bool(ak_zikr)                       # print the dhikr above the box?
+        self._ak_scale = float(ak_scale or 1.0)             # size of the whole box
+        self._ak_tscale = float(ak_text_scale or 1.0)       # size of the text inside it
         self._ak_theme = ak_theme or THEMES[DEFAULT_THEME]   # colour palette of the answer-key box
         self._ak_box_w       = ak_box_w   # fitted width of the clipboard box (same on every page)
         # (x0, y_bottom, x1, y_top) of the frame's white area, or None — the
@@ -2214,16 +2228,19 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         P600, P800 = colors.HexColor(_ak["P600"]), colors.HexColor(_ak["P800"])
         P500, P400, P300 = colors.HexColor(_ak["P500"]), colors.HexColor(_ak["P400"]), colors.HexColor(_ak["P300"])
         P200, P900 = colors.HexColor(_ak["P200"]), colors.HexColor(_ak["P900"])
-        LINE_H, FS = 0.65 * cm, 13
+        LINE_H, FS = 0.65 * cm, 13 * self._ak_tscale
         n   = len(pairs)
+        sc  = self._ak_scale
         w0  = self._ak_box_w or _clipboard_box_width(max(q for q, _ in pairs), [l for _, l in pairs], self._ak_font_bold)
-        x, y, w, h = _ak_box_rect("column", n, w0, self._ak_wall_gap_cm, self._ak_nudge_cm,
+        X, Y, W, H = _ak_box_rect("column", n, w0, self._ak_wall_gap_cm, self._ak_nudge_cm,
                                   self._ak_up_nudge_cm, self._ak_content_box,
-                                  extra_top=AK_ZIKR_H if self._ak_zikr else 0)
+                                  extra_top=AK_ZIKR_H if self._ak_zikr else 0, scale=sc)
 
         self.saveState()
         if AK_UPSIDE_DOWN:
-            self.translate(x + w / 2, y + h / 2); self.rotate(180); self.translate(-(x + w / 2), -(y + h / 2))
+            self.translate(X + W / 2, Y + H / 2); self.rotate(180); self.translate(-(X + W / 2), -(Y + H / 2))
+        self.translate(X, Y); self.scale(sc, sc)            # everything below is drawn at 100 % from (0, 0)
+        x, y, w, h = 0, 0, W / sc, H / sc
         # board + paper
         self.setFillColor(P600);        self.roundRect(x, y, w, h, 7, stroke=0, fill=1)
         self.setFillColor(colors.white); self.roundRect(x + 5, y + 5, w - 10, h - 19, 3, stroke=0, fill=1)
@@ -2253,7 +2270,7 @@ class _AnswerKeyCanvas(_canvas.Canvas):
             self.setFillColor(P900)
             self._draw_safe_string(x_let, base, str(letter), self._ak_font_bold, FS, bold=True)
         self.restoreState()
-        self._draw_zikr(x, y, w, h)
+        self._draw_zikr(X, Y, W, H)
 
     def _draw_clipboard_grouped(self, pairs):
         """The horizontal ("grouped") answer box, drawn as the same purple CLIPBOARD as the
@@ -2263,14 +2280,17 @@ class _AnswerKeyCanvas(_canvas.Canvas):
         P600, P800 = colors.HexColor(_ak["P600"]), colors.HexColor(_ak["P800"])
         P500, P300 = colors.HexColor(_ak["P500"]), colors.HexColor(_ak["P300"])
         P200, P900 = colors.HexColor(_ak["P200"]), colors.HexColor(_ak["P900"])
-        ROW_H, FS, PER_ROW = 0.62 * cm, 11.5, 4
+        ROW_H, FS, PER_ROW = 0.62 * cm, 11.5 * self._ak_tscale, 4
         n = len(pairs)
-        x, y, w, h = _ak_box_rect("grouped", n, None, self._ak_wall_gap_cm, self._ak_nudge_cm,
+        sc = self._ak_scale
+        X, Y, W, H = _ak_box_rect("grouped", n, None, self._ak_wall_gap_cm, self._ak_nudge_cm,
                                   self._ak_up_nudge_cm, self._ak_content_box,
-                                  extra_top=AK_ZIKR_H if self._ak_zikr else 0)
+                                  extra_top=AK_ZIKR_H if self._ak_zikr else 0, scale=sc)
         self.saveState()
         if AK_UPSIDE_DOWN:
-            self.translate(x + w / 2, y + h / 2); self.rotate(180); self.translate(-(x + w / 2), -(y + h / 2))
+            self.translate(X + W / 2, Y + H / 2); self.rotate(180); self.translate(-(X + W / 2), -(Y + H / 2))
+        self.translate(X, Y); self.scale(sc, sc)
+        x, y, w, h = 0, 0, W / sc, H / sc
         self.setFillColor(P600);         self.roundRect(x, y, w, h, 7, stroke=0, fill=1)
         self.setFillColor(colors.white); self.roundRect(x + 5, y + 5, w - 10, h - 19, 3, stroke=0, fill=1)
         cw = 38
@@ -2296,7 +2316,7 @@ class _AnswerKeyCanvas(_canvas.Canvas):
                 self.setFillColor(P900)
                 self._draw_safe_string(cx + nw + 3, base, str(letter), self._ak_font_bold, FS, bold=True)
         self.restoreState()
-        self._draw_zikr(x, y, w, h)
+        self._draw_zikr(X, Y, W, H)
 
     def _draw_answer_key(self, pairs):
         if self._ak_style == "column":
@@ -2917,6 +2937,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               page_map_out: dict = None,
               show_written_answers: bool = True,
               zikr: bool = True,
+              ak_scale: float = DEFAULT_AK_SCALE, ak_text_scale: float = DEFAULT_AK_TEXT_SCALE,
               theme: str = DEFAULT_THEME) -> BytesIO:
     items = normalize_items_for_render(items)
     buffer = BytesIO()
@@ -3003,7 +3024,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # scaled by this ratio, so a single "font size" number moves the whole
     # document's typography up or down together instead of just the
     # question text.
-    FSCALE = font_size / DEFAULT_FONT_SIZE
+    FSCALE = font_size / BASE_FONT_SIZE
 
     # Fitted clipboard width: sized once for the whole document (widest question
     # number + widest answer letter) so every page's box is identical.
@@ -3081,7 +3102,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
     # PDF gets writing space instead (see the "written" branch below).
     WRITTEN_ANSWER = ParagraphStyle(
         "WAnswer", fontName=font_name_choice_bold, fontSize=11 * FSCALE, leading=15 * FSCALE,
-        textColor=colors.HexColor("#1B5E20"), leftIndent=14, spaceAfter=6,
+        textColor=colors.black, leftIndent=14, spaceAfter=6,
     )
     NUM_STYLE = ParagraphStyle(
         "NumStyle", fontName=font_name_bold, fontSize=9 * FSCALE,
@@ -3225,7 +3246,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                     block.append(w_title)
                 if show_answers and show_written_answers:
                     if item.get("content"):
-                        block.append(mk_para(item["content"], WRITTEN_ANSWER, bold=True, lead=ok_lead, br=True))
+                        block.append(mk_para(item["content"], WRITTEN_ANSWER, bold=True, br=True))
                     if item.get("answer_image"):           # spoilered picture = the ANSWER (answered PDF only)
                         try:
                             block.append(Spacer(1, 4))
@@ -3295,7 +3316,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
         gap = 0.25 * cm
         for pg, n in counts.items():
             zk = AK_ZIKR_H if zikr else 0
-            x, y, w, h = _ak_box_rect(ak_style, n, AK_BOX_W, ak_wall_gap_cm, ak_nudge_cm, ak_up_nudge_cm, FRAME_BOX, extra_top=zk)
+            x, y, w, h = _ak_box_rect(ak_style, n, AK_BOX_W, ak_wall_gap_cm, ak_nudge_cm, ak_up_nudge_cm, FRAME_BOX, extra_top=zk, scale=ak_scale)
             zones[pg] = dict(top=y + h + zk + gap, bottom=y - gap,
                              narrow_right=x - TEXT_TO_BOX_GAP_CM * cm + 6)   # +6: the frame's own padding
         return zones
@@ -3318,7 +3339,7 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
                 ak_wall_gap_cm=ak_wall_gap_cm, ak_up_nudge_cm=ak_up_nudge_cm,
                 ak_box_w=AK_BOX_W,
                 ak_content_box=FRAME_BOX,
-                ak_theme=T, ak_zikr=zikr,
+                ak_theme=T, ak_zikr=zikr, ak_scale=ak_scale, ak_text_scale=ak_text_scale,
                 **kwargs,
             )
         zdoc.build(story,
@@ -3556,7 +3577,7 @@ def _dx_table_box(doc, after_par, rows, col_w, x_left, y_top, row_h, font, *, bo
     after_par._p.addnext(t)
     return tbl
 
-def _dx_box_image(pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, content_box, theme, zikr=True):
+def _dx_box_image(pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, content_box, theme, zikr=True, scale=1.0, text_scale=1.0):
     """The per-page answer box (with its zikr) as a transparent PNG, drawn by the very same code
     as the PDF's box. Returns (png_stream, x_pt, y_top_pt, w_pt, h_pt) — position measured from the
     page's top-left corner — or None when it can't be rendered."""
@@ -3565,14 +3586,15 @@ def _dx_box_image(pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt,
         A4W, A4H = A4
         n = len(pairs)
         zk = AK_ZIKR_H if zikr else 0
-        x, y, w, h = _ak_box_rect(style, n, box_w_pt, wall_gap_cm, nudge_cm, up_nudge_cm, content_box, extra_top=zk)
+        x, y, w, h = _ak_box_rect(style, n, box_w_pt, wall_gap_cm, nudge_cm, up_nudge_cm, content_box, extra_top=zk, scale=scale)
         tmp = BytesIO()
         c = _AnswerKeyCanvas(tmp, pagesize=A4, answer_pairs=list(pairs),
                              page_of_idx={q: 1 for q, _ in pairs},
                              font_name=FONT_NAME, font_name_bold=FONT_NAME_BOLD,
                              ak_style=style, ak_nudge_cm=nudge_cm, ak_wall_gap_cm=wall_gap_cm,
                              ak_up_nudge_cm=up_nudge_cm, ak_box_w=box_w_pt,
-                             ak_content_box=content_box, ak_theme=theme, ak_zikr=zikr)
+                             ak_content_box=content_box, ak_theme=theme, ak_zikr=zikr,
+                             ak_scale=scale, ak_text_scale=text_scale)
         c.showPage()
         c.save()
         SC = 4.0                                            # ≈ 290 dpi — crisp when printed
@@ -3605,7 +3627,7 @@ def _dx_box_image(pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt,
         return None
 
 def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nudge_cm, box_w_pt, font="Calibri", font_path=None,
-                   content_box=None, theme=None, zikr=True):
+                   content_box=None, theme=None, zikr=True, scale=1.0, text_scale=1.0):
     """Floating table = the per-page answer key. Anchored to the paragraph it follows, so it
     lands on that paragraph's page, at the same spot as the PDF's box (measured from the
     page's right edge / bottom edge). Fully editable in Word."""
@@ -3613,7 +3635,8 @@ def _dx_answer_box(doc, after_par, pairs, style, *, wall_gap_cm, nudge_cm, up_nu
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     # Preferred: the box as a picture (looks exactly like the PDF's, can't be mangled by Word).
     pic = _dx_box_image(pairs, style, wall_gap_cm=wall_gap_cm, nudge_cm=nudge_cm, up_nudge_cm=up_nudge_cm,
-                        box_w_pt=box_w_pt, content_box=content_box, theme=theme or THEMES[DEFAULT_THEME], zikr=zikr)
+                        box_w_pt=box_w_pt, content_box=content_box, theme=theme or THEMES[DEFAULT_THEME], zikr=zikr,
+                        scale=scale, text_scale=text_scale)
     if pic:
         stream, px, py, pw, ph = pic
         _dx_picture_run(after_par, stream, pw, ph, px, py, behind=False, rel_height=50)
@@ -3681,6 +3704,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                opt_gap_cm: float = DEFAULT_OPT_GAP_CM,
                show_written_answers: bool = True,
                zikr: bool = True,
+               ak_scale: float = DEFAULT_AK_SCALE, ak_text_scale: float = DEFAULT_AK_TEXT_SCALE,
                theme: str = DEFAULT_THEME,
                **_ignored) -> BytesIO:
     from docx import Document
@@ -3688,7 +3712,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
     from docx.enum.table import WD_TABLE_ALIGNMENT
 
-    FS = font_size / DEFAULT_FONT_SIZE
+    FS = font_size / BASE_FONT_SIZE
     FONT = _dx_font_family(font_path) or "Calibri"
     CM_PT = 28.3465
     Q_GAP, OPT_GAP = q_gap_cm * CM_PT, opt_gap_cm * CM_PT
@@ -3715,7 +3739,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     _P = 28.3465
     if ak_style == "column":
         PW = 21.0 * _P
-        box_left = min(PW - ak_wall_gap_cm * _P - ak_nudge_cm * _P, (fbox[2] - 0.15 * _P) if fbox else PW) - AK_BOX_W
+        box_left = min(PW - ak_wall_gap_cm * _P - ak_nudge_cm * _P, (fbox[2] - 0.15 * _P) if fbox else PW) - AK_BOX_W * ak_scale
         rm = max(MIN_RIGHT_MARGIN_CM * _P, PW - box_left + TEXT_TO_BOX_GAP_CM * _P)
         rm = min(rm, PW - left_cm * _P - MIN_TEXT_WIDTH_CM * _P)
         right_cm, bottom_cm = rm / _P, 2.0
@@ -3765,7 +3789,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
         if pend["box"]:
             _dx_answer_box(doc, p, pend["box"], ak_style, wall_gap_cm=ak_wall_gap_cm,
                            nudge_cm=ak_nudge_cm, up_nudge_cm=ak_up_nudge_cm, box_w_pt=AK_BOX_W, font=FONT, font_path=font_path,
-                           content_box=fbox, theme=T, zikr=zikr)
+                           content_box=fbox, theme=T, zikr=zikr, scale=ak_scale, text_scale=ak_text_scale)
             pend["box"] = None
         return p
 
@@ -3932,8 +3956,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                     p = new_par(rtl=crtl, after=6)
                     if not crtl:
                         p.paragraph_format.left_indent = Pt(14)
-                    lead_runs(p, "", rtl=crtl, marker=True)
-                    add_text(p, c, size=11 * FS, bold=True, color=GREEN, rtl=crtl)
+                    add_text(p, c, size=11 * FS, bold=True, color="000000", rtl=crtl)
                 if item.get("answer_image"):
                     add_image(item["answer_image"])
             else:
@@ -4115,16 +4138,17 @@ def preview_keyboard() -> InlineKeyboardMarkup:
 # LAYOUT NUMBERS SENT AT ANY TIME — e.g. "14 3 0 0.5 7 0.6 0.1" in the middle
 # of collecting questions replaces the saved layout straight away.
 # ═══════════════════════════════════════════════════════════════
-LAYOUT_CLAMPS = [(4.0, 40.0), (0.5, 10.0), (-15.0, 15.0), (0.0, 5.0), (-2.0, 20.0), (0.0, 4.0), (0.0, 2.0)]
+LAYOUT_CLAMPS = [(4.0, 40.0), (0.5, 10.0), (-15.0, 15.0), (0.0, 5.0), (-2.0, 20.0), (0.0, 4.0), (0.0, 2.0), (0.5, 2.0)]
+N_LAYOUT = 8
 _LAYOUT_NUM_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 
 def _layout_numbers_from_text(text: str):
-    """If `text` is nothing but 5–7 layout numbers (a '-' means "keep this one
-    as it is"), returns a list of 7 floats/None; otherwise None so the message
+    """If `text` is nothing but 5–8 layout numbers (a '-' means "keep this one
+    as it is"), returns a list of 8 floats/None; otherwise None so the message
     is treated as a normal question/case. At least 4 real numbers are needed,
     so ordinary text can never be mistaken for a layout."""
     tokens = [t for t in re.split(r"[\s,،]+", text.strip()) if t]
-    if not (5 <= len(tokens) <= 7):
+    if not (5 <= len(tokens) <= N_LAYOUT):
         return None
     vals = []
     for t in tokens:
@@ -4136,10 +4160,10 @@ def _layout_numbers_from_text(text: str):
             return None
     if sum(v is not None for v in vals) < 4:
         return None
-    return vals + [None] * (7 - len(vals))
+    return vals + [None] * (N_LAYOUT - len(vals))
 
 def _apply_layout_numbers(user_id: int, vals: list) -> list:
-    """Saves the new values (None = keep the current one) and returns the final 7."""
+    """Saves the new values (None = keep the current one) and returns the final 8."""
     current = [
         PDF_FONT_SIZE.get(user_id, DEFAULT_FONT_SIZE),
         PDF_TOP_MARGIN_CM.get(user_id, DEFAULT_TOP_MARGIN_CM),
@@ -4148,13 +4172,15 @@ def _apply_layout_numbers(user_id: int, vals: list) -> list:
         PDF_AK_UP_NUDGE_CM.get(user_id, DEFAULT_AK_UP_NUDGE_CM),
         PDF_Q_GAP_CM.get(user_id, DEFAULT_Q_GAP_CM),
         PDF_OPT_GAP_CM.get(user_id, DEFAULT_OPT_GAP_CM),
+        PDF_AK_SCALE.get(user_id, DEFAULT_AK_SCALE),
     ]
     final = []
     for v, cur, (lo, hi) in zip(vals, current, LAYOUT_CLAMPS):
         final.append(cur if v is None else max(lo, min(v, hi)))
     (PDF_FONT_SIZE[user_id], PDF_TOP_MARGIN_CM[user_id], PDF_AK_NUDGE_CM[user_id],
      PDF_AK_WALL_GAP_CM[user_id], PDF_AK_UP_NUDGE_CM[user_id],
-     PDF_Q_GAP_CM[user_id], PDF_OPT_GAP_CM[user_id]) = final
+     PDF_Q_GAP_CM[user_id], PDF_OPT_GAP_CM[user_id],
+     PDF_AK_SCALE[user_id]) = final
     return final
 
 async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: int) -> None:
@@ -4179,6 +4205,7 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
             show_answers=True,
             ak_style=PDF_AK_STYLE.get(user_id, "grouped"),
             theme=PDF_THEME.get(user_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(user_id, True),
+            ak_scale=PDF_AK_SCALE.get(user_id, DEFAULT_AK_SCALE), ak_text_scale=PDF_AK_TEXT_SCALE.get(user_id, DEFAULT_AK_TEXT_SCALE),
             ak_nudge_cm=ak_nudge_cm, font_size=font_size,
             top_margin_cm=top_margin_cm, ak_wall_gap_cm=ak_wall_gap_cm,
             ak_up_nudge_cm=ak_up_nudge_cm,
@@ -4937,19 +4964,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             tokens = [t for t in re.split(r"[\s,،]+", stripped) if t]
 
-        if len(tokens) > 7:
+        if len(tokens) > N_LAYOUT:
             await update.message.reply_text(
-                "⚠️ أقصى حاجة 7 أرقام بس. ابعتهم تاني زي المثال فوق.",
+                f"⚠️ أقصى حاجة {N_LAYOUT} أرقام بس. ابعتهم تاني زي المقترح فوق.",
             )
             return
 
         # Pad with "-" (→ default) for any trailing values left out.
-        tokens += ["-"] * (7 - len(tokens))
+        tokens += ["-"] * (N_LAYOUT - len(tokens))
 
         DEFAULTS = [
             DEFAULT_FONT_SIZE, DEFAULT_TOP_MARGIN_CM,
             DEFAULT_AK_NUDGE_CM, DEFAULT_AK_WALL_GAP_CM, DEFAULT_AK_UP_NUDGE_CM,
             DEFAULT_Q_GAP_CM, DEFAULT_OPT_GAP_CM,
+            DEFAULT_AK_SCALE,
         ]
         # (min, max) sane clamps so a typo can't blow up the layout or send
         # the answer-key box flying off the page. Font size / top margin /
@@ -4974,7 +5002,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lo, hi = CLAMPS[i]
             parsed.append(max(lo, min(val, hi)))
 
-        font_size, top_margin_cm, ak_nudge_cm, ak_wall_gap_cm, ak_up_nudge_cm, q_gap_cm, opt_gap_cm = parsed
+        font_size, top_margin_cm, ak_nudge_cm, ak_wall_gap_cm, ak_up_nudge_cm, q_gap_cm, opt_gap_cm, ak_scale = parsed
         PDF_FONT_SIZE[user_id]      = font_size
         PDF_TOP_MARGIN_CM[user_id] = top_margin_cm
         PDF_AK_NUDGE_CM[user_id]    = ak_nudge_cm
@@ -4982,6 +5010,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_AK_UP_NUDGE_CM[user_id] = ak_up_nudge_cm
         PDF_Q_GAP_CM[user_id]       = q_gap_cm
         PDF_OPT_GAP_CM[user_id]     = opt_gap_cm
+        PDF_AK_SCALE[user_id]       = ak_scale
         del AWAITING_LAYOUT[user_id]
         await _finish_pdf_setup(context, user_id, update.message)
         return
@@ -4994,12 +5023,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in PDF_BUFFER:
         new_layout = _layout_numbers_from_text(text)
         if new_layout is not None:
-            f, top, nudge, wall, up, qg, og = _apply_layout_numbers(user_id, new_layout)
+            f, top, nudge, wall, up, qg, og, aks, akt = _apply_layout_numbers(user_id, new_layout)
             await update.message.reply_text(
                 "📐 <b>الإعدادات الجديدة اتحفظت</b> (هتتطبق على الـ PDF ده):\n"
                 f"خط <code>{f:g}</code> · فوق <code>{top:g}</code> · إزاحة <code>{nudge:g}</code> · "
                 f"حافة <code>{wall:g}</code> · رفع <code>{up:g}</code>\n"
-                f"بين الأسئلة <code>{qg:g}</code> · بين الاختيارات <code>{og:g}</code>",
+                f"بين الأسئلة <code>{qg:g}</code> · بين الاختيارات <code>{og:g}</code>\n"
+                f"حجم الصندوق <code>{aks:g}</code> · كتابة الصندوق <code>{akt:g}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=preview_keyboard(),
             )
@@ -5204,8 +5234,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "done":
+            PENDING_EDIT.pop(user_id, None)
             await query.edit_message_text(
-                "✅ <b>خلاص، اتسجل:</b>\n\n" + _review_text(item), parse_mode=ParseMode.HTML
+                build_progress_text(items, pending=_pending_summary(user_id)), parse_mode=ParseMode.HTML,
+                reply_markup=export_keyboard(user_id),
             )
             return
 
@@ -5535,6 +5567,8 @@ def _reset_pdf_session(user_id: int) -> None:
     PDF_AK_UP_NUDGE_CM.pop(user_id, None)
     PDF_Q_GAP_CM.pop(user_id, None)
     PDF_OPT_GAP_CM.pop(user_id, None)
+    PDF_AK_SCALE.pop(user_id, None)
+    PDF_AK_TEXT_SCALE.pop(user_id, None)
     PDF_WRITTEN_SHOW.pop(user_id, None)
     PROGRESS_MSG_ID.pop(user_id, None)
     font_path = PDF_FONT_PATH.pop(user_id, None)
@@ -5566,6 +5600,7 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
         bg_image_path=PDF_FRAME_PATH.get(session_id),
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
         theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
+        ak_scale=PDF_AK_SCALE.get(session_id, DEFAULT_AK_SCALE), ak_text_scale=PDF_AK_TEXT_SCALE.get(session_id, DEFAULT_AK_TEXT_SCALE),
         ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
         font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
         top_margin_cm=PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM),
@@ -5611,6 +5646,7 @@ async def _export_pptx_session(context: ContextTypes.DEFAULT_TYPE, message, sess
         bg_image_path=PDF_FRAME_PATH.get(session_id),
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
         theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
+        ak_scale=PDF_AK_SCALE.get(session_id, DEFAULT_AK_SCALE), ak_text_scale=PDF_AK_TEXT_SCALE.get(session_id, DEFAULT_AK_TEXT_SCALE),
         ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
         font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
         top_margin_cm=PDF_TOP_MARGIN_CM.get(session_id, DEFAULT_TOP_MARGIN_CM),
@@ -5666,6 +5702,8 @@ async def _export_docx_session(context: ContextTypes.DEFAULT_TYPE, message, sess
         ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
         ak_wall_gap_cm=PDF_AK_WALL_GAP_CM.get(session_id, DEFAULT_AK_WALL_GAP_CM),
         ak_up_nudge_cm=PDF_AK_UP_NUDGE_CM.get(session_id, DEFAULT_AK_UP_NUDGE_CM),
+        ak_scale=PDF_AK_SCALE.get(session_id, DEFAULT_AK_SCALE),
+        ak_text_scale=PDF_AK_TEXT_SCALE.get(session_id, DEFAULT_AK_TEXT_SCALE),
     )
 
     def _page_map(show_answers: bool):
@@ -5825,6 +5863,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "أو /start_Cardikal عشان تجمع كروت بالصور وتصدرها ملف Anki (APKG).\n"
         "/c لعرض كل الأوامر.",
         parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
     )
 
 async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6301,6 +6340,52 @@ async def handle_image_document(update: Update, context: ContextTypes.DEFAULT_TY
     await _ck_add_image(update, context, doc.file_id, doc.file_unique_id, ext)
 
 # ═══════════════════════════════════════════════════════════════
+# MENU — the "/" command list, the blue Menu button, and the two big buttons under the chat
+# ═══════════════════════════════════════════════════════════════
+BTN_CREATE_FILES = "📄 Create files"
+BTN_CREATE_CARDS = "🃏 Create Flashcards"
+
+BOT_COMMANDS = [
+    BotCommand("pdf_start",        "📄 Create files — PDF / Word / PowerPoint"),
+    BotCommand("start_cardikal",   "🃏 Create Flashcards — Anki .apkg"),
+    BotCommand("pdf_generate",     "Build the PDF from what you collected"),
+    BotCommand("docx_generate",    "Build editable Word files"),
+    BotCommand("pdf_preview",      "Send a sample PDF with your layout"),
+    BotCommand("cardikal_generate", "Export the flashcards (.apkg)"),
+    BotCommand("pdf_clear",        "Clear the current session"),
+    BotCommand("set_cover",        "Set the cover page image"),
+    BotCommand("clear_cover",      "Remove the saved cover"),
+    BotCommand("set_frame",        "Set the page frame image"),
+    BotCommand("clear_frame",      "Remove the saved frame"),
+    BotCommand("how_to_use",       "How to use the bot"),
+    BotCommand("cancel",           "Cancel what's in progress"),
+    BotCommand("sleep",            "Pause the bot in this chat"),
+    BotCommand("c",                "List all commands"),
+    BotCommand("start",            "Start / show the menu"),
+]
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """The two always-visible buttons under the message box."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_CREATE_FILES), KeyboardButton(BTN_CREATE_CARDS)]],
+        resize_keyboard=True, is_persistent=True, one_time_keyboard=False,
+        input_field_placeholder="Create files · Create Flashcards",
+    )
+
+async def _post_init(application) -> None:
+    """Runs once when the bot starts: (re)publishes the command list for every scope that could
+    shadow it and switches the chat's menu button to "show commands" — so the menu is always
+    there and up to date, whatever an older version (or BotFather) left behind."""
+    try:
+        from telegram import BotCommandScopeDefault, BotCommandScopeAllPrivateChats
+        for scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()):
+            await application.bot.set_my_commands(BOT_COMMANDS, scope=scope)
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        print("Menu commands + menu button set.")
+    except Exception as e:
+        print("Could not set the menu commands:", e)
+
+# ═══════════════════════════════════════════════════════════════
 # GLOBAL ERROR HANDLER — no ERROR_LOG_GROUP_ID channel here (that whole
 # system stayed behind in the main bot); just a stderr traceback so a bad
 # update never silently vanishes without at least a console trace.
@@ -6316,6 +6401,7 @@ app = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
     .rate_limiter(AIORateLimiter())
+    .post_init(_post_init)
     # Patient network settings: wait a long time before giving up on a request
     # (big PDF/DOCX uploads on a slow link used to die with "Timed out").
     .connect_timeout(30)
@@ -6371,6 +6457,11 @@ app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
 # Inline buttons
 app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(PollHandler(poll_update_handler))
+
+# The two menu buttons under the chat box — they must sit BEFORE the general text handler,
+# which would otherwise take the tap for a question.
+app.add_handler(MessageHandler(filters.Regex(r"^" + re.escape(BTN_CREATE_FILES) + r"$"), pdf_start))
+app.add_handler(MessageHandler(filters.Regex(r"^" + re.escape(BTN_CREATE_CARDS) + r"$"), cardikal_start))
 
 # Text handler last
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
