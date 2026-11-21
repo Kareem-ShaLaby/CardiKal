@@ -2,6 +2,8 @@ import re
 import string
 import random
 import os
+import time
+import shutil
 import html
 import tempfile
 import traceback
@@ -316,6 +318,11 @@ BUNDLED_FONTS = {
 # back to the bold body font (still black with a purple outline).
 TITLE_FONT    = FONT_NAME_BOLD
 TITLE_FONT_OK = False
+_TITLE_TLS    = threading.local()     # .font = per-build title font (a user-supplied one), set by build_pdf
+
+def _title_font() -> str:
+    """The font the title is drawn with: the user's own title font for this build, else The Bomb Sound."""
+    return getattr(_TITLE_TLS, "font", None) or TITLE_FONT
 
 def _register_title_font():
     global TITLE_FONT, TITLE_FONT_OK
@@ -435,12 +442,17 @@ PDF_COVER_PATH         = {}    # user_id -> path to a cover-page image, inserted
                                 # Same persistence as PDF_FRAME_PATH — set with /set_cover, cleared with
                                 # /clear_cover or a bot restart.
 AWAITING_COVER         = {}    # user_id -> True, waiting on the next photo to save as the cover image
+AWAITING_TITLE_FONT    = {}    # user_id -> True, while the setup flow waits for a title font (or Skip)
+FONT_PICK              = {}    # user_id -> {'files': [(label, path)], 'queue': [roles], 'ctx': 'setup'|'setup_title'|'session'}
+PDF_TITLE_FONT_PATH    = {}    # user_id -> path of the user's own title font (absent = The Bomb Sound)
 AWAITING_FONT          = {}    # user_id -> True, while the /pdf_start setup flow is waiting on a font file/skip
 PDF_AK_STYLE           = {}    # user_id -> "grouped" (default, rows of "1-A  2-D") or "column" (one "1. A" per line)
 PDF_AK_NUDGE_CM        = {}    # user_id -> float, how many cm to shift the answer-key box left of its default spot
 AWAITING_AK_STYLE      = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the answer-key style choice
 PDF_ZIKR               = {}    # user_id -> bool, print the dhikr above the answer box (absent = on)
 PDF_THEME              = {}    # user_id -> key of THEMES (colour theme); absent = DEFAULT_THEME
+PDF_QNUM_COLOR         = {}    # user_id -> '#RRGGBB' for the question numbers (Q1, Q2…); absent = the theme's own
+AWAITING_QNUM_HEX      = {}    # user_id -> True while waiting for a typed hex colour
 AWAITING_THEME         = {}    # user_id -> True, while the /pdf_start setup flow is waiting on the colour-theme choice
 
 # ─── LAYOUT SETTINGS — all asked for in one combined numeric prompt ─────
@@ -1846,9 +1858,27 @@ def export_keyboard(user_id: int = None):
                               callback_data="theme_pick"),
          InlineKeyboardButton("🕋 Zikr: " + ("✅ on" if PDF_ZIKR.get(user_id, True) else "⬜ off"),
                               callback_data="toggle_zikr")],
+        [InlineKeyboardButton("🔢 لون رقم السؤال", callback_data="qnum_pick")],
         [InlineKeyboardButton("🆕 New session", callback_data="new_session"),
          InlineKeyboardButton("🗑 Clear & Cancel", callback_data="clear_pdf")],
     ])
+
+QNUM_COLORS = [
+    ("🟡 ذهبي", "#D4A017"), ("🟠 برتقالي", "#EA580C"), ("🔴 أحمر", "#DC2626"), ("🌸 وردي", "#DB2777"),
+    ("🟣 بنفسجي", "#7C3AED"), ("🔵 أزرق", "#2563EB"), ("🩵 سماوي", "#0891B2"), ("🟢 أخضر", "#16A34A"),
+    ("🟤 بني", "#92400E"), ("⚫ أسود", "#111111"), ("🩶 رمادي", "#6B7280"), ("⚪ أبيض", "#FFFFFF"),
+]
+_HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+def qnum_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
+    cur = (PDF_QNUM_COLOR.get(user_id) or "").upper()
+    btns = [InlineKeyboardButton(("✔ " if cur == hx.upper() else "") + lbl, callback_data=f"qnum:{hx[1:]}")
+            for lbl, hx in QNUM_COLORS]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([InlineKeyboardButton(("✔ " if not cur else "") + "🎨 لون الثيم", callback_data="qnum:default"),
+                 InlineKeyboardButton("✏️ كود hex", callback_data="qnum_custom")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="edit_pick_back")])
+    return InlineKeyboardMarkup(rows)
 
 def theme_keyboard(user_id: int = None, back: bool = False) -> InlineKeyboardMarkup:
     """One button per colour theme (two per row); the current one gets a ✔.
@@ -2426,10 +2456,11 @@ class _OutlinedTitle(Flowable):
     def _font_for(self, ch):
         if RAMIS_READY and _is_arabic_cp(ord(ch)) and _font_has_glyph(RAMIS_FONT_NAME, ch):
             return RAMIS_FONT_NAME        # Arabic is always Ramis, even in the title
-        if _font_has_glyph(TITLE_FONT, ch):
-            return TITLE_FONT
-        f = _chain_font_for(ch, True, TITLE_FONT)
-        return f if f else TITLE_FONT
+        tf = _title_font()
+        if _font_has_glyph(tf, ch):
+            return tf
+        f = _chain_font_for(ch, True, tf)
+        return f if f else tf
 
     def _runs(self, s):
         """Split into (font, text) runs so each character is drawn by a font that has it."""
@@ -2517,7 +2548,7 @@ class _OutlinedTitle(Flowable):
     def draw(self):
         c = self.canv
         try:
-            asc = min(pdfmetrics.getAscentDescent(TITLE_FONT, self.size)[0], self.size)
+            asc = min(pdfmetrics.getAscentDescent(_title_font(), self.size)[0], self.size)
         except Exception:
             asc = self.size * 0.85
         y = self._h - self.ow - asc
@@ -2938,11 +2969,19 @@ def build_pdf(items: list, doc_title: str = "questions", font_path: str = None,
               show_written_answers: bool = True,
               zikr: bool = True,
               ak_scale: float = DEFAULT_AK_SCALE, ak_text_scale: float = DEFAULT_AK_TEXT_SCALE,
-              theme: str = DEFAULT_THEME) -> BytesIO:
+              theme: str = DEFAULT_THEME, title_font_path: str = None, q_num_color: str = None) -> BytesIO:
     items = normalize_items_for_render(items)
     buffer = BytesIO()
+    _TITLE_TLS.font = None
+    if title_font_path and os.path.exists(title_font_path):
+        try:
+            _tn = f"TitleCustom_{abs(hash(title_font_path)) % 10**8}"
+            pdfmetrics.registerFont(TTFont(_tn, title_font_path))
+            _TITLE_TLS.font = _tn
+        except Exception as e:
+            print(f"Custom title font load error: {e} — using the default title font")
     T = get_theme(theme)          # colour theme: question/number/title/answer-key/case/separator colours
-    Q_NUM_COLOR, Q_TEXT_COLOR = T["q_num"], T["q_text"]   # local — shadow the module defaults for this build
+    Q_NUM_COLOR, Q_TEXT_COLOR = (q_num_color or T["q_num"]), T["q_text"]   # local — shadow the module defaults for this build
 
     # Custom font: registered under a name unique to this call so two users'
     # uploaded fonts (built around the same time) can never clobber each
@@ -3705,7 +3744,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
                show_written_answers: bool = True,
                zikr: bool = True,
                ak_scale: float = DEFAULT_AK_SCALE, ak_text_scale: float = DEFAULT_AK_TEXT_SCALE,
-               theme: str = DEFAULT_THEME,
+               theme: str = DEFAULT_THEME, q_num_color: str = None,
                **_ignored) -> BytesIO:
     from docx import Document
     from docx.shared import Pt, Cm, RGBColor
@@ -3718,7 +3757,7 @@ def build_docx(items: list, doc_title: str = "questions", font_path: str = None,
     Q_GAP, OPT_GAP = q_gap_cm * CM_PT, opt_gap_cm * CM_PT
     IMG_MAX_H = IMG_MAX_LINES * 15 * FS
     T = get_theme(theme)                                     # colour theme (same one the PDF uses)
-    Q_NUM_COLOR, Q_TEXT_COLOR = T["q_num"], T["q_text"]      # local — shadow the module defaults for this build
+    Q_NUM_COLOR, Q_TEXT_COLOR = (q_num_color or T["q_num"]), T["q_text"]      # local — shadow the module defaults for this build
     DARK, GREEN, GREY, CASE_TXT, WR_TXT = "1A1A2E", "1B5E20", Q_NUM_COLOR.lstrip("#"), "2D2A3E", "37474F"
 
     items = normalize_items_for_render(items)
@@ -4200,11 +4239,11 @@ async def _send_preview(context: ContextTypes.DEFAULT_TYPE, message, user_id: in
         pdf_bytes = await asyncio.to_thread(
             build_pdf, items, "Preview",
             font_path=PDF_FONT_PATH.get(user_id),
-            font_bold_path=PDF_FONT_BOLD_PATH.get(user_id),
+            font_bold_path=PDF_FONT_BOLD_PATH.get(user_id), title_font_path=PDF_TITLE_FONT_PATH.get(user_id),
             bg_image_path=PDF_FRAME_PATH.get(user_id),
             show_answers=True,
             ak_style=PDF_AK_STYLE.get(user_id, "grouped"),
-            theme=PDF_THEME.get(user_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(user_id, True),
+            theme=PDF_THEME.get(user_id, DEFAULT_THEME), q_num_color=PDF_QNUM_COLOR.get(user_id), zikr=PDF_ZIKR.get(user_id, True),
             ak_scale=PDF_AK_SCALE.get(user_id, DEFAULT_AK_SCALE), ak_text_scale=PDF_AK_TEXT_SCALE.get(user_id, DEFAULT_AK_TEXT_SCALE),
             ak_nudge_cm=ak_nudge_cm, font_size=font_size,
             top_margin_cm=top_margin_cm, ak_wall_gap_cm=ak_wall_gap_cm,
@@ -4788,32 +4827,212 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PENDING_IMG_CAPTION[user_id] = caption
     await update_progress(context, user_id, update.effective_chat.id)
 
+# ── FONT PACKS (.zip) / TITLE FONT ──────────────────────────────
+_FONT_EXTS      = (".ttf", ".otf")
+_ZIP_MAX_FONTS  = 90                 # Telegram allows at most 100 inline buttons in one message
+_ZIP_MAX_FILE   = 25 * 1024 * 1024
+_ZIP_MAX_TOTAL  = 120 * 1024 * 1024
+
+def _otf_to_ttf(src: str, dst: str) -> None:
+    """CFF/PostScript-outline .otf -> TrueType-outline .ttf (reportlab can only embed TrueType)."""
+    from fontTools.ttLib import TTFont as _FT, newTable
+    from fontTools.pens.cu2quPen import Cu2QuPen
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    font = _FT(src)
+    if "CFF " not in font:
+        font.save(dst)
+        return
+    gs, order = font.getGlyphSet(), font.getGlyphOrder()
+    glyf = newTable("glyf")
+    glyf.glyphOrder, glyf.glyphs = order, {}
+    for name in order:
+        pen = TTGlyphPen(gs)
+        gs[name].draw(Cu2QuPen(pen, 1.0, reverse_direction=True))
+        glyf.glyphs[name] = pen.glyph()
+    font["loca"] = newTable("loca")
+    font["glyf"] = glyf
+    maxp = font["maxp"]
+    maxp.tableVersion = 0x00010000
+    maxp.maxZones, maxp.maxTwilightPoints, maxp.maxStorage = 1, 0, 0
+    maxp.maxFunctionDefs = maxp.maxInstructionDefs = maxp.maxStackElements = maxp.maxSizeOfInstructions = 0
+    maxp.maxPoints = maxp.maxContours = maxp.maxCompositePoints = maxp.maxCompositeContours = 0
+    maxp.maxComponentElements = maxp.maxComponentDepth = 0
+    font["head"].glyphDataFormat = 0
+    post = font["post"]
+    post.formatType, post.extraNames, post.mapping, post.glyphOrder = 2.0, [], {}, order
+    del font["CFF "]
+    if "VORG" in font:
+        del font["VORG"]
+    font.sfntVersion = "\x00\x01\x00\x00"
+    font.save(dst)
+
+def _make_embeddable(path: str):
+    """Returns a path reportlab can embed (converting a CFF .otf to .ttf if needed) or None."""
+    try:
+        TTFont(f"_probe_{abs(hash(path)) % 10**8}", path)
+        return path
+    except Exception:
+        pass
+    try:
+        out = os.path.splitext(path)[0] + "_conv.ttf"
+        _otf_to_ttf(path, out)
+        TTFont(f"_probe_{abs(hash(out)) % 10**8}", out)
+        return out
+    except Exception as e:
+        print(f"Font {os.path.basename(path)} can't be used: {e}")
+        return None
+
+def _extract_fonts_from_zip(zip_path: str, dest_dir: str) -> list:
+    """Unpacks the .ttf/.otf files of a zip safely (no paths trusted, size-capped). Returns
+    [(label, usable_path)] sorted by name; fonts that can't be embedded are dropped."""
+    import zipfile
+    os.makedirs(dest_dir, exist_ok=True)
+    found, total = [], 0
+    with zipfile.ZipFile(zip_path) as z:
+        for info in z.infolist():
+            base = os.path.basename(info.filename.replace("\\", "/"))
+            if info.is_dir() or not base or base.startswith(".") or "__MACOSX" in info.filename:
+                continue
+            if not base.lower().endswith(_FONT_EXTS):
+                continue
+            if info.file_size > _ZIP_MAX_FILE or total + info.file_size > _ZIP_MAX_TOTAL:
+                continue
+            total += info.file_size
+            safe = re.sub(r"[^\w.\- ]", "_", base)
+            out = os.path.join(dest_dir, f"{len(found):02d}_{safe}")
+            with z.open(info) as src, open(out, "wb") as dst:
+                dst.write(src.read())
+            found.append((os.path.splitext(base)[0], out))
+            if len(found) >= _ZIP_MAX_FONTS:
+                break
+    usable = []
+    for label, path in sorted(found, key=lambda t: t[0].lower()):
+        p = _make_embeddable(path)
+        if p:
+            usable.append((label, p))
+    return usable
+
+_ROLE_LABEL = {"questions": "❓ الأسئلة", "choices": "✅ الاختيارات", "title": "🏷 العنوان"}
+
+def _apply_font_role(user_id: int, role: str, path: str) -> None:
+    if role == "questions":
+        PDF_FONT_BOLD_PATH[user_id] = path
+        PDF_FONT_PATH.setdefault(user_id, path)
+    elif role == "choices":
+        PDF_FONT_PATH[user_id] = path
+    elif role == "title":
+        PDF_TITLE_FONT_PATH[user_id] = path
+
+def _font_pick_keyboard(files: list) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label[:45], callback_data=f"fpick:{i}")] for i, (label, _p) in enumerate(files)]
+    return InlineKeyboardMarkup(rows)
+
+async def _ask_font_pick(reply_target, user_id: int) -> None:
+    st = FONT_PICK.get(user_id)
+    if not st or not st["queue"]:
+        return
+    role = st["queue"][0]
+    await reply_target.reply_text(
+        f"🔤 فيه <b>{len(st['files'])}</b> خط في الملف.\nاختار خط <b>{_ROLE_LABEL[role]}</b>:",
+        parse_mode=ParseMode.HTML, reply_markup=_font_pick_keyboard(st["files"]),
+    )
+
+def _title_font_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip (الخط الافتراضي)", callback_data="title_font_skip")]])
+
+async def _ask_title_font(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target) -> None:
+    """Setup step after the body fonts: an optional different font for the TITLE."""
+    AWAITING_TITLE_FONT[user_id] = True
+    await reply_target.reply_text(
+        "🏷 <b>خط العنوان</b>\nابعت ملف خط (.ttf / .otf) أو ملف zip فيه خطوط عشان تستخدمه للعنوان، "
+        "أو دوس Skip عشان تستخدم الخط الافتراضي (The Bomb Sound).\n"
+        "<i>العربي بيتكتب دايمًا بخط Ramis.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=_title_font_keyboard(),
+    )
+
+async def _font_files_received(context: ContextTypes.DEFAULT_TYPE, user_id: int, files: list, message) -> None:
+    """`files` = [(label, usable_path)] from one uploaded font or a whole zip."""
+    if AWAITING_FONT.get(user_id):
+        if len(files) == 1:
+            PDF_FONT_PATH[user_id] = files[0][1]
+            PDF_FONT_BOLD_PATH.pop(user_id, None)
+            del AWAITING_FONT[user_id]
+            await message.reply_text("✅ الخط اتسجل!")
+            await _ask_title_font(context, user_id, message)
+            return
+        FONT_PICK[user_id] = {"files": files, "queue": ["questions", "choices"], "ctx": "setup"}
+        await _ask_font_pick(message, user_id)
+        return
+    if AWAITING_TITLE_FONT.get(user_id):
+        if len(files) == 1:
+            PDF_TITLE_FONT_PATH[user_id] = files[0][1]
+            del AWAITING_TITLE_FONT[user_id]
+            await message.reply_text("✅ خط العنوان اتسجل!")
+            await _start_cover_step(context, user_id, message)
+            return
+        FONT_PICK[user_id] = {"files": files, "queue": ["title"], "ctx": "setup_title"}
+        await _ask_font_pick(message, user_id)
+        return
+    # Mid-session: ask what the font is for.
+    FONT_PICK[user_id] = {"files": files, "queue": [], "ctx": "session"}
+    await message.reply_text(
+        f"🔤 استلمت {'الخط' if len(files) == 1 else str(len(files)) + ' خطوط'}. تستخدمه لإيه؟",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏷 العنوان", callback_data="frole:title")],
+            [InlineKeyboardButton("❓ الأسئلة", callback_data="frole:questions"),
+             InlineKeyboardButton("✅ الاختيارات", callback_data="frole:choices")],
+            [InlineKeyboardButton("❓+✅ الاتنين", callback_data="frole:both")],
+        ]),
+    )
+
 async def handle_font_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Font file (.ttf/.otf) uploaded during the /pdf_start setup flow.
-    Registered on a filter that only matches those two extensions, but
-    still guarded by AWAITING_FONT — an unsolicited font upload outside
-    the setup flow is just ignored, not treated as a command."""
+    """A font file (.ttf/.otf) or a zip of fonts. During /pdf_start setup it is the body font
+    (a zip lets the user pick the questions font and the choices font from it) or the title font;
+    during a collecting session it asks what the font is for."""
     if not update.message or not update.message.document:
         return
     user_id = update.effective_chat.id
     if user_id in SLEEPING:
         return
-    if not AWAITING_FONT.get(user_id):
+    in_session = user_id in PDF_BUFFER
+    if not (AWAITING_FONT.get(user_id) or AWAITING_TITLE_FONT.get(user_id) or in_session):
         return
 
     doc      = update.message.document
+    name_low = (doc.file_name or "").lower()
     font_dir = os.path.join(FONT_BASE_DIR, str(user_id))
     os.makedirs(font_dir, exist_ok=True)
-    ext       = ".otf" if (doc.file_name or "").lower().endswith(".otf") else ".ttf"
-    font_path = os.path.join(font_dir, f"font{ext}")
-    tg_file   = await context.bot.get_file(doc.file_id)
-    await tg_file.download_to_drive(font_path)
+    stamp = f"{int(time.time() * 1000) % 10**9}"
+    if name_low.endswith(".zip"):
+        zpath = os.path.join(font_dir, f"pack_{stamp}.zip")
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            await tg_file.download_to_drive(zpath)
+            files = await asyncio.to_thread(_extract_fonts_from_zip, zpath, os.path.join(font_dir, f"zip_{stamp}"))
+        except Exception as e:
+            print(f"Font zip error: {e}")
+            await update.message.reply_text("⚠️ مقدرتش أفتح ملف الـ zip ده.")
+            return
+        finally:
+            try:
+                os.remove(zpath)
+            except Exception:
+                pass
+        if not files:
+            await update.message.reply_text("⚠️ مفيش خطوط (.ttf / .otf) تنفع جوه الـ zip ده.")
+            return
+        await _font_files_received(context, user_id, files, update.message)
+        return
 
-    PDF_FONT_PATH[user_id] = font_path
-    PDF_FONT_BOLD_PATH.pop(user_id, None)   # single upload has no bold companion — clear any stale preset one
-    del AWAITING_FONT[user_id]
-    await update.message.reply_text("✅ الخط اتسجل!")
-    await _start_cover_step(context, user_id, update.message)
+    ext       = ".otf" if name_low.endswith(".otf") else ".ttf"
+    raw_path  = os.path.join(font_dir, f"font_{stamp}{ext}")
+    tg_file   = await context.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(raw_path)
+    path = await asyncio.to_thread(_make_embeddable, raw_path)
+    if not path:
+        await update.message.reply_text("⚠️ الخط ده مش مدعوم (مقدرتش أستخدمه). جرّب ملف .ttf تاني.")
+        return
+    await _font_files_received(context, user_id, [(os.path.splitext(doc.file_name or "font")[0], path)], update.message)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """PDFs sent in a private DM: captioned = treated as a manual question
@@ -4927,6 +5146,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if AWAITING_TITLE_FONT.get(user_id) or (FONT_PICK.get(user_id) and FONT_PICK[user_id]["ctx"] != "session"):
+        await update.message.reply_text(
+            "⚠️ ابعت ملف خط (.ttf / .otf) أو zip لخط العنوان، أو دوس Skip." if AWAITING_TITLE_FONT.get(user_id)
+            else "⚠️ اختار الخط من الأزرار فوق.",
+        )
+        return
+
     # ── AWAITING COVER / FRAME IMAGE (same — reminder only) ─────────
     if AWAITING_COVER.get(user_id):
         await update.message.reply_text(
@@ -4945,6 +5171,19 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if AWAITING_AK_STYLE.get(user_id):
         await update.message.reply_text(
             "⚠️ اختار شكل صندوق الإجابات من الأزرار فوق.",
+        )
+        return
+
+    if AWAITING_QNUM_HEX.get(user_id):
+        m = _HEX_RE.match(text.strip())
+        if not m:
+            await update.message.reply_text("⚠️ الكود لازم يبقى 6 حروف/أرقام hex زي #D4A017.")
+            return
+        PDF_QNUM_COLOR[user_id] = "#" + m.group(1).upper()
+        del AWAITING_QNUM_HEX[user_id]
+        await update.message.reply_text(
+            build_progress_text(PDF_BUFFER.get(user_id, []), pending=_pending_summary(user_id)),
+            parse_mode=ParseMode.HTML, reply_markup=export_keyboard(user_id),
         )
         return
 
@@ -5312,7 +5551,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PDF_FONT_BOLD_PATH.pop(user_id, None)
         del AWAITING_FONT[user_id]
         await query.edit_message_text(f"✅ خط <b>{name}</b> اتحدد!", parse_mode=ParseMode.HTML)
-        await _start_cover_step(context, user_id, query.message)
+        FONT_PICK.pop(user_id, None)
+        await _ask_title_font(context, user_id, query.message)
         return
 
     if query.data == "font_skip":
@@ -5322,7 +5562,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PDF_FONT_BOLD_PATH.pop(user_id, None)
         del AWAITING_FONT[user_id]
         await query.edit_message_text("⏭ اتخطيت اختيار الخط.")
+        FONT_PICK.pop(user_id, None)
+        await _ask_title_font(context, user_id, query.message)
+        return
+
+    if query.data == "title_font_skip":
+        if not AWAITING_TITLE_FONT.get(user_id):
+            return
+        del AWAITING_TITLE_FONT[user_id]
+        PDF_TITLE_FONT_PATH.pop(user_id, None)
+        FONT_PICK.pop(user_id, None)
+        await query.edit_message_text("⏭ خط العنوان: الافتراضي.")
         await _start_cover_step(context, user_id, query.message)
+        return
+
+    if query.data.startswith("frole:"):          # mid-session font: what is it for?
+        st = FONT_PICK.get(user_id)
+        if not st or st["ctx"] != "session":
+            return
+        role = query.data.split(":")[1]
+        st["queue"] = ["questions", "choices"] if role == "both" else [role]
+        if len(st["files"]) == 1:
+            for r in st["queue"]:
+                _apply_font_role(user_id, r, st["files"][0][1])
+            FONT_PICK.pop(user_id, None)
+            await query.edit_message_text("✅ الخط اتسجل — هيظهر في الملفات الجاية.")
+            return
+        await query.edit_message_text("👇")
+        await _ask_font_pick(query.message, user_id)
+        return
+
+    if query.data.startswith("fpick:"):          # a font chosen from a zip
+        st = FONT_PICK.get(user_id)
+        if not st or not st["queue"]:
+            return
+        try:
+            label, path = st["files"][int(query.data.split(":")[1])]
+        except (ValueError, IndexError):
+            return
+        role = st["queue"].pop(0)
+        _apply_font_role(user_id, role, path)
+        await query.edit_message_text(f"✅ {_ROLE_LABEL[role]}: <b>{html.escape(label)}</b>", parse_mode=ParseMode.HTML)
+        if st["queue"]:
+            await _ask_font_pick(query.message, user_id)
+            return
+        FONT_PICK.pop(user_id, None)
+        if st["ctx"] == "setup":
+            AWAITING_FONT.pop(user_id, None)
+            await _ask_title_font(context, user_id, query.message)
+        elif st["ctx"] == "setup_title":
+            AWAITING_TITLE_FONT.pop(user_id, None)
+            await _start_cover_step(context, user_id, query.message)
         return
 
     if query.data == "cover_skip":
@@ -5380,6 +5670,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 build_progress_text(PDF_BUFFER.get(user_id, []), pending=_pending_summary(user_id)),
                 parse_mode=ParseMode.HTML, reply_markup=export_keyboard(user_id),
             )
+        return
+
+    # ── QUESTION-NUMBER COLOUR (export panel) ────────────────────
+    if query.data == "qnum_pick":
+        if user_id not in PDF_BUFFER:
+            return
+        await query.edit_message_text(
+            "🔢 <b>اختار لون رقم السؤال (Q1, Q2…):</b>", parse_mode=ParseMode.HTML,
+            reply_markup=qnum_keyboard(user_id),
+        )
+        return
+
+    if query.data == "qnum_custom":
+        if user_id not in PDF_BUFFER:
+            return
+        AWAITING_QNUM_HEX[user_id] = True
+        await query.edit_message_text(
+            "✏️ ابعت كود اللون hex زي <code>#D4A017</code> (6 حروف/أرقام).", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="qnum_pick")]]),
+        )
+        return
+
+    if query.data.startswith("qnum:"):
+        if user_id not in PDF_BUFFER:
+            return
+        val = query.data.split(":", 1)[1]
+        AWAITING_QNUM_HEX.pop(user_id, None)
+        if val == "default":
+            PDF_QNUM_COLOR.pop(user_id, None)
+        elif re.fullmatch(r"[0-9a-fA-F]{6}", val):
+            PDF_QNUM_COLOR[user_id] = "#" + val.upper()
+        else:
+            return
+        await query.edit_message_text(
+            build_progress_text(PDF_BUFFER.get(user_id, []), pending=_pending_summary(user_id)),
+            parse_mode=ParseMode.HTML, reply_markup=export_keyboard(user_id),
+        )
         return
 
     # ── PREVIEW BUTTON ──────────────────────────────────────────
@@ -5443,15 +5770,287 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 PPTX_RENDER_SCALE = 2.2     # ≈ 160 dpi per slide: sharp on screen, keeps the file light
 
-def build_pptx(items: list, doc_title: str = "questions", show_answers: bool = True, **pdf_kwargs) -> BytesIO:
-    """PowerPoint file that looks exactly like the PDF: every PDF page (cover, frame, questions,
-    answer box, zikr…) becomes one A4-portrait slide. Takes the same keyword arguments as
-    build_pdf, builds that PDF first and puts each page on a slide as a picture."""
+def _pptx_page_items(pdf_bytes: bytes):
+    """Splits every PDF page into: a background picture (frame/cover, card shapes, separators, the
+    rotated answer box — everything that is not upright text or a question image), the question
+    images (separate pictures) and the upright text lines (real text). Returns a list of dicts."""
+    import pdfplumber
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as praw
+
+    pages = []
+    plumb = pdfplumber.open(BytesIO(pdf_bytes))
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    try:
+        for i in range(len(pdf)):
+            pg = pdf[i]
+            W, H = pg.get_size()
+            ppage = plumb.pages[i]
+
+            # ---- text lines (upright only; the rotated answer box stays in the background)
+            up = ppage.filter(lambda o: o.get("object_type") != "char" or (o.get("upright", True) and o.get("matrix", (1, 0, 0, 1, 0, 0))[0] > 0 and o.get("matrix", (1, 0, 0, 1, 0, 0))[3] > 0))
+            words = up.extract_words(extra_attrs=["fontname", "size", "non_stroking_color"], keep_blank_chars=False)
+            words.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
+            rows = []
+            for w in words:
+                for r in rows:
+                    if abs(r[0]["top"] - w["top"]) < max(2.5, w["size"] * 0.45):
+                        r.append(w)
+                        break
+                else:
+                    rows.append([w])
+            lines = []
+            for r in rows:
+                r.sort(key=lambda w: w["x0"])
+                seg = [r[0]]
+                segs = [seg]
+                for w in r[1:]:
+                    if w["x0"] - seg[-1]["x1"] > max(10.0, w["size"] * 1.6):
+                        seg = [w]
+                        segs.append(seg)
+                    else:
+                        seg.append(w)
+                for sg in segs:
+                    n_ar = sum(1 for w in sg if any("\u0590" <= c <= "\u08ff" or "\ufb50" <= c <= "\ufeff" or _is_arabic_cp(ord(c)) for c in w["text"]))
+                    rtl = n_ar * 2 > len(sg)
+                    ordered = list(reversed(sg)) if rtl else sg
+                    if rtl:   # runs of Latin/number words inside an Arabic line keep their left-to-right order
+                        isar = lambda w: any(("\u0590" <= c <= "\u08ff") or ("\ufb50" <= c <= "\ufeff") or _is_arabic_cp(ord(c)) for c in w["text"])
+                        fixed, k = [], 0
+                        while k < len(ordered):
+                            if isar(ordered[k]) or re.fullmatch(r"[\(\[\{<][A-Za-z0-9]+", ordered[k]["text"]):
+                                fixed.append(ordered[k]); k += 1
+                            else:
+                                j = k
+                                while j < len(ordered) and not isar(ordered[j]):
+                                    j += 1
+                                fixed.extend(reversed(ordered[k:j])); k = j
+                        ordered = fixed
+                    lines.append(dict(words=ordered, rtl=rtl,
+                                      x0=min(w["x0"] for w in sg), x1=max(w["x1"] for w in sg),
+                                      top=min(w["top"] for w in sg), bottom=max(w["bottom"] for w in sg)))
+
+            # ---- images (everything that is not a page-sized frame/cover) + strip upright text
+            pics, kill = [], []
+            all_objs = list(pg.get_objects(filter=[praw.FPDF_PAGEOBJ_TEXT, praw.FPDF_PAGEOBJ_IMAGE], max_depth=15))
+            for o in all_objs:
+                if o.type == praw.FPDF_PAGEOBJ_TEXT:
+                    m = o.get_matrix().get()
+                    if m[0] > 0 and m[3] > 0:
+                        kill.append(o)
+                else:
+                    l, bt, r, t = o.get_bounds()
+                    if (r - l) * (t - bt) < 0.6 * W * H:
+                        try:
+                            pics.append(dict(img=o.get_bitmap(render=True).to_pil().convert("RGBA"),
+                                             x=l, y=H - t, w=r - l, h=t - bt))
+                            kill.append(o)
+                        except Exception:
+                            pass
+            for o in kill:
+                try:
+                    pg.remove_obj(o)
+                except Exception:
+                    pass
+            pg.gen_content()
+            bg = pg.render(scale=PPTX_RENDER_SCALE).to_pil().convert("RGB")
+            for o in all_objs:
+                try:
+                    o.close()
+                except Exception:
+                    pass
+            pg.close()
+            pages.append(dict(W=W, H=H, bg=bg, pics=pics, lines=lines))
+    finally:
+        plumb.close()
+        pdf.close()
+    return pages
+
+
+_PPTX_FONT_MAP = {"poppins": "Poppins", "dejavusans": "Arial", "freesans": "Arial", "liberationsans": "Arial",
+                  "freeserif": "Times New Roman"}
+_RAMIS_REV_CACHE = {}
+
+def _ramis_reverse_map() -> dict:
+    """presentation-form / ligature / diacritic-composite codepoint -> the plain logical characters
+    it stands for (the inverse of _ramis_shape), so PowerPoint gets real, editable Arabic."""
+    if _RAMIS_REV_CACHE:
+        return _RAMIS_REV_CACHE
+    rev = {}
+    for (base, _form), cp in _RAMIS_FORMS.items():
+        rev[cp] = chr(base)
+    for (alef, _joined), cp in _RAMIS_LAMALEF.items():
+        rev[cp] = "\u0644" + alef
+    if _RAMIS_ALLAH:
+        rev[_RAMIS_ALLAH] = "\u0627\u0644\u0644\u0647"
+    for (base, marks), cp in _RAMIS_COMP.items():
+        rev[cp] = rev.get(base, chr(base)) + "".join(chr(m) for m in marks)
+    _RAMIS_REV_CACHE.update(rev)
+    _RAMIS_REV_CACHE[-1] = True
+    return _RAMIS_REV_CACHE
+
+def _pptx_unshape(text: str) -> str:
+    rev = _ramis_reverse_map()
+    out = []
+    for ch in text:
+        out.append(rev.get(ord(ch), ch))
+    return "".join(out)
+
+def _pptx_logical_word(word: str, rtl_line: bool) -> str:
+    """One extracted word (visual, left-to-right order, shaped glyphs) -> logical text."""
+    has_ar = any(("\u0590" <= c <= "\u08ff") or ("\ufb50" <= c <= "\ufeff") or _is_arabic_cp(ord(c)) for c in word)
+    if has_ar:
+        letters = []
+        for c in reversed(word):                       # visual -> logical order first,
+            letters.append(_MIRROR.get(c, c) if not _is_arabic_cp(ord(c)) else c)
+        res, run = [], []
+        for c in letters:
+            if _ud.category(c) == "Nd" or (c.isascii() and c.isalnum()):
+                run.append(c)
+            else:
+                if run:
+                    res.extend(reversed(run)); run = []
+                res.append(c)
+        if run:
+            res.extend(reversed(run))
+        return _pptx_unshape("".join(res))             # ...then expand ligatures / joined forms
+    w = word
+    if rtl_line:
+        # "(A" in an RTL line is the engine's mirrored "A)" — hand PowerPoint the logical order
+        m = re.fullmatch(r"([\(\[\{<])([^\(\)\[\]\{\}<>]+)", w)
+        if m:
+            return m.group(2) + _MIRROR.get(m.group(1), m.group(1))
+    return w
+
+
+def _pptx_font_of(fontname: str):
+    base = re.sub(r"^[A-Z]{6}\+", "", fontname or "")
+    low = base.lower().replace(" ", "").replace("_", "")
+    if low.startswith("ramisarabicxb"):
+        return _ramis_ppt_family("extrabold"), False, False
+    if low.startswith("ramisarabic") or low.startswith("ramis"):
+        return _ramis_ppt_family("medium"), False, False
+    fam = base.split("-")[0]
+    bold = "bold" in low or "black" in low
+    ital = "italic" in low or "oblique" in low
+    return _PPTX_FONT_MAP.get(fam.lower().replace(" ", ""), fam or "Arial"), bold, ital
+
+def _ramis_ppt_family(weight: str) -> str:
+    """Family name PowerPoint knows the Ramis weight by (read from the font file's name table)."""
+    try:
+        from fontTools.ttLib import TTFont as _FT
+        p = _find_ramis_weight(weight) or _find_ramis_file()
+        if p:
+            t = _FT(p, lazy=True)
+            for nid in (1, 4):
+                for n in t["name"].names:
+                    if n.nameID == nid and n.platformID == 3:
+                        return n.toUnicode()
+    except Exception:
+        pass
+    return "Ramis Arabic"
+
+
+def build_pptx(items: list, doc_title: str = "questions", show_answers: bool = True, editable: bool = True, **pdf_kwargs) -> BytesIO:
+    """PowerPoint file that looks like the PDF but is EDITABLE: every PDF page becomes one A4-portrait
+    slide with the frame as a background picture, each question image as its own picture and every
+    line of text (questions, options, cases, titles, zikr) as a real text box. The rotated per-page
+    answer box stays part of the background picture. Falls back to full-page pictures if the split fails."""
+    from pptx import Presentation
+    from pptx.util import Emu, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    from pptx.oxml.ns import qn
+
+    pdf_bytes = build_pdf(items, doc_title, show_answers=show_answers, **pdf_kwargs).getvalue()
+    try:
+        if not editable:
+            raise RuntimeError("picture mode")
+        pages = _pptx_page_items(pdf_bytes)
+    except Exception as e:
+        print(f"PPTX editable split failed ({e!r}) — using page pictures")
+        return _build_pptx_pictures(pdf_bytes, doc_title)
+
+    EMU = 12700  # 1 pt
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(int(pages[0]["W"] * EMU)), Emu(int(pages[0]["H"] * EMU))
+    blank = prs.slide_layouts[6]
+
+    def _rgb(c):
+        try:
+            if c is None:
+                return RGBColor(0, 0, 0)
+            if isinstance(c, (int, float)):
+                c = (c, c, c)
+            if len(c) == 1:
+                c = (c[0],) * 3
+            if len(c) == 4:  # CMYK
+                C, M, Y, K = c
+                c = ((1 - C) * (1 - K), (1 - M) * (1 - K), (1 - Y) * (1 - K))
+            return RGBColor(*[max(0, min(255, int(round(float(v) * 255)))) for v in c[:3]])
+        except Exception:
+            return RGBColor(0, 0, 0)
+
+    for pg in pages:
+        sl = prs.slides.add_slide(blank)
+        buf = BytesIO()
+        pg["bg"].save(buf, "JPEG", quality=92, optimize=True)
+        buf.seek(0)
+        sl.shapes.add_picture(buf, 0, 0, prs.slide_width, prs.slide_height)
+        for p in pg["pics"]:
+            pb = BytesIO()
+            p["img"].save(pb, "PNG")
+            pb.seek(0)
+            sl.shapes.add_picture(pb, Emu(int(p["x"] * EMU)), Emu(int(p["y"] * EMU)),
+                                  Emu(int(p["w"] * EMU)), Emu(int(p["h"] * EMU)))
+        for ln in pg["lines"]:
+            size = max(w["size"] for w in ln["words"])
+            pad = 4.0
+            x0, x1 = ln["x0"] - pad, ln["x1"] + pad
+            width = (x1 - x0) + size * 0.6          # a little slack so PowerPoint never wraps
+            left = x0 if not ln["rtl"] else x1 - width
+            top = ln["top"] - size * (0.30 if any(w["fontname"].lower().find("ramis") >= 0 for w in ln["words"]) else 0.12)
+            tb = sl.shapes.add_textbox(Emu(int(left * EMU)), Emu(int(top * EMU)),
+                                       Emu(int(width * EMU)), Emu(int((ln["bottom"] - ln["top"] + size * 0.3) * EMU)))
+            tf = tb.text_frame
+            tf.word_wrap = False
+            tf.margin_left = tf.margin_right = Emu(int(pad * EMU))
+            tf.margin_top = tf.margin_bottom = 0
+            tf.vertical_anchor = MSO_ANCHOR.TOP
+            para = tf.paragraphs[0]
+            para.alignment = PP_ALIGN.RIGHT if ln["rtl"] else PP_ALIGN.LEFT
+            para.line_spacing = 1.0
+            if ln["rtl"]:
+                para._p.get_or_add_pPr().set("rtl", "1")
+            for k, w in enumerate(ln["words"]):
+                fam, bold, ital = _pptx_font_of(w["fontname"])
+                txt = _pptx_logical_word(w["text"], ln["rtl"]) + (" " if k < len(ln["words"]) - 1 else "")
+                run = para.add_run()
+                run.text = txt
+                f = run.font
+                f.name, f.size, f.bold, f.italic = fam, Pt(round(w["size"], 1)), bold, ital
+                f.color.rgb = _rgb(w.get("non_stroking_color"))
+                rPr = run._r.get_or_add_rPr()
+                if any(("\u0590" <= c <= "\u08ff") for c in txt):
+                    cs = rPr.find(qn("a:cs"))
+                    if cs is None:
+                        cs = rPr.makeelement(qn("a:cs"), {})
+                        rPr.append(cs)
+                    cs.set("typeface", fam if fam != "Poppins" else "Arial")
+                    if fam.startswith("Ramis"):
+                        f.name = fam
+    prs.core_properties.title = str(doc_title or "questions")
+    out = BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return out
+
+
+def _build_pptx_pictures(pdf_bytes: bytes, doc_title: str) -> BytesIO:
+    """Fallback: one full-page picture per slide."""
     from pptx import Presentation
     from pptx.util import Emu
     from PIL import Image as _PILImage
-
-    pdf_bytes = build_pdf(items, doc_title, show_answers=show_answers, **pdf_kwargs).getvalue()
     pages = []
     try:
         import pypdfium2 as pdfium
@@ -5470,7 +6069,6 @@ def build_pptx(items: list, doc_title: str = "questions", show_answers: bool = T
                 pages.append(_PILImage.frombytes("RGB", (pix.width, pix.height), pix.samples))
         finally:
             d.close()
-
     prs = Presentation()
     prs.slide_width, prs.slide_height = Emu(int(21.0 / 2.54 * 914400)), Emu(int(29.7 / 2.54 * 914400))
     blank = prs.slide_layouts[6]
@@ -5552,10 +6150,15 @@ def _reset_pdf_session(user_id: int) -> None:
     PDF_NAMES.pop(user_id, None)
     AWAITING_NAME.pop(user_id, None)
     AWAITING_FONT.pop(user_id, None)
+    AWAITING_TITLE_FONT.pop(user_id, None)
+    FONT_PICK.pop(user_id, None)
+    PDF_TITLE_FONT_PATH.pop(user_id, None)
     AWAITING_FRAME.pop(user_id, None)
     AWAITING_COVER.pop(user_id, None)
     AWAITING_AK_STYLE.pop(user_id, None)
     AWAITING_THEME.pop(user_id, None)
+    AWAITING_QNUM_HEX.pop(user_id, None)
+    PDF_QNUM_COLOR.pop(user_id, None)
     AWAITING_LAYOUT.pop(user_id, None)
     PDF_THEME.pop(user_id, None)
     PDF_ZIKR.pop(user_id, None)
@@ -5580,6 +6183,10 @@ def _reset_pdf_session(user_id: int) -> None:
             os.remove(font_path)
         except Exception:
             pass
+    try:
+        shutil.rmtree(os.path.join(FONT_BASE_DIR, str(user_id)), ignore_errors=True)   # zip-extracted / title fonts
+    except Exception:
+        pass
     PDF_FONT_BOLD_PATH.pop(user_id, None)   # always a bundled preset path (or absent) — never a per-user file, nothing to delete
     # NOTE: PDF_COVER_PATH / PDF_FRAME_PATH are deliberately NOT touched
     # here — unlike everything above, they're meant to stay remembered
@@ -5596,10 +6203,10 @@ async def _export_pdf_session(context: ContextTypes.DEFAULT_TYPE, message, sessi
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
     kw = dict(
         font_path=PDF_FONT_PATH.get(session_id),
-        font_bold_path=PDF_FONT_BOLD_PATH.get(session_id),
+        font_bold_path=PDF_FONT_BOLD_PATH.get(session_id), title_font_path=PDF_TITLE_FONT_PATH.get(session_id),
         bg_image_path=PDF_FRAME_PATH.get(session_id),
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
-        theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME), q_num_color=PDF_QNUM_COLOR.get(session_id), zikr=PDF_ZIKR.get(session_id, True),
         ak_scale=PDF_AK_SCALE.get(session_id, DEFAULT_AK_SCALE), ak_text_scale=PDF_AK_TEXT_SCALE.get(session_id, DEFAULT_AK_TEXT_SCALE),
         ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
         font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
@@ -5642,10 +6249,10 @@ async def _export_pptx_session(context: ContextTypes.DEFAULT_TYPE, message, sess
     safe = re.sub(r"[^\w\s\-]", "", name).strip().replace(" ", "_") or "questions"
     kw = dict(
         font_path=PDF_FONT_PATH.get(session_id),
-        font_bold_path=PDF_FONT_BOLD_PATH.get(session_id),
+        font_bold_path=PDF_FONT_BOLD_PATH.get(session_id), title_font_path=PDF_TITLE_FONT_PATH.get(session_id),
         bg_image_path=PDF_FRAME_PATH.get(session_id),
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
-        theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME), q_num_color=PDF_QNUM_COLOR.get(session_id), zikr=PDF_ZIKR.get(session_id, True),
         ak_scale=PDF_AK_SCALE.get(session_id, DEFAULT_AK_SCALE), ak_text_scale=PDF_AK_TEXT_SCALE.get(session_id, DEFAULT_AK_TEXT_SCALE),
         ak_nudge_cm=PDF_AK_NUDGE_CM.get(session_id, DEFAULT_AK_NUDGE_CM),
         font_size=PDF_FONT_SIZE.get(session_id, DEFAULT_FONT_SIZE),
@@ -5695,7 +6302,7 @@ async def _export_docx_session(context: ContextTypes.DEFAULT_TYPE, message, sess
         q_gap_cm=PDF_Q_GAP_CM.get(session_id, DEFAULT_Q_GAP_CM),
         opt_gap_cm=PDF_OPT_GAP_CM.get(session_id, DEFAULT_OPT_GAP_CM),
         show_written_answers=PDF_WRITTEN_SHOW.get(session_id, True),
-        theme=PDF_THEME.get(session_id, DEFAULT_THEME), zikr=PDF_ZIKR.get(session_id, True),
+        theme=PDF_THEME.get(session_id, DEFAULT_THEME), q_num_color=PDF_QNUM_COLOR.get(session_id), zikr=PDF_ZIKR.get(session_id, True),
     )
     ak_kw = dict(
         ak_style=PDF_AK_STYLE.get(session_id, "grouped"),
@@ -5838,7 +6445,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     was_doing_something = bool(
         PDF_BUFFER.get(user_id) or AWAITING_NAME.get(user_id)
-        or AWAITING_FONT.get(user_id) or AWAITING_FRAME.get(user_id) or AWAITING_COVER.get(user_id)
+        or AWAITING_FONT.get(user_id) or AWAITING_TITLE_FONT.get(user_id) or AWAITING_FRAME.get(user_id) or AWAITING_COVER.get(user_id)
         or AWAITING_AK_STYLE.get(user_id) or AWAITING_THEME.get(user_id) or AWAITING_LAYOUT.get(user_id)
         or PENDING_IMAGE.get(user_id) or PENDING_CASE.get(user_id)
         or CARDIKAL.get(user_id)
@@ -6444,7 +7051,7 @@ app.add_handler(MessageHandler(filters.PHOTO, handle_image))
 # registered before the general PDF/document handler below since it's a
 # different mime/extension entirely.
 app.add_handler(MessageHandler(
-    filters.Document.FileExtension("ttf") | filters.Document.FileExtension("otf"),
+    filters.Document.FileExtension("ttf") | filters.Document.FileExtension("otf") | filters.Document.FileExtension("zip"),
     handle_font_upload,
 ))
 
